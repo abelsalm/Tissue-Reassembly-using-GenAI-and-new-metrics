@@ -1,0 +1,33 @@
+# @package _global_
+general:
+    name : 'Perturb-FISH'
+    mode : 'test_only'
+
+distribute:
+    gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
+
+dataset:
+    dataset_name: 'Perturb-FISH'
+    gene_columns_start: 0   # first column after the index is a gene
+    gene_columns_end: 500    #
+    train_data_path: "/data-master/code/Spatial-Transcriptomics-and-Perturbations-Modeling/data_splits/luna_pf/perturb_fish_train.csv"
+    test_data_path: "/data-master/code/Spatial-Transcriptomics-and-Perturbations-Modeling/data_splits/luna_pf/perturb_fish_test.csv"
+    validation_data_path: ""
+    maximum_graph_size:
+        train: 5000    # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: 5000
+        validation: 5000
+
+train: # !!!!
+    n_epochs: 3000        # tiny number for a smoke-test; increase for real training
+    batch_size: 6      # keep small on CPU
+    lr: 5e-4
+
+test:
+    save_dir: '/data-master/code/Spatial-Transcriptomics-and-Perturbations-Modeling/results'
+    checkpoints_parent_dir: null
+    checkpoints_name_list: all
+
+validation: # !!!!
+    if_validate: False
+    save_model_every_n_epochs: 250  # save every epoch during the smoke-test
