@@ -501,6 +501,14 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         dtype = pred_pos.dtype
 
         mask_b = mask.bool() if mask.dtype != torch.bool else mask
+        if cell_class.dim() == 2 and cell_class.shape[-1] == 1:
+            cell_class = cell_class.squeeze(-1)
+        elif cell_class.dim() != 1:
+            raise ValueError(
+                f"CahnHilliardEnergyAUCLoss expected cell_class shape [N] or [N, 1], "
+                f"got {tuple(cell_class.shape)}."
+            )
+
         if mask_b.sum() == 0:
             return torch.zeros((), device=device, dtype=dtype), 0
 

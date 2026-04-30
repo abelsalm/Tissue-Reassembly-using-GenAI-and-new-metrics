@@ -58,12 +58,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 eps=cfg.train.ch_eps,
                 min_cells_per_type=cfg.train.ch_min_cells_per_type,
             )
-            self.val_loss = self.train_loss
         elif cfg.train.loss_type == "position_mse":
             self.train_loss = LossFunction()
-            self.val_loss = self.train_loss
         else:
             raise ValueError(f"Unsupported train loss_type: {cfg.train.loss_type}")
+        self.val_loss = LossFunction()
 
         self.model = Model(
             input_dims=self.input_dims,
