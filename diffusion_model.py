@@ -53,6 +53,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 kappa=cfg.train.ch_kappa,
                 soft_max_beta=cfg.train.ch_soft_max_beta,
                 support_factor=cfg.train.ch_support_factor,
+                landscape_chunk_size=getattr(cfg.train, "ch_landscape_chunk_size", 128),
                 square_bbox=cfg.train.ch_square_bbox,
                 margin=cfg.train.ch_margin,
                 eps=cfg.train.ch_eps,

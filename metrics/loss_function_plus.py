@@ -1,3 +1,4 @@
+import math
 from typing import Callable, Dict, Literal, Optional, Sequence, Tuple
 
 import numpy as np
@@ -284,7 +285,9 @@ def build_continuous_landscape_from_points(
             points.
         support_factor: per-point support cutoff in units of ``radius``
             (default 10, matching the reference default).
-        chunk: number of points processed at once to bound peak memory.
+        chunk: number of points processed at once. Each chunk is evaluated on
+            fixed-size local patches, which keeps memory bounded while giving
+            the GPU enough work per kernel.
 
     Returns:
         ``phi`` tensor of shape ``(ny, nx)`` with values in ``[-1, 1]``
@@ -301,46 +304,81 @@ def build_continuous_landscape_from_points(
         return torch.full((ny, nx), -1.0, device=device, dtype=dtype)
 
     pts = positions[valid_mask]                 # [M, 2]
-    M = pts.shape[0]
 
-    # Grid of shape (ny, nx, 2), y varying on dim 0, x on dim 1 (matches
-    # the reference numpy landscape convention).
-    gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
-    grid = torch.stack([gx, gy], dim=-1)        # [ny, nx, 2]
-
+    # The support is expressed in radius units. Keeping it local is what
+    # prevents materialising an [M, ny, nx] bump tensor for large cell types.
     support = float(support_factor) * float(radius)
     bump_kwargs = dict(bump_kwargs or {})
+    chunk = max(1, int(chunk))
+
+    # The grid comes from torch.linspace, so index-space patches can be
+    # computed with simple arithmetic. This avoids per-cell searchsorted/item()
+    # calls, which would synchronize CPU and GPU thousands of times.
+    dx_grid = abs(float((grid_x[1] - grid_x[0]).detach().item())) if nx > 1 else 1.0
+    dy_grid = abs(float((grid_y[1] - grid_y[0]).detach().item())) if ny > 1 else 1.0
+    half_x = min(nx - 1, max(0, math.ceil(support / max(dx_grid, 1e-12)) + 1))
+    half_y = min(ny - 1, max(0, math.ceil(support / max(dy_grid, 1e-12)) + 1))
+    offset_x = torch.arange(-half_x, half_x + 1, device=device)
+    offset_y = torch.arange(-half_y, half_y + 1, device=device)
+
+    def local_patch_values(pts_chunk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Vectorise bump evaluation over a chunk of local point patches.
+
+        The output tensors are shaped [m, patch_y, patch_x]. This is the
+        compromise between the original full-grid broadcast [m, ny, nx]
+        (fast but huge) and the point-by-point loop (small but slow).
+        """
+        centers_x = torch.round(
+            (pts_chunk[:, 0].detach() - grid_x[0]) / max(dx_grid, 1e-12)
+        ).long().clamp(0, nx - 1)
+        centers_y = torch.round(
+            (pts_chunk[:, 1].detach() - grid_y[0]) / max(dy_grid, 1e-12)
+        ).long().clamp(0, ny - 1)
+
+        x_idx = centers_x[:, None, None] + offset_x[None, None, :]
+        y_idx = centers_y[:, None, None] + offset_y[None, :, None]
+        valid = (x_idx >= 0) & (x_idx < nx) & (y_idx >= 0) & (y_idx < ny)
+        x_idx = x_idx.clamp(0, nx - 1)
+        y_idx = y_idx.clamp(0, ny - 1)
+
+        gx = grid_x[x_idx]
+        gy = grid_y[y_idx]
+        dx = gx - pts_chunk[:, 0, None, None]
+        dy = gy - pts_chunk[:, 1, None, None]
+        r = torch.sqrt(dx * dx + dy * dy)
+        support_mask = valid & (r <= support)
+        bump = bump_fn(r, radius, **bump_kwargs)
+        flat_idx = y_idx * nx + x_idx
+        return flat_idx, bump * support_mask.to(dtype)
 
     if combine == "soft_max":
         # soft-max over bumps: (1/beta) * logsumexp(beta * b_i).
         # Init accumulator at exp(beta * 0) = 1 so a grid cell with no
         # contributing point degrades to soft-max value 0 -> phi = -1.
         beta = float(soft_max_beta)
-        acc = torch.zeros(ny, nx, device=device, dtype=dtype)        # accumulates exp(beta * b)
-        acc = acc + 1.0                                               # baseline b=0
-        for start in range(0, M, chunk):
-            end = min(start + chunk, M)
-            pts_chunk = pts[start:end]                                # [m, 2]
-            diff = grid.unsqueeze(0) - pts_chunk[:, None, None, :]    # [m, ny, nx, 2]
-            r = torch.norm(diff, dim=-1)                              # [m, ny, nx]
-            bumps = bump_fn(r, radius, **bump_kwargs)                 # [m, ny, nx]
-            # Zero out contributions beyond support window.
-            bumps = bumps * (r <= support).to(bumps.dtype)
-            acc = acc + torch.exp(beta * bumps).sum(dim=0)
-        soft_max_bump = torch.log(acc) / beta                         # ~ max_i bumps_i
+        acc = torch.ones(ny * nx, device=device, dtype=dtype)        # baseline exp(beta * 0)
+        for start in range(0, pts.shape[0], chunk):
+            flat_idx, bump = local_patch_values(pts[start:start + chunk])
+            # Only supported patch entries contribute; unsupported entries
+            # have value 0 and therefore add nothing to the sparse-like sum.
+            values = torch.exp(beta * bump) * (bump > 0).to(dtype)
+            acc = acc.scatter_add(0, flat_idx.reshape(-1), values.reshape(-1))
+        soft_max_bump = torch.log(acc.reshape(ny, nx)) / beta         # ~ max_i bumps_i
         phi = -1.0 + 2.0 * soft_max_bump
     elif combine == "hard_max":
-        # exact pointwise max, running over chunks.
-        best = torch.zeros(ny, nx, device=device, dtype=dtype)        # max bump so far; 0 == no point
-        for start in range(0, M, chunk):
-            end = min(start + chunk, M)
-            pts_chunk = pts[start:end]
-            diff = grid.unsqueeze(0) - pts_chunk[:, None, None, :]
-            r = torch.norm(diff, dim=-1)
-            bumps = bump_fn(r, radius, **bump_kwargs)
-            bumps = bumps * (r <= support).to(bumps.dtype)
-            chunk_max = bumps.max(dim=0).values
-            best = torch.maximum(best, chunk_max)
+        # Exact pointwise max over local patches. scatter_reduce keeps this
+        # vectorized over chunks without allocating a full [M, ny, nx] tensor.
+        best = torch.zeros(ny * nx, device=device, dtype=dtype)       # max bump so far; 0 == no point
+        for start in range(0, pts.shape[0], chunk):
+            flat_idx, bump = local_patch_values(pts[start:start + chunk])
+            best = best.scatter_reduce(
+                0,
+                flat_idx.reshape(-1),
+                bump.reshape(-1),
+                reduce="amax",
+                include_self=True,
+            )
+        best = best.reshape(ny, nx)
         phi = -1.0 + 2.0 * best
     else:
         raise ValueError(f"unknown combine='{combine}'")
@@ -422,6 +460,9 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         combine: ``'soft_max'`` (default, differentiable) or ``'hard_max'``.
         soft_max_beta: temperature for the soft-max bump combination.
         support_factor: per-point support cutoff in units of ``radius``.
+        landscape_chunk_size: number of cells evaluated together when building
+            local landscape patches. Larger values improve GPU utilization but
+            use more memory.
         square_bbox: build the shared grid on the square bbox of GT ∪ pred
             (matches reference default).
         margin: fractional padding added to the (square) bbox per axis.
@@ -440,6 +481,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         combine: Literal["soft_max", "hard_max"] = "soft_max",
         soft_max_beta: float = 16.0,
         support_factor: float = 10.0,
+        landscape_chunk_size: int = 128,
         square_bbox: bool = True,
         margin: float = 0.05,
         eps: float = 1e-6,
@@ -456,6 +498,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         self.combine = combine
         self.soft_max_beta = float(soft_max_beta)
         self.support_factor = float(support_factor)
+        self.landscape_chunk_size = int(landscape_chunk_size)
         self.square_bbox = bool(square_bbox)
         self.margin = float(margin)
         self.eps = float(eps)
@@ -488,6 +531,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             combine=self.combine,
             soft_max_beta=self.soft_max_beta,
             support_factor=self.support_factor,
+            chunk=self.landscape_chunk_size,
         )
 
     def _sample_loss(
@@ -543,9 +587,13 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             e_gt_curve = []
             e_pred_curve = []
             for r in self.radii:
-                phi_gt = self._landscape(true_xy, type_mask, grid_x, grid_y, r)
+                # The GT curve is a constant target for this batch. Avoid
+                # building an autograd graph for it; only the predicted
+                # landscape must carry gradients back to pred positions.
+                with torch.no_grad():
+                    phi_gt = self._landscape(true_xy, type_mask, grid_x, grid_y, r)
+                    e_gt_curve.append(cahn_hilliard_energy(phi_gt, dx, dy, self.kappa))
                 phi_pred = self._landscape(pred_xy, type_mask, grid_x, grid_y, r)
-                e_gt_curve.append(cahn_hilliard_energy(phi_gt, dx, dy, self.kappa))
                 e_pred_curve.append(cahn_hilliard_energy(phi_pred, dx, dy, self.kappa))
 
             e_gt_t = torch.stack(e_gt_curve)
@@ -654,6 +702,7 @@ class CombinedLossFunction(nn.Module):
         combine: Literal["soft_max", "hard_max"] = "soft_max",
         soft_max_beta: float = 16.0,
         support_factor: float = 10.0,
+        landscape_chunk_size: int = 128,
         square_bbox: bool = True,
         margin: float = 0.05,
         eps: float = 1e-6,
@@ -672,6 +721,7 @@ class CombinedLossFunction(nn.Module):
             combine=combine,
             soft_max_beta=soft_max_beta,
             support_factor=support_factor,
+            landscape_chunk_size=landscape_chunk_size,
             square_bbox=square_bbox,
             margin=margin,
             eps=eps,
@@ -696,6 +746,7 @@ class CombinedLossFunction(nn.Module):
             masked_pred, masked_true, train_stage=train_stage, log=log
         )
         loss = self.mse_weight * mse_val + self.ch_weight * ch_val
+        print(f"mse_val: {mse_val.item()}, ch_val: {ch_val.item()}, loss: {loss.item()}")
 
         to_log: Optional[Dict[str, float]] = None
         if log:
