@@ -1,8 +1,29 @@
+from math import ceil
+
 import torch
 import wandb
 
 from utils.data.dataholder import DataHolder
 from utils.data.misc import to_batch
+
+
+def _compute_ch_weight(cfg, current_epoch: int) -> float:
+    """Step the CH loss weight from zero to its final value after warmup."""
+    total_epochs = int(cfg.train.n_epochs)
+    warmup_epochs = int(total_epochs * float(cfg.train.ch_warmup_fraction))
+    final_weight = float(cfg.train.ch_final_weight)
+    ramp_every = max(1, int(cfg.train.ch_ramp_every_n_epochs))
+
+    if current_epoch < warmup_epochs or final_weight == 0.0:
+        return 0.0
+
+    ramp_epochs = max(1, total_epochs - warmup_epochs)
+    ramp_steps = max(1, ceil(ramp_epochs / ramp_every))
+    current_step = min(
+        ((current_epoch - warmup_epochs) // ramp_every) + 1,
+        ramp_steps,
+    )
+    return final_weight * current_step / ramp_steps
 
 
 def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
@@ -71,8 +92,19 @@ def on_train_epoch_start_func(self) -> None:
     Returns:
     - None
     """
+
+    ch_weight = None
+    if hasattr(self.train_loss, "ch_weight"):
+        ch_weight = _compute_ch_weight(self.cfg, self.current_epoch)
+        self.train_loss.ch_weight = ch_weight
+
     # Reset training loss and metrics for the new epoch
     self.train_loss.reset()
+
+    if ch_weight is not None:
+        self.log("train_loss/ch_weight", ch_weight, on_epoch=True, sync_dist=True)
+        if wandb.run:
+            wandb.log({"train_loss/ch_weight": ch_weight}, commit=False)
 
     # Re-randomise chunk boundaries every N epochs to prevent the model from
     # overfitting to fixed local cell neighbourhoods.

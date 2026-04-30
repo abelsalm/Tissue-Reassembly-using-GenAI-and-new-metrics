@@ -1,5 +1,7 @@
 import pytorch_lightning as pl
 import torch
+## HERE ADD NEW LOSS
+from metrics.loss_function_plus import CombinedLossFunction
 from metrics.loss_function import LossFunction
 from models.model import Model
 from utils.data.dataholder import DataHolder
@@ -42,8 +44,26 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.dataset_infos = dataset_infos
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
-        self.train_loss = LossFunction()
-        self.val_loss = LossFunction()
+        if cfg.train.loss_type == "combined":
+            self.train_loss = CombinedLossFunction(
+                mse_weight=cfg.train.mse_weight,
+                ch_weight=0.0,
+                radii=list(cfg.train.ch_radii),
+                grid_resolution=cfg.train.ch_grid_resolution,
+                kappa=cfg.train.ch_kappa,
+                soft_max_beta=cfg.train.ch_soft_max_beta,
+                support_factor=cfg.train.ch_support_factor,
+                square_bbox=cfg.train.ch_square_bbox,
+                margin=cfg.train.ch_margin,
+                eps=cfg.train.ch_eps,
+                min_cells_per_type=cfg.train.ch_min_cells_per_type,
+            )
+            self.val_loss = self.train_loss
+        elif cfg.train.loss_type == "position_mse":
+            self.train_loss = LossFunction()
+            self.val_loss = self.train_loss
+        else:
+            raise ValueError(f"Unsupported train loss_type: {cfg.train.loss_type}")
 
         self.model = Model(
             input_dims=self.input_dims,
