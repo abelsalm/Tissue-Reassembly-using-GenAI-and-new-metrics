@@ -1,5 +1,5 @@
 
-n_epochs: 1000 # Number of epochs
+n_epochs: 4000 # Number of epochs
 batch_size: 1 # Batch size for training
 lr: 5e-4 # Learning rate
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
@@ -9,11 +9,11 @@ debug_print_shuffle_every_n_epochs: 100 # Print a shuffle canary every N epochs 
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 loss_type: "combined" # "combined" or "position_mse"
 mse_weight: 1.0
-ch_final_weight: 0.02
-ch_warmup_fraction: 0.2
+ch_final_weight: 0.05
+ch_warmup_fraction: 0.5
 ch_ramp_every_n_epochs: 10
 ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01]
-ch_grid_resolution: 512
+ch_grid_resolution: 1024
 ch_kappa: 0.5
 ch_soft_max_beta: 32.0
 ch_support_factor: 8

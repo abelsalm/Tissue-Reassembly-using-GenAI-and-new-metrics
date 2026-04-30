@@ -746,7 +746,6 @@ class CombinedLossFunction(nn.Module):
             masked_pred, masked_true, train_stage=train_stage, log=log
         )
         loss = self.mse_weight * mse_val + self.ch_weight * ch_val
-        print(f"mse_val: {mse_val.item()}, ch_val: {ch_val.item()}, loss: {loss.item()}")
 
         to_log: Optional[Dict[str, float]] = None
         if log:
