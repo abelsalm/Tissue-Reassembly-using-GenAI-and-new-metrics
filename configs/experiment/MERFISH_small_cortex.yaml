@@ -19,8 +19,8 @@ dataset:
         validation: null
 
 train: # !!!!
-    n_epochs: 100        # tiny number for a smoke-test; increase for real training
-    batch_size: 1      # keep small on CPU
+    n_epochs: 4000        # tiny number for a smoke-test; increase for real training
+    batch_size: 2      # keep small on CPU
     lr: 5e-4
 
 test:

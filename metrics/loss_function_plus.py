@@ -605,7 +605,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             total = total + self._normalized_exp_diff(auc_pred, auc_gt)
             n_types += 1
 
-        return total, n_types
+        return total/(n_types**2), n_types
 
     # ---------------- forward ----------------
 

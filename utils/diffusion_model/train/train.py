@@ -11,13 +11,16 @@ def _compute_ch_weight(cfg, current_epoch: int) -> float:
     """Step the CH loss weight from zero to its final value after warmup."""
     total_epochs = int(cfg.train.n_epochs)
     warmup_epochs = int(total_epochs * float(cfg.train.ch_warmup_fraction))
+    post_ramp_epochs = int(total_epochs * float(cfg.train.ch_ramp_fraction)) + warmup_epochs
     final_weight = float(cfg.train.ch_final_weight)
     ramp_every = max(1, int(cfg.train.ch_ramp_every_n_epochs))
 
     if current_epoch < warmup_epochs or final_weight == 0.0:
         return 0.0
+    elif current_epoch > post_ramp_epochs:
+        return final_weight
 
-    ramp_epochs = max(1, total_epochs - warmup_epochs)
+    ramp_epochs = max(1, post_ramp_epochs - warmup_epochs)
     ramp_steps = max(1, ceil(ramp_epochs / ramp_every))
     current_step = min(
         ((current_epoch - warmup_epochs) // ramp_every) + 1,
