@@ -58,6 +58,16 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 margin=cfg.train.ch_margin,
                 eps=cfg.train.ch_eps,
                 min_cells_per_type=cfg.train.ch_min_cells_per_type,
+                voronoi_weight=cfg.train.voronoi_weight,
+                voronoi_transition_width=cfg.train.voronoi_transition_width,
+                voronoi_grid_resolution=cfg.train.voronoi_grid_resolution,
+                voronoi_kappa=cfg.train.voronoi_kappa,
+                voronoi_soft_beta=cfg.train.voronoi_soft_beta,
+                voronoi_square_bbox=cfg.train.voronoi_square_bbox,
+                voronoi_margin=cfg.train.voronoi_margin,
+                voronoi_eps=cfg.train.voronoi_eps,
+                voronoi_min_cells_per_type=cfg.train.voronoi_min_cells_per_type,
+                voronoi_chunk=cfg.train.voronoi_chunk,
             )
         elif cfg.train.loss_type == "position_mse":
             self.train_loss = LossFunction()

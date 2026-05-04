@@ -9,7 +9,8 @@ debug_print_shuffle_every_n_epochs: 100 # Print a shuffle canary every N epochs 
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 loss_type: "combined" # "combined" or "position_mse"
 mse_weight: 1.0
-ch_final_weight: 0.4
+# --- CH-AUC parameters --------------------------------------------
+ch_final_weight: 0.01
 ch_warmup_fraction: 0.6
 ch_ramp_fraction: 0.2
 ch_ramp_every_n_epochs: 10
@@ -23,3 +24,13 @@ ch_square_bbox: True
 ch_margin: 0.01
 ch_eps: 1e-6
 ch_min_cells_per_type: 10
+# --- Voronoi phase-pair parameters --------------------------------
+voronoi_weight: None # None = use ch_weight, otherwise use the specified weight
+voronoi_transition_width: 0.005
+voronoi_grid_resolution: 512
+voronoi_kappa: 0.5
+voronoi_soft_beta: 1024
+voronoi_square_bbox: True
+voronoi_margin: 0.01
+voronoi_min_cells_per_type: 10
+voronoi_chunk: 128

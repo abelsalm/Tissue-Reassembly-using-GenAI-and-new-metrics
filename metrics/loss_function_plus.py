@@ -1395,7 +1395,7 @@ class CombinedLossFunction(nn.Module):
         # --- Voronoi phase-pair parameters --------------------------------
         # Disabled by default (weight=0) so the existing behaviour of this
         # combined loss is unchanged unless the user opts in.
-        voronoi_weight: float = 0.0,
+        voronoi_weight: float = None
         voronoi_transition_width: float = 0.01,
         voronoi_grid_resolution: int = 64,
         voronoi_kappa: float = 1.0,
@@ -1408,7 +1408,7 @@ class CombinedLossFunction(nn.Module):
         super().__init__()
         self.mse_weight = float(mse_weight)
         self.ch_weight = float(ch_weight)
-        self.voronoi_weight = float(voronoi_weight)
+        self.voronoi_weight = float(voronoi_weight) if voronoi_weight is not None else float(ch_weight)
 
         self.mse_loss = LossFunction()
         self.ch_loss = CahnHilliardEnergyAUCLoss(
