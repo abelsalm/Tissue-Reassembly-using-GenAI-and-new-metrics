@@ -9,7 +9,7 @@ debug_print_shuffle_every_n_epochs: 100 # Print a shuffle canary every N epochs 
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 loss_type: "combined" # "combined" or "position_mse"
 mse_weight: 1.0
-ch_final_weight: 0.01
+ch_final_weight: 0.4
 ch_warmup_fraction: 0.6
 ch_ramp_fraction: 0.2
 ch_ramp_every_n_epochs: 10

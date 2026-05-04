@@ -681,6 +681,245 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Neighborhood-averaged transcriptome RMSE loss
+# ---------------------------------------------------------------------------
+#
+# For every cell ``i`` we collect the cells ``j`` that lie within ``radius``
+# of ``i`` (Euclidean distance on the spatial coordinates) and average their
+# transcriptomic profile to obtain ``avg(i)``.  The loss is the RMSE between
+# the predicted-side and the GT-side averages, then averaged over cells.
+#
+# The transcriptomic features themselves are GT data: the model only
+# predicts positions, so the predicted-side average reuses the same
+# ``node_features`` but uses the predicted positions to define the
+# neighborhood.
+#
+# The GT-side averages do not depend on the model and can be computed once
+# (cf. :func:`precompute_gt_neighborhood_features`) and looked up at every
+# step instead of being recomputed.
+# ---------------------------------------------------------------------------
+
+
+def compute_neighborhood_average_features(
+    positions: torch.Tensor,        # [B, N, D]
+    features: torch.Tensor,         # [B, N, F]
+    mask: torch.Tensor,             # [B, N] (bool / 0-1)
+    radius: float,
+    *,
+    soft_beta: Optional[float] = None,
+    eps: float = 1e-6,
+    include_self: bool = True,
+) -> torch.Tensor:
+    """Vectorised per-cell neighborhood average of ``features``.
+
+    For each cell ``i``::
+
+        avg(i) = (sum_j w_ij * features[j]) / (sum_j w_ij)
+
+    where the sum runs over valid cells ``j`` (``mask[j] == 1``) and:
+
+      * ``w_ij = 1`` if ``dist(i, j) <= radius``, else ``0``  (default,
+        ``soft_beta=None``)  -- exact membership but **not differentiable**
+        w.r.t. the positions, since the mask is boolean.
+      * ``w_ij = sigmoid(soft_beta * (radius - dist(i, j)))``  -- a smooth
+        approximation of the step at ``dist == radius`` that is fully
+        differentiable.  Use this for the predicted side if you want the
+        loss to back-propagate through ``positions``.
+
+    The full computation is one ``cdist`` + one batched matmul:
+        ``[B, N, N] @ [B, N, F] = [B, N, F]``
+    which keeps the per-cell loop completely on the GPU.
+
+    Padding rows (``mask==0``) get zero contribution as neighbors and the
+    output rows for padded cells are zeroed out.
+    """
+    # [B, N, N] pairwise Euclidean distances. Same shape regardless of D.
+    dists = torch.cdist(positions, positions, p=2)
+
+    if soft_beta is None:
+        # Hard cutoff: boolean adjacency cast to float.
+        weights = (dists <= float(radius)).to(features.dtype)
+    else:
+        # Soft cutoff that is smooth around the boundary -> differentiable.
+        weights = torch.sigmoid(float(soft_beta) * (float(radius) - dists))
+
+    # Exclude invalid neighbors j: mask[:, None, :] broadcasts along the i axis.
+    valid_j = mask.to(weights.dtype).unsqueeze(1)
+    weights = weights * valid_j
+
+    if not include_self:
+        n = positions.shape[-2]
+        eye = torch.eye(n, device=positions.device, dtype=weights.dtype)
+        weights = weights * (1.0 - eye)
+
+    # Single batched matmul replaces a per-cell python loop.
+    sum_features = torch.matmul(weights, features)
+    denom = weights.sum(dim=-1, keepdim=True).clamp_min(eps)
+    avg = sum_features / denom
+
+    # Zero out rows for padded cells i so they cannot contaminate later means.
+    valid_i = mask.to(avg.dtype).unsqueeze(-1)
+    return avg * valid_i
+
+
+def precompute_gt_neighborhood_features(
+    true_positions: torch.Tensor,
+    node_features: torch.Tensor,
+    node_mask: torch.Tensor,
+    radius: float,
+    *,
+    save_path: Optional[str] = None,
+    soft_beta: Optional[float] = None,
+    include_self: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """One-shot helper to compute the GT neighborhood-averaged transcriptome.
+
+    Returns a tensor of shape ``[B, N, F]``. If ``save_path`` is given, the
+    detached tensor is written to disk via ``torch.save`` so it can be
+    reloaded across runs without recomputation.
+
+    The GT side does not need gradients, so the computation runs under
+    ``torch.no_grad`` to avoid building an autograd graph.
+    """
+    with torch.no_grad():
+        avg = compute_neighborhood_average_features(
+            true_positions, node_features, node_mask,
+            radius=radius,
+            soft_beta=soft_beta,
+            eps=eps,
+            include_self=include_self,
+        )
+    if save_path is not None:
+        torch.save(avg.detach().cpu(), save_path)
+    return avg
+
+
+class NeighborhoodTranscriptomeRMSELoss(nn.Module):
+    """RMSE between predicted and GT neighborhood-averaged transcriptomes.
+
+    Pipeline:
+      1. For each cell ``i`` and side (pred / GT), compute the average
+         transcriptomic profile of cells ``j`` within ``radius`` of ``i``
+         (cf. :func:`compute_neighborhood_average_features`).
+      2. ``per_cell_rmse(i) = sqrt(mean_f (avg_pred(i, f) - avg_gt(i, f))^2)``.
+      3. ``loss = mean_i per_cell_rmse(i)``  over valid (unmasked) cells.
+
+    The GT-side average is independent of the model. Either pass a
+    precomputed tensor as ``cached_gt_avg`` (recommended; see
+    :func:`precompute_gt_neighborhood_features`) or let the loss recompute
+    it under ``no_grad`` on every call.
+
+    Differentiability:
+      * ``soft_beta=None`` (default) uses a hard cutoff. The loss is
+        well-defined but its gradient w.r.t. predicted positions is zero
+        almost everywhere (the neighborhood is boolean).  Use this only as
+        a diagnostic / metric.
+      * ``soft_beta>0`` uses a sigmoid-soft membership and is differentiable
+        through the predicted positions; recommended for training.
+    """
+
+    def __init__(
+        self,
+        radius: float,
+        soft_beta: Optional[float] = None,
+        eps: float = 1e-6,
+        include_self: bool = True,
+    ) -> None:
+        super().__init__()
+        self.radius = float(radius)
+        self.soft_beta = None if soft_beta is None else float(soft_beta)
+        self.eps = float(eps)
+        self.include_self = bool(include_self)
+
+    # ---------------- GT precompute / caching ----------------
+
+    def precompute_gt(
+        self,
+        true_positions: torch.Tensor,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        save_path: Optional[str] = None,
+    ) -> torch.Tensor:
+        """Convenience wrapper around :func:`precompute_gt_neighborhood_features`."""
+        return precompute_gt_neighborhood_features(
+            true_positions, node_features, node_mask,
+            radius=self.radius,
+            save_path=save_path,
+            soft_beta=self.soft_beta,
+            include_self=self.include_self,
+            eps=self.eps,
+        )
+
+    # ---------------- forward ----------------
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        cached_gt_avg: Optional[torch.Tensor] = None,
+        train_stage: bool = True,
+        log: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        node_mask = masked_true.node_mask
+        node_features = masked_true.node_features
+        true_xy = masked_true.positions[..., :2]
+        pred_xy = masked_pred.positions[..., :2]
+
+        # GT side: either look up the cached average or recompute under
+        # no_grad. We never want autograd state on the GT.
+        if cached_gt_avg is None:
+            with torch.no_grad():
+                gt_avg = compute_neighborhood_average_features(
+                    true_xy, node_features, node_mask,
+                    radius=self.radius,
+                    soft_beta=self.soft_beta,
+                    eps=self.eps,
+                    include_self=self.include_self,
+                )
+        else:
+            gt_avg = cached_gt_avg.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+
+        # Predicted side: features are GT data, neighborhoods come from the
+        # predicted positions. Same one-matmul vectorised computation.
+        pred_avg = compute_neighborhood_average_features(
+            pred_xy, node_features, node_mask,
+            radius=self.radius,
+            soft_beta=self.soft_beta,
+            eps=self.eps,
+            include_self=self.include_self,
+        )
+
+        # Per-cell RMSE over the feature dimension.
+        sq_err = (pred_avg - gt_avg).pow(2)
+        per_cell_mse = sq_err.mean(dim=-1)
+        per_cell_rmse = torch.sqrt(per_cell_mse + self.eps)
+
+        # Mean over valid (unmasked) cells only.
+        valid_i = node_mask.to(per_cell_rmse.dtype)
+        n_valid = valid_i.sum().clamp_min(1.0)
+        loss = (per_cell_rmse * valid_i).sum() / n_valid
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            key = (
+                "train_loss/neighborhood_transcriptome_rmse"
+                if train_stage
+                else "val_loss/neighborhood_transcriptome_rmse"
+            )
+            to_log = {key: loss.item()}
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss, to_log
+
+    def reset(self) -> None:
+        """No running state to reset."""
+        pass
+
+
 class CombinedLossFunction(nn.Module):
     """Convenience wrapper combining the pairwise-distance MSE with the
     Cahn-Hilliard energy-AUC loss.
