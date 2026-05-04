@@ -605,6 +605,8 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             total = total + self._normalized_exp_diff(auc_pred, auc_gt)
             n_types += 1
 
+        # no reason to have to divide by the number of pairs squared, we can just divide by the number of pairs
+        # PLZ CHANGE THIS
         return total/(n_types**2), n_types
 
     # ---------------- forward ----------------
@@ -669,6 +671,439 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
                 key: loss.item(),
                 f"{key}/avg_types_per_sample": (
                     float(sum(type_counts)) / max(len(type_counts), 1)
+                ),
+            }
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+
+        return loss, to_log
+
+    def reset(self) -> None:
+        """No running state to reset."""
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Voronoi phase-separation energy loss (per cell-type pair)
+# ---------------------------------------------------------------------------
+#
+# Differentiable torch port of
+#     Celullar-Tissue-Spatial-Metrics-/cahn-hilliard-energy/cahn_hilliard.py
+#         build_voronoi_phase_landscape_from_cell_types
+# (see also the "comparing phase separation between two cell types" section
+# of ch_energy_tests.ipynb).
+#
+# For an unordered pair of cell types ``(A, B)`` the landscape is
+#
+#       phi_AB(x) = tanh( ( dist_A(x) - dist_B(x) ) / w )
+#
+# where ``dist_t(x)`` is the distance from the grid cell ``x`` to the
+# nearest cell of type ``t``. The field is naturally bounded in ``[-1, 1]``:
+#   * ``phi ~ -1`` where the closest cell is of type A
+#   * ``phi ~ +1`` where the closest cell is of type B
+#   * smooth sigmoid-like transition across the Voronoi frontier between
+#     the two cell types, with width ``transition_width``.
+#
+# The Cahn-Hilliard energy ``E_AB`` is then evaluated on this landscape on
+# both the ground-truth and the predicted positions. Per-pair loss:
+#
+#     L_AB = 1 - exp( -|E_pred - E_gt| / (|E_gt| + eps) )
+#
+# This mirrors the bounded, scale-invariant form already used by
+# :class:`CahnHilliardEnergyAUCLoss` (denominator is detached so the
+# normalisation does not leak gradients). The sample loss is the mean over
+# pairs; the batch loss is the mean over samples.
+#
+# Performance notes (this is where the speed-up vs. a naive per-pair
+# implementation comes from):
+#   * The bbox / shared grid is built **once per sample**, not per pair.
+#   * For each cell type ``t`` the field ``dist_t`` is computed **once**
+#     per side (GT/pred) and reused across all pairs that involve ``t``.
+#     The cost therefore scales as ``O(K * G * N_t)`` (over all types) and
+#     the per-pair work is just a tanh + a CH energy eval, both
+#     ``O(G)``. With K cell types we save a factor ``~K`` over the naive
+#     "recompute everything per pair" approach.
+#   * GT side runs under ``torch.no_grad`` to skip autograd graph
+#     construction; only the predicted side carries gradients back to
+#     ``pred_positions``.
+#   * Distance evaluation chunks the grid axis of ``cdist`` to keep peak
+#     memory bounded for samples with many cells.
+#
+# Differentiability:
+#   * ``soft_beta=None`` -> hard ``min``; sub-differentiable but exact.
+#     Gradient flows only through the closest cell (sparse but unbiased).
+#   * ``soft_beta>0`` -> ``-logsumexp(-beta * d) / beta``; a smooth
+#     soft-min that is differentiable through every contributing cell.
+#     Larger ``beta`` -> sharper, closer to the exact min.
+# ---------------------------------------------------------------------------
+
+
+def soft_nearest_distance(
+    grid_xy: torch.Tensor,    # [G, 2] -- flattened grid points (x, y)
+    cell_xy: torch.Tensor,    # [N, 2] -- cell centers (x, y)
+    soft_beta: Optional[float] = None,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Distance from each grid point to the nearest cell.
+
+    Computes ``min_i ||grid_xy[g] - cell_xy[i]||`` (or its soft
+    approximation) without materialising the full ``[G, N]`` distance
+    matrix, by chunking the ``G`` axis of ``cdist``. Differentiable w.r.t.
+    ``cell_xy`` (sparse gradient for the hard ``min``, dense gradient for
+    the soft ``min``).
+
+    Args:
+        grid_xy: ``[G, 2]`` grid sample locations.
+        cell_xy: ``[N, 2]`` cell positions.
+        soft_beta: ``None`` for an exact (hard) ``min`` over ``i``;
+            a positive float to use the smooth soft-min
+            ``-logsumexp(-beta * d) / beta`` (matches min as ``beta -> inf``).
+        chunk: number of grid points per ``cdist`` block; controls peak
+            memory of the temporary ``[chunk, N]`` distance matrix.
+
+    Returns:
+        ``[G]`` tensor of (soft-)nearest distances.
+    """
+    n_cells = cell_xy.shape[0]
+    if n_cells == 0:
+        # Convention used downstream: an "empty type" never beats any other
+        # type in the (dist_A - dist_B) comparison; +inf is a safe sentinel.
+        return torch.full(
+            (grid_xy.shape[0],),
+            float("inf"),
+            device=grid_xy.device,
+            dtype=grid_xy.dtype,
+        )
+
+    G = grid_xy.shape[0]
+    chunk = max(1, int(chunk))
+    out_chunks = []
+    # Chunk along G (the grid axis) so we never materialise the full
+    # [G, N] distance matrix; this keeps memory bounded by O(chunk * N).
+    for s in range(0, G, chunk):
+        e = min(s + chunk, G)
+        # [chunk, N] pairwise Euclidean distances.
+        d = torch.cdist(grid_xy[s:e], cell_xy, p=2)
+        if soft_beta is None:
+            out_chunks.append(d.min(dim=-1).values)
+        else:
+            beta = float(soft_beta)
+            # softmin(d_1, ..., d_N) = -logsumexp(-beta*d_i) / beta.
+            # As beta -> inf this approaches min_i d_i. logsumexp is stable.
+            out_chunks.append(-torch.logsumexp(-beta * d, dim=-1) / beta)
+    return torch.cat(out_chunks, dim=0)
+
+
+def compute_distance_field_per_type(
+    positions_xy: torch.Tensor,                  # [N, 2]
+    type_masks: Dict[int, torch.Tensor],         # type_id -> [N] bool
+    grid_x: torch.Tensor,                        # [nx]
+    grid_y: torch.Tensor,                        # [ny]
+    soft_beta: Optional[float] = None,
+    chunk: int = 4096,
+) -> Dict[int, torch.Tensor]:
+    """Per-cell-type "distance to nearest cell of that type" fields.
+
+    For each entry ``(type_id, mask)`` of ``type_masks`` we compute a
+    ``[ny, nx]`` field giving, at every grid location, the (soft-)distance
+    to the nearest cell of that type. These fields are the building block
+    of :func:`voronoi_phase_field`: they are computed **once per type**
+    per side (GT/pred), and any pair ``(A, B)`` is then constructed in
+    O(G) time as ``tanh((dist_A - dist_B) / w)``.
+
+    Empty types (no cells passing the mask) are dropped from the output.
+    """
+    ny, nx = grid_y.shape[0], grid_x.shape[0]
+    # Build the [G, 2] flattened grid once and reuse across types. Indexing
+    # convention matches `cahn_hilliard_energy_density`: dim 0 = y, dim 1 = x.
+    gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    grid_xy = torch.stack([gx.flatten(), gy.flatten()], dim=-1)  # [G, 2]
+
+    out: Dict[int, torch.Tensor] = {}
+    for type_id, mask in type_masks.items():
+        cells = positions_xy[mask]
+        if cells.shape[0] == 0:
+            continue
+        d_flat = soft_nearest_distance(
+            grid_xy, cells, soft_beta=soft_beta, chunk=chunk
+        )
+        out[type_id] = d_flat.reshape(ny, nx)
+    return out
+
+
+def voronoi_phase_field(
+    dist_neg: torch.Tensor,        # [ny, nx]
+    dist_pos: torch.Tensor,        # [ny, nx]
+    transition_width: float,
+) -> torch.Tensor:
+    """Smooth two-phase Voronoi landscape from precomputed distance fields.
+
+    ``phi(x) = tanh((dist_neg(x) - dist_pos(x)) / transition_width)`` -- the
+    same formula as ``build_voronoi_phase_landscape_from_cell_types`` from
+    ``cahn_hilliard.py``. Bounded in ``[-1, 1]`` by ``tanh``; an extra
+    ``clamp`` only catches potential numerical slop.
+    """
+    w = float(transition_width)
+    if w <= 0:
+        raise ValueError("transition_width must be > 0")
+    field = torch.tanh((dist_neg - dist_pos) / w)
+    return field.clamp(-1.0, 1.0)
+
+
+class VoronoiPhasePairEnergyLoss(nn.Module):
+    """Cahn-Hilliard energy loss over Voronoi phase-separation landscapes
+    of all unordered pairs of cell types.
+
+    For every sample in the batch:
+      1. Identify the cell types present in the (masked) sample with at
+         least ``min_cells_per_type`` cells.
+      2. Build a single shared grid covering the union bbox of all those
+         cells (GT and pred), optionally squarified.
+      3. Compute, **once per type**, the distance fields
+            ``dist_t(x) = (soft-)distance to nearest cell of type t``
+         on that grid -- once for the GT positions and once for the
+         predicted ones.
+      4. For each unordered pair ``(A, B)`` of those types, build
+            ``phi_AB = tanh((dist_A - dist_B) / transition_width)``
+         (cheap O(G) operation, reuses the precomputed dist fields), and
+         evaluate the Cahn-Hilliard energy
+            ``E_AB = sum_ij [(phi^2 - 1)^2 + kappa * |grad phi|^2] dx dy``.
+      5. Accumulate the per-pair loss
+            ``L_AB = 1 - exp(-|E_pred - E_gt| / (|E_gt| + eps))``,
+         then average over pairs (sample loss). Batch loss is the mean
+         over samples.
+
+    Note on symmetry: swapping ``(A, B) -> (B, A)`` flips the sign of
+    ``phi_AB``; the CH energy is even in ``phi`` (well: ``(c^2-1)^2``;
+    gradient term: ``|grad c|^2``), so ``E_BA = E_AB`` and we only
+    iterate over unordered pairs.
+
+    Args:
+        transition_width: width of the Voronoi frontier transition (coord
+            units). Smaller -> sharper boundary; larger -> broader.
+        grid_resolution: number of grid points per axis (``nx = ny``).
+        kappa: Cahn-Hilliard gradient-energy coefficient.
+        soft_beta: ``None`` for an exact ``min`` (sparse gradient through
+            the closest cell only, matches the reference numerics) or a
+            positive float for a smooth soft-min (dense, fully
+            differentiable through every cell). Recommended for training.
+        square_bbox: build the shared grid on the square bbox of GT u pred
+            so that x/y are on the same physical scale (matches the
+            reference helper).
+        margin: fractional padding around the (square) bbox per axis.
+        eps: numerical floor for divisions.
+        min_cells_per_type: a type contributes only if it has this many
+            cells in the masked sample.
+        chunk: ``cdist`` chunk size along the grid axis (controls peak
+            memory of the per-type distance computation).
+    """
+
+    def __init__(
+        self,
+        transition_width: float = 0.01,
+        grid_resolution: int = 64,
+        kappa: float = 1.0,
+        soft_beta: Optional[float] = None,
+        square_bbox: bool = True,
+        margin: float = 0.05,
+        eps: float = 1e-6,
+        min_cells_per_type: int = 2,
+        chunk: int = 4096,
+    ) -> None:
+        super().__init__()
+        self.transition_width = float(transition_width)
+        self.grid_resolution = int(grid_resolution)
+        self.kappa = float(kappa)
+        self.soft_beta = None if soft_beta is None else float(soft_beta)
+        self.square_bbox = bool(square_bbox)
+        self.margin = float(margin)
+        self.eps = float(eps)
+        self.min_cells_per_type = int(min_cells_per_type)
+        self.chunk = int(chunk)
+
+    # ---------------- internals ----------------
+
+    def _normalized_exp_diff(
+        self,
+        e_pred: torch.Tensor,
+        e_gt: torch.Tensor,
+    ) -> torch.Tensor:
+        """``1 - exp(-|e_pred - e_gt| / |e_gt|)``; denominator is detached.
+
+        Same bounded, scale-invariant form as
+        :class:`CahnHilliardEnergyAUCLoss._normalized_exp_diff` -- so
+        per-pair contributions remain comparable across pairs with very
+        different absolute energies, and the loss is bounded in ``[0, 1)``.
+        """
+        rel = (e_pred - e_gt).abs() / (e_gt.detach().abs() + self.eps)
+        return 1.0 - torch.exp(-rel)
+
+    def _sample_loss(
+        self,
+        pred_pos: torch.Tensor,     # [N, >=2]
+        true_pos: torch.Tensor,     # [N, >=2]
+        mask: torch.Tensor,         # [N]
+        cell_class: torch.Tensor,   # [N] integer ids (padding marked with <0)
+    ) -> Tuple[torch.Tensor, int]:
+        device = pred_pos.device
+        dtype = pred_pos.dtype
+
+        mask_b = mask.bool() if mask.dtype != torch.bool else mask
+        if cell_class.dim() == 2 and cell_class.shape[-1] == 1:
+            cell_class = cell_class.squeeze(-1)
+        elif cell_class.dim() != 1:
+            raise ValueError(
+                f"VoronoiPhasePairEnergyLoss expected cell_class shape [N] or [N, 1], "
+                f"got {tuple(cell_class.shape)}."
+            )
+
+        if mask_b.sum() == 0:
+            return torch.zeros((), device=device, dtype=dtype), 0
+
+        # Only the spatial dims drive the landscape.
+        pred_xy = pred_pos[..., :2]
+        true_xy = true_pos[..., :2]
+
+        # 1) Identify cell types that have enough cells to participate.
+        unique_types = torch.unique(cell_class[mask_b]).tolist()
+        valid_types = []
+        type_masks: Dict[int, torch.Tensor] = {}
+        for ct in unique_types:
+            if ct < 0:  # padding / invalid class id
+                continue
+            tm = mask_b & (cell_class == ct)
+            if int(tm.sum().item()) < self.min_cells_per_type:
+                continue
+            type_masks[int(ct)] = tm
+            valid_types.append(int(ct))
+
+        # Need at least two types to form a pair.
+        if len(valid_types) < 2:
+            return torch.zeros((), device=device, dtype=dtype), 0
+
+        # 2) Single shared grid covering the union of cells we will use.
+        # We restrict the bbox to cells of the participating types so the
+        # grid is as tight as possible around the actually-used data.
+        used_mask = torch.zeros_like(mask_b)
+        for ct in valid_types:
+            used_mask = used_mask | type_masks[ct]
+        grid_x, grid_y, dx, dy = shared_square_grid(
+            true_xy[used_mask], pred_xy[used_mask],
+            grid_resolution=self.grid_resolution,
+            margin=self.margin,
+            square=self.square_bbox,
+        )
+
+        # 3) Per-type distance fields, computed once per side and reused
+        # across every pair that touches that type. GT side runs under
+        # no_grad so we don't track an autograd graph for a constant target.
+        with torch.no_grad():
+            gt_dists = compute_distance_field_per_type(
+                true_xy, type_masks, grid_x, grid_y,
+                soft_beta=self.soft_beta, chunk=self.chunk,
+            )
+        pred_dists = compute_distance_field_per_type(
+            pred_xy, type_masks, grid_x, grid_y,
+            soft_beta=self.soft_beta, chunk=self.chunk,
+        )
+
+        # 4) Iterate over unordered pairs (i < j). Each iteration is O(G):
+        # build phi via tanh of precomputed differences, then evaluate the
+        # CH energy. No new cdist / no new distance computation here.
+        total = torch.zeros((), device=device, dtype=dtype)
+        n_pairs = 0
+        for i in range(len(valid_types)):
+            ta = valid_types[i]
+            if ta not in gt_dists or ta not in pred_dists:
+                continue
+            for j in range(i + 1, len(valid_types)):
+                tb = valid_types[j]
+                if tb not in gt_dists or tb not in pred_dists:
+                    continue
+
+                with torch.no_grad():
+                    phi_gt = voronoi_phase_field(
+                        gt_dists[ta], gt_dists[tb], self.transition_width
+                    )
+                    e_gt = cahn_hilliard_energy(phi_gt, dx, dy, self.kappa)
+
+                phi_pred = voronoi_phase_field(
+                    pred_dists[ta], pred_dists[tb], self.transition_width
+                )
+                e_pred = cahn_hilliard_energy(phi_pred, dx, dy, self.kappa)
+
+                total = total + self._normalized_exp_diff(e_pred, e_gt)
+                n_pairs += 1
+
+        if n_pairs == 0:
+            return torch.zeros((), device=device, dtype=dtype), 0
+
+        # 5) Sample loss = total divided by the number of pairs squared
+        return total / float(n_pairs), n_pairs
+
+    # ---------------- forward ----------------
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        train_stage: bool = True,
+        log: bool = False,
+        cell_class: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        """Compute the Voronoi phase-pair CH energy loss.
+
+        Args:
+            masked_pred: DataHolder with predicted ``.positions`` of shape
+                ``[B, N, >=2]`` and ``.node_mask`` of shape ``[B, N]``.
+            masked_true: DataHolder with ground-truth ``.positions`` and
+                ``.cell_class`` of shape ``[B, N]`` (integer ids).
+            train_stage: True for training logs, False for validation logs.
+            log: whether to emit a WandB log line.
+            cell_class: optional override for the per-cell integer class
+                tensor, shape ``[B, N]``.
+        """
+        if cell_class is None:
+            cell_class = masked_true.cell_class
+        if cell_class is None:
+            raise ValueError(
+                "VoronoiPhasePairEnergyLoss requires cell_class; none was provided."
+            )
+
+        pred_positions = masked_pred.positions
+        true_positions = masked_true.positions
+        node_mask = masked_true.node_mask
+
+        B = pred_positions.shape[0]
+        losses = []
+        pair_counts = []
+        for b in range(B):
+            loss_b, n_pairs_b = self._sample_loss(
+                pred_positions[b],
+                true_positions[b],
+                node_mask[b],
+                cell_class[b],
+            )
+            losses.append(loss_b)
+            pair_counts.append(n_pairs_b)
+
+        # Batch loss = mean over samples (samples with no valid pair
+        # contribute a 0 from _sample_loss, which is reasonable since they
+        # carry no signal -- they're effectively a no-op for this loss).
+        stacked = torch.stack(losses)
+        loss = stacked.mean()
+
+        to_log = None
+        if log:
+            key = (
+                "train_loss/voronoi_phase_pair_ch_energy"
+                if train_stage
+                else "val_loss/voronoi_phase_pair_ch_energy"
+            )
+            to_log = {
+                key: loss.item(),
+                f"{key}/avg_pairs_per_sample": (
+                    float(sum(pair_counts)) / max(len(pair_counts), 1)
                 ),
             }
             if wandb.run:
@@ -921,18 +1356,29 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
 
 
 class CombinedLossFunction(nn.Module):
-    """Convenience wrapper combining the pairwise-distance MSE with the
-    Cahn-Hilliard energy-AUC loss.
+    """Convenience wrapper combining:
+       * the pairwise-distance MSE (``LossFunction``),
+       * the Cahn-Hilliard energy-AUC loss (``CahnHilliardEnergyAUCLoss``),
+       * the Voronoi phase-pair CH-energy loss
+         (``VoronoiPhasePairEnergyLoss``).
 
-        L = mse_weight * L_mse + ch_weight * L_ch
+           L = mse_weight   * L_mse
+             + ch_weight    * L_ch_auc
+             + voronoi_weight * L_voronoi_pair
 
-    Either component can be turned off by setting its weight to 0.
+    Any component can be turned off by setting its weight to ``0`` (we
+    short-circuit those branches so we don't pay their cost).
+
+    Parameters are split by component using a ``voronoi_*`` prefix to
+    avoid colliding with the existing CH-AUC parameters (some of which
+    have similar names, e.g. ``grid_resolution``).
     """
 
     def __init__(
         self,
         mse_weight: float = 1.0,
         ch_weight: float = 1.0,
+        # --- CH-AUC parameters --------------------------------------------
         radii: Sequence[float] = np.linspace(0.0004, 0.01, 25),
         grid_resolution: int = 64,
         kappa: float = 1.0,
@@ -946,10 +1392,24 @@ class CombinedLossFunction(nn.Module):
         margin: float = 0.05,
         eps: float = 1e-6,
         min_cells_per_type: int = 2,
+        # --- Voronoi phase-pair parameters --------------------------------
+        # Disabled by default (weight=0) so the existing behaviour of this
+        # combined loss is unchanged unless the user opts in.
+        voronoi_weight: float = 0.0,
+        voronoi_transition_width: float = 0.01,
+        voronoi_grid_resolution: int = 64,
+        voronoi_kappa: float = 1.0,
+        voronoi_soft_beta: Optional[float] = None,
+        voronoi_square_bbox: bool = True,
+        voronoi_margin: float = 0.05,
+        voronoi_min_cells_per_type: int = 2,
+        voronoi_chunk: int = 4096,
     ) -> None:
         super().__init__()
         self.mse_weight = float(mse_weight)
         self.ch_weight = float(ch_weight)
+        self.voronoi_weight = float(voronoi_weight)
+
         self.mse_loss = LossFunction()
         self.ch_loss = CahnHilliardEnergyAUCLoss(
             radii=radii,
@@ -966,6 +1426,20 @@ class CombinedLossFunction(nn.Module):
             eps=eps,
             min_cells_per_type=min_cells_per_type,
         )
+        # We always instantiate the Voronoi loss so users can introspect /
+        # toggle it without recreating the combined module; if the weight
+        # is 0 we just skip its forward pass (see ``forward`` below).
+        self.voronoi_loss = VoronoiPhasePairEnergyLoss(
+            transition_width=voronoi_transition_width,
+            grid_resolution=voronoi_grid_resolution,
+            kappa=voronoi_kappa,
+            soft_beta=voronoi_soft_beta,
+            square_bbox=voronoi_square_bbox,
+            margin=voronoi_margin,
+            eps=eps,
+            min_cells_per_type=voronoi_min_cells_per_type,
+            chunk=voronoi_chunk,
+        )
 
     def forward(
         self,
@@ -974,17 +1448,28 @@ class CombinedLossFunction(nn.Module):
         train_stage: bool = True,
         log: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        # MSE is essentially free, always compute it (and weight it).
         mse_val, mse_log = self.mse_loss(
             masked_pred, masked_true, train_stage=train_stage, log=log
         )
+        loss = self.mse_weight * mse_val
 
-        if self.ch_weight == 0.0:
-            return self.mse_weight * mse_val, mse_log
+        # CH-AUC: skip entirely if disabled (it's the most expensive of
+        # the three; no point running it just to multiply by zero).
+        ch_log: Optional[Dict[str, float]] = None
+        if self.ch_weight != 0.0:
+            ch_val, ch_log = self.ch_loss(
+                masked_pred, masked_true, train_stage=train_stage, log=log
+            )
+            loss = loss + self.ch_weight * ch_val
 
-        ch_val, ch_log = self.ch_loss(
-            masked_pred, masked_true, train_stage=train_stage, log=log
-        )
-        loss = self.mse_weight * mse_val + self.ch_weight * ch_val
+        # Voronoi phase-pair: same short-circuit pattern.
+        voronoi_log: Optional[Dict[str, float]] = None
+        if self.voronoi_weight != 0.0:
+            voronoi_val, voronoi_log = self.voronoi_loss(
+                masked_pred, masked_true, train_stage=train_stage, log=log
+            )
+            loss = loss + self.voronoi_weight * voronoi_val
 
         to_log: Optional[Dict[str, float]] = None
         if log:
@@ -994,6 +1479,8 @@ class CombinedLossFunction(nn.Module):
                 to_log.update(mse_log)
             if ch_log is not None:
                 to_log.update(ch_log)
+            if voronoi_log is not None:
+                to_log.update(voronoi_log)
             if wandb.run:
                 wandb.log(to_log, commit=True)
         return loss, to_log
@@ -1001,6 +1488,7 @@ class CombinedLossFunction(nn.Module):
     def reset(self) -> None:
         self.mse_loss.reset()
         self.ch_loss.reset()
+        self.voronoi_loss.reset()
 
     def log_epoch_metrics(self) -> Dict[str, float]:
         return self.mse_loss.log_epoch_metrics()
