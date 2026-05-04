@@ -607,7 +607,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
 
         # no reason to have to divide by the number of pairs squared, we can just divide by the number of pairs
         # PLZ CHANGE THIS
-        return total/(n_types**2), n_types
+        return total/(n_types), n_types
 
     # ---------------- forward ----------------
 
