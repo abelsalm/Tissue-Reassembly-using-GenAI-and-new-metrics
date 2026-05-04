@@ -1108,6 +1108,8 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
             }
             if wandb.run:
                 wandb.log(to_log, commit=True)
+        
+        print(f"Voronoi phase-pair CH energy loss: {loss.item()}")
 
         return loss, to_log
 
@@ -1395,7 +1397,7 @@ class CombinedLossFunction(nn.Module):
         # --- Voronoi phase-pair parameters --------------------------------
         # Disabled by default (weight=0) so the existing behaviour of this
         # combined loss is unchanged unless the user opts in.
-        voronoi_weight: float = None
+        voronoi_weight: float = None,
         voronoi_transition_width: float = 0.01,
         voronoi_grid_resolution: int = 64,
         voronoi_kappa: float = 1.0,
@@ -1408,7 +1410,7 @@ class CombinedLossFunction(nn.Module):
         super().__init__()
         self.mse_weight = float(mse_weight)
         self.ch_weight = float(ch_weight)
-        self.voronoi_weight = float(voronoi_weight) if voronoi_weight is not None else float(ch_weight)
+        self.voronoi_weight = float(voronoi_weight) if voronoi_weight != -1 else float(ch_weight)
 
         self.mse_loss = LossFunction()
         self.ch_loss = CahnHilliardEnergyAUCLoss(
@@ -1447,12 +1449,21 @@ class CombinedLossFunction(nn.Module):
         masked_true: DataHolder,
         train_stage: bool = True,
         log: bool = False,
+        verbose: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+
+        if verbose:
+            print(f"MSE weight: {self.mse_weight}")
+            print(f"CH weight: {self.ch_weight}")
+            print(f"Voronoi weight: {self.voronoi_weight}")
+
         # MSE is essentially free, always compute it (and weight it).
         mse_val, mse_log = self.mse_loss(
             masked_pred, masked_true, train_stage=train_stage, log=log
         )
         loss = self.mse_weight * mse_val
+
+        
 
         # CH-AUC: skip entirely if disabled (it's the most expensive of
         # the three; no point running it just to multiply by zero).

@@ -65,7 +65,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 voronoi_soft_beta=cfg.train.voronoi_soft_beta,
                 voronoi_square_bbox=cfg.train.voronoi_square_bbox,
                 voronoi_margin=cfg.train.voronoi_margin,
-                voronoi_eps=cfg.train.voronoi_eps,
                 voronoi_min_cells_per_type=cfg.train.voronoi_min_cells_per_type,
                 voronoi_chunk=cfg.train.voronoi_chunk,
             )

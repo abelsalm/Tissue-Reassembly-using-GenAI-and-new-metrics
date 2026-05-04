@@ -100,6 +100,8 @@ def on_train_epoch_start_func(self) -> None:
     if hasattr(self.train_loss, "ch_weight"):
         ch_weight = _compute_ch_weight(self.cfg, self.current_epoch)
         self.train_loss.ch_weight = ch_weight
+        if self.cfg.train.voronoi_weight == -1:
+            self.train_loss.voronoi_weight = ch_weight
 
     # Reset training loss and metrics for the new epoch
     self.train_loss.reset()
