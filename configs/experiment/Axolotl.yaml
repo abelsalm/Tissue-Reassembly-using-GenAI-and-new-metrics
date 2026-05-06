@@ -1,21 +1,21 @@
 # @package _global_
 general:
-    name : 'MERFISH_small_cortex'
+    name : 'Axolotl'
     mode : 'train_and_test'
 
 distribute:
     gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
 
 dataset:
-    dataset_name: 'MERFISH_small_cortex'
-    gene_columns_start: 0   # first column after the index is a gene
-    gene_columns_end: 254    #
-    train_data_path: "/data-master/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_train.csv"
-    test_data_path: "/data-master/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv"
+    dataset_name: 'Axolotl'
+    gene_columns_start: 5   # first column after the index is a gene
+    gene_columns_end: -1 
+    train_data_path: "/data-master/biodata/Axolotl/train_cells_expression.csv"
+    test_data_path: "/data-master/biodata/Axolotl/test_cells_expression.csv"
     validation_data_path: ""
     maximum_graph_size:
-        train:  null   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
-        test: null
+        train:  3000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: 3000
         validation: null
 
 train: # !!!!

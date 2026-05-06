@@ -7,11 +7,11 @@ weight_decay: 1.0e-12
 rechunk_every_n_epochs: 0 # Re-randomise chunk boundaries every N epochs (0 = disabled)
 debug_print_shuffle_every_n_epochs: 100 # Print a shuffle canary every N epochs (0 = disabled)
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
-loss_type: "combined" # "combined" or "position_mse"
+loss_type: "position_mse" # "combined" or "position_mse"
 mse_weight: 1.0
 # --- CH-AUC parameters --------------------------------------------
-ch_final_weight: 0.01
-ch_warmup_fraction: 0.2
+ch_final_weight: 0.00
+ch_warmup_fraction: 0.5
 ch_ramp_fraction: 0.2
 ch_ramp_every_n_epochs: 10
 ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01]
@@ -30,7 +30,9 @@ voronoi_transition_width: 0.005
 voronoi_grid_resolution: 512
 voronoi_kappa: 0.5
 voronoi_soft_beta: 1024
-voronoi_square_bbox: True
+voronoi_square_bbox: True 
 voronoi_margin: 0.01
 voronoi_min_cells_per_type: 10
 voronoi_chunk: 128
+voronoi_cache_gt: True # Cache GT-side Voronoi energies; skips recomputing the constant target side every step
+voronoi_cache_key_mode: "content" # "content" (shuffle-safe, keys by cell_ID hash) or "slot" (keys by (batch_idx, sample_idx); only correct when DataLoader shuffle=False AND no rechunking)

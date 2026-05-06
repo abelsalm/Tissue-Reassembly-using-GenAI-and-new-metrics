@@ -64,6 +64,9 @@ class LossFunction(nn.Module):
         masked_true: DataHolder,
         train_stage: bool = True,  # Default value set to True
         log: bool = False,  # Default value set to False
+        **_unused: object,  # accept (and ignore) e.g. ``batch_idx`` from
+        # the training loop so this loss stays drop-in compatible with
+        # the richer loss APIs (``CombinedLossFunction``, etc.).
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
         self.node_mask = masked_true.node_mask
 
@@ -391,27 +394,54 @@ def build_continuous_landscape_from_points(
 # ---------- Cahn-Hilliard energy (mirror ContinuousLandscape2D energy) -----
 
 
+def _grad_xy_edge_order_1(
+    phi: torch.Tensor, dx: float, dy: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Central-difference gradient with ``edge_order=1`` boundaries.
+
+    Numerically identical to ``torch.gradient(phi, spacing=(dy, dx),
+    dim=(-2, -1))`` (and to ``np.gradient(..., edge_order=1)``), but
+    inlined as slice + ``cat`` so it skips the Python wrapper and works
+    naturally on any leading batch shape ``[..., ny, nx]``. Note: a
+    direct ``F.conv2d`` with ``[-1, 0, 1]`` doesn't reproduce the
+    ``edge_order=1`` boundary scaling without per-edge fix-ups, which
+    would cancel the cuDNN win -- the slice+cat path below is faster in
+    practice for our grid sizes.
+
+    Returns ``(d_phi_dy, d_phi_dx)``, each shaped like ``phi``.
+    """
+    inner_x = (phi[..., :, 2:] - phi[..., :, :-2]) / (2.0 * dx)
+    left_x = ((phi[..., :, 1] - phi[..., :, 0]) / dx).unsqueeze(-1)
+    right_x = ((phi[..., :, -1] - phi[..., :, -2]) / dx).unsqueeze(-1)
+    dphi_dx = torch.cat([left_x, inner_x, right_x], dim=-1)
+
+    inner_y = (phi[..., 2:, :] - phi[..., :-2, :]) / (2.0 * dy)
+    top_y = ((phi[..., 1, :] - phi[..., 0, :]) / dy).unsqueeze(-2)
+    bot_y = ((phi[..., -1, :] - phi[..., -2, :]) / dy).unsqueeze(-2)
+    dphi_dy = torch.cat([top_y, inner_y, bot_y], dim=-2)
+
+    return dphi_dy, dphi_dx
+
+
 def cahn_hilliard_energy_density(
-    phi: torch.Tensor,                    # [ny, nx] with values in [-1, 1]
+    phi: torch.Tensor,                    # [..., ny, nx] with values in [-1, 1]
     dx: float,
     dy: float,
     kappa: float = 1.0,
 ) -> torch.Tensor:
     """Discrete energy density ``e = (phi^2 - 1)^2 + kappa * |grad phi|^2``.
 
-    Mirrors :meth:`ContinuousLandscape2D.cahn_hilliard_energy_density`. Uses
-    ``torch.gradient`` (central differences with ``edge_order=1`` boundary
-    handling), the same scheme as ``np.gradient(c, dy, dx, edge_order=1)``.
+    Mirrors :meth:`ContinuousLandscape2D.cahn_hilliard_energy_density`.
+    Accepts any leading batch dims (e.g. ``[P, ny, nx]`` for stacked
+    pair fields); the gradient is taken along the last two axes so a
+    bare ``[ny, nx]`` input still works unchanged.
     """
     if kappa < 0:
         raise ValueError("kappa must be >= 0")
 
     well = (phi * phi - 1.0).pow(2)
 
-    # torch.gradient defaults to edge_order=1 (one-sided on borders, central
-    # inside) and returns gradients in the order the spacing is given,
-    # matching np.gradient conventions.
-    dphi_dy, dphi_dx = torch.gradient(phi, spacing=(float(dy), float(dx)))
+    dphi_dy, dphi_dx = _grad_xy_edge_order_1(phi, dx, dy)
     grad_sq = dphi_dx * dphi_dx + dphi_dy * dphi_dy
 
     return well + kappa * grad_sq
@@ -423,8 +453,14 @@ def cahn_hilliard_energy(
     dy: float,
     kappa: float = 1.0,
 ) -> torch.Tensor:
-    """Integrated Cahn-Hilliard energy (Riemann sum)."""
-    return cahn_hilliard_energy_density(phi, dx, dy, kappa=kappa).sum() * dx * dy
+    """Integrated Cahn-Hilliard energy (Riemann sum).
+
+    For ``phi`` of shape ``[..., ny, nx]`` returns a tensor of shape
+    ``[...]`` (so a 2D phi yields a scalar; a stacked ``[P, ny, nx]``
+    yields ``[P]`` energies in one fused kernel).
+    """
+    density = cahn_hilliard_energy_density(phi, dx, dy, kappa=kappa)
+    return density.sum(dim=(-2, -1)) * dx * dy
 
 
 # ---------- Loss module ----------------------------------------------------
@@ -832,22 +868,158 @@ def compute_distance_field_per_type(
 
 
 def voronoi_phase_field(
-    dist_neg: torch.Tensor,        # [ny, nx]
-    dist_pos: torch.Tensor,        # [ny, nx]
+    dist_neg: torch.Tensor,        # [..., ny, nx]
+    dist_pos: torch.Tensor,        # [..., ny, nx]
     transition_width: float,
 ) -> torch.Tensor:
     """Smooth two-phase Voronoi landscape from precomputed distance fields.
 
     ``phi(x) = tanh((dist_neg(x) - dist_pos(x)) / transition_width)`` -- the
     same formula as ``build_voronoi_phase_landscape_from_cell_types`` from
-    ``cahn_hilliard.py``. Bounded in ``[-1, 1]`` by ``tanh``; an extra
-    ``clamp`` only catches potential numerical slop.
+    ``cahn_hilliard.py``. ``tanh`` already returns in ``(-1, 1)`` by
+    construction, so no further clamp is applied (one fewer kernel).
     """
     w = float(transition_width)
     if w <= 0:
         raise ValueError("transition_width must be > 0")
-    field = torch.tanh((dist_neg - dist_pos) / w)
-    return field.clamp(-1.0, 1.0)
+    return torch.tanh((dist_neg - dist_pos) / w)
+
+
+def compute_distance_fields_per_type_fused(
+    grid_xy: torch.Tensor,            # [G, 2]
+    grid_norm_sq: torch.Tensor,       # [G] precomputed ||g||^2
+    cells_xy: torch.Tensor,           # [N, 2] cells of *all* valid types stacked
+    cell_type_idx: torch.Tensor,      # [N] in [0, T)
+    num_types: int,
+    soft_beta: Optional[float] = None,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Per-type "(soft-)distance to nearest cell of that type" fields.
+
+    Two fused changes compared to :func:`compute_distance_field_per_type`:
+
+    1. **Single pass over all cells** (instead of one ``cdist`` per type):
+       we compute the squared-distance matrix ``[Gc, N]`` once per grid
+       chunk, then reduce per-type via ``scatter_reduce`` along the cell
+       axis. With ``T`` types this trades ``T`` cdist calls for one
+       matmul + one scatter, removing ``T-1`` full grid passes.
+    2. **Matmul expansion of the squared distance**:
+       ``||g - c||^2 = ||g||^2 + ||c||^2 - 2 g.c``. The dot product is
+       a plain ``matmul`` (cuBLAS / tensor cores), much faster than
+       ``cdist(p=2)`` whose general kernel doesn't take advantage of
+       tensor-core matmul. The ``sqrt`` is then applied only on the
+       reduced ``[Gc, T]`` tensor for the hard-min branch -- one
+       ``sqrt`` over ``Gc * T`` values instead of ``Gc * N``.
+
+    Soft-min branch: we still need ``sqrt(d2)`` over the full ``[Gc, N]``
+    tensor (because ``-logsumexp(-beta * d)/beta`` is defined on
+    distances, not squared distances), but the squared-distance matmul
+    itself is still cheaper than ``cdist``.
+
+    Args:
+        grid_xy: ``[G, 2]`` flattened grid points.
+        grid_norm_sq: ``[G]`` precomputed ``(grid_xy ** 2).sum(-1)``;
+            cached to avoid recomputing each step.
+        cells_xy: ``[N, 2]`` positions of cells across **all** valid
+            types (concatenated -- not one tensor per type).
+        cell_type_idx: ``[N]`` integer in ``[0, num_types)`` indicating
+            which valid-type each cell belongs to.
+        num_types: ``T``, the number of valid types.
+        soft_beta: ``None`` for hard min (sqrt-at-the-end), positive
+            float for the smooth ``-logsumexp(-beta * d)/beta`` softmin.
+        chunk: how many grid rows to process at once. Controls the peak
+            ``[chunk, N]`` working-set memory.
+
+    Returns:
+        ``[T, G]`` tensor of (soft-)distances. The caller reshapes to
+        ``[T, ny, nx]`` outside.
+    """
+    G = grid_xy.shape[0]
+    N = cells_xy.shape[0]
+    device = grid_xy.device
+    dtype = grid_xy.dtype
+
+    if N == 0 or num_types == 0:
+        # No cells of any valid type -> +inf everywhere (sentinel used
+        # downstream to mean "this type loses every distance comparison").
+        return torch.full((max(num_types, 1), G), float("inf"),
+                          device=device, dtype=dtype)
+
+    cell_norm_sq = (cells_xy * cells_xy).sum(-1)  # [N]
+    out = torch.empty((num_types, G), device=device, dtype=dtype)
+
+    chunk = max(1, int(chunk))
+    # Index tensor used by the scatter_reduce/scatter_add ops; stays the
+    # same across chunks (only the row dim Gc changes).
+    type_idx_row = cell_type_idx.unsqueeze(0)  # [1, N]
+
+    for s in range(0, G, chunk):
+        e = min(s + chunk, G)
+        Gc = e - s
+
+        g = grid_xy[s:e]                         # [Gc, 2]
+        gn2 = grid_norm_sq[s:e].unsqueeze(-1)    # [Gc, 1]
+
+        # Squared-distance matrix via matmul expansion.
+        dot = g @ cells_xy.t()                   # [Gc, N]  (tensor cores)
+        d2 = gn2 + cell_norm_sq.unsqueeze(0) - 2.0 * dot
+        # Float32 roundoff in the expansion can push d2 slightly below
+        # zero (or to exactly zero) when the actual distance is tiny.
+        # Clamping at a small *positive* epsilon keeps both forward and
+        # backward well-behaved: the forward bias is at most ``sqrt(eps)``
+        # (~1e-6 in coord units, far below any meaningful spatial scale),
+        # but ``sqrt`` then has a finite derivative everywhere. This is
+        # the safety net that ``torch.cdist`` provides internally and
+        # that a plain ``matmul`` does not -- without it, a cell sitting
+        # exactly on a grid point makes ``d/dx sqrt(x)|_0 = inf`` and
+        # NaNs the backward.
+        eps_d2 = 1e-12
+        d2 = d2.clamp_min(eps_d2)
+
+        type_idx_chunk = type_idx_row.expand(Gc, N)
+
+        if soft_beta is None:
+            # Hard min: scatter-amin over the cell axis, grouped by type.
+            min_d2 = torch.full(
+                (Gc, num_types), float("inf"),
+                device=device, dtype=dtype,
+            )
+            min_d2.scatter_reduce_(
+                dim=1, index=type_idx_chunk, src=d2,
+                reduce="amin", include_self=False,
+            )
+            # One sqrt on the reduced tensor [Gc, T] (instead of [Gc, N]).
+            out[:, s:e] = min_d2.sqrt().t()
+        else:
+            beta = float(soft_beta)
+            # -logsumexp trick: subtract per-type max for numerical stability.
+            d = d2.sqrt()                        # [Gc, N]
+            neg_beta_d = -beta * d               # [Gc, N]
+            # Per-(grid, type) max of -beta*d.
+            max_per_t = torch.full(
+                (Gc, num_types), float("-inf"),
+                device=device, dtype=dtype,
+            )
+            max_per_t.scatter_reduce_(
+                dim=1, index=type_idx_chunk, src=neg_beta_d,
+                reduce="amax", include_self=False,
+            )
+            # Broadcast each cell's per-type max back to its position.
+            shifted = neg_beta_d - max_per_t.gather(1, type_idx_chunk)
+            # Sum exp(shifted) per type.
+            sums = torch.zeros(
+                (Gc, num_types), device=device, dtype=dtype,
+            )
+            sums.scatter_add_(
+                dim=1, index=type_idx_chunk, src=shifted.exp(),
+            )
+            # log-sum-exp: max + log(sum). clamp_min guards types with
+            # zero cells in this batch (sums == 0 -> log(0) = -inf,
+            # which yields softmin = +inf -- the correct sentinel).
+            lse = max_per_t + sums.clamp_min(1e-30).log()
+            out[:, s:e] = (-lse / beta).t()
+
+    return out  # [T, G]
 
 
 class VoronoiPhasePairEnergyLoss(nn.Module):
@@ -909,6 +1081,8 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         eps: float = 1e-6,
         min_cells_per_type: int = 2,
         chunk: int = 4096,
+        cache_gt: bool = False,
+        cache_key_mode: Literal["content", "slot"] = "content",
     ) -> None:
         super().__init__()
         self.transition_width = float(transition_width)
@@ -920,6 +1094,48 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         self.eps = float(eps)
         self.min_cells_per_type = int(min_cells_per_type)
         self.chunk = int(chunk)
+        # When ``cache_gt`` is enabled, the grid is built from GT cells
+        # *only* (instead of the GT u pred union), which makes the grid --
+        # and therefore the GT distance fields and pair energies -- depend
+        # on the input batch only, never on the model's predictions. This
+        # is what makes caching across training steps correct.
+        self.cache_gt = bool(cache_gt)
+        # Two ways to key the cache:
+        #   * "content" (default, shuffle-safe): hash the cell_ID tensor
+        #     of the sample. The same chunk of cells maps to the same
+        #     cache entry regardless of which (batch_idx, sample_idx)
+        #     slot it lands in -- so the cache survives DataLoader
+        #     ``shuffle=True``, which is the standard training setup.
+        #   * "slot": use ``(batch_idx, sample_idx)``. Faster lookup but
+        #     only useful when sample-to-batch assignment is stable
+        #     across epochs (no shuffling, no rechunking). Kept as an
+        #     escape hatch; not recommended for typical training.
+        if cache_key_mode not in ("content", "slot"):
+            raise ValueError(
+                f"cache_key_mode must be 'content' or 'slot', got {cache_key_mode!r}."
+            )
+        self.cache_key_mode = cache_key_mode
+        # Maps cache_key -> dict with the cached GT data:
+        #   {"cell_id", "grid_x", "grid_y", "dx", "dy",
+        #    "valid_types", "type_masks", "pair_energies"}
+        # The key type depends on ``cache_key_mode``: ``bytes`` for
+        # "content", ``Tuple[int, int]`` for "slot". Tensors are kept on
+        # the device they were computed on (typically CUDA); per-entry
+        # footprint is small (a 1D grid of ``grid_resolution`` floats
+        # per axis, a few ``[N]`` boolean type masks, and one scalar per
+        # cell-type pair).
+        self._gt_cache: Dict = {}
+
+    def clear_gt_cache(self) -> None:
+        """Drop all cached GT data.
+
+        Call after an event that changes the GT cells assigned to a given
+        ``(batch_idx, sample_idx)`` slot -- e.g. dataset rechunking or
+        re-shuffling. Note that the cache is *also* automatically
+        invalidated per-entry when the ``cell_ID`` fingerprint of a sample
+        changes, so calling this manually is usually only a safety net.
+        """
+        self._gt_cache.clear()
 
     # ---------------- internals ----------------
 
@@ -944,6 +1160,10 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         true_pos: torch.Tensor,     # [N, >=2]
         mask: torch.Tensor,         # [N]
         cell_class: torch.Tensor,   # [N] integer ids (padding marked with <0)
+        *,
+        batch_idx: Optional[int] = None,
+        sample_idx: Optional[int] = None,
+        cell_id: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, int]:
         device = pred_pos.device
         dtype = pred_pos.dtype
@@ -964,82 +1184,212 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         pred_xy = pred_pos[..., :2]
         true_xy = true_pos[..., :2]
 
-        # 1) Identify cell types that have enough cells to participate.
-        unique_types = torch.unique(cell_class[mask_b]).tolist()
-        valid_types = []
-        type_masks: Dict[int, torch.Tensor] = {}
-        for ct in unique_types:
-            if ct < 0:  # padding / invalid class id
-                continue
-            tm = mask_b & (cell_class == ct)
-            if int(tm.sum().item()) < self.min_cells_per_type:
-                continue
-            type_masks[int(ct)] = tm
-            valid_types.append(int(ct))
+        # ---- (Optional) cache lookup ---------------------------------
+        # Try to reuse the GT-side data computed on a previous call.
+        # The key depends on ``cache_key_mode``:
+        #   * "content": hash of the sample's ``cell_id`` -> survives
+        #     DataLoader shuffling, because the same chunk of cells maps
+        #     to the same key regardless of where it lands in the epoch.
+        #   * "slot": ``(batch_idx, sample_idx)`` -> only correct when
+        #     sample-to-slot is stable (no shuffling, no rechunking).
+        # In both modes ``cell_id`` is *also* stored as a fingerprint and
+        # checked on hit, so a stale entry is rebuilt rather than reused.
+        cache_key = None
+        if self.cache_gt:
+            if self.cache_key_mode == "content" and cell_id is not None:
+                # Hash via tobytes(): O(N) and fully deterministic.
+                # ``int64`` cast guards against future dtype drift (the
+                # bytes representation must be stable for the same IDs).
+                cache_key = (
+                    "cid",
+                    cell_id.detach().to(torch.int64).cpu().contiguous().numpy().tobytes(),
+                )
+            elif self.cache_key_mode == "slot" \
+                    and batch_idx is not None and sample_idx is not None:
+                cache_key = ("slot", int(batch_idx), int(sample_idx))
 
-        # Need at least two types to form a pair.
-        if len(valid_types) < 2:
+        cached: Optional[Dict] = None
+        if cache_key is not None:
+            cached = self._gt_cache.get(cache_key)
+            if cached is not None and cell_id is not None:
+                cached_cid = cached.get("cell_id")
+                # Detach + same-device compare; cheap for typical sample
+                # sizes (a few thousand ints). Acts as a defensive
+                # fingerprint check (collision guard for "content" mode,
+                # rechunk guard for "slot" mode).
+                if cached_cid is None or cached_cid.shape != cell_id.shape \
+                        or not torch.equal(cached_cid, cell_id.detach()):
+                    cached = None  # stale entry: rebuild below
+
+        # ---- Compute the GT side (only if not cached) ----------------
+        if cached is None:
+            # 1) Identify valid types in a single fused pass (avenue 11):
+            # one ``torch.unique(..., return_counts=True)`` replaces the
+            # old per-type Python loop with its many ``.item()`` syncs.
+            masked_classes = cell_class[mask_b]
+            masked_classes = masked_classes[masked_classes >= 0]
+            if masked_classes.numel() == 0:
+                if cache_key is not None:
+                    self._gt_cache[cache_key] = {
+                        "cell_id": cell_id.detach() if cell_id is not None else None,
+                        "valid_types": [],
+                    }
+                return torch.zeros((), device=device, dtype=dtype), 0
+
+            uniq, counts = torch.unique(masked_classes, return_counts=True)
+            keep = counts >= self.min_cells_per_type
+            valid_types_t = uniq[keep]              # sorted, [T]
+            num_types = int(valid_types_t.numel())  # one sync
+            if num_types < 2:
+                if cache_key is not None:
+                    self._gt_cache[cache_key] = {
+                        "cell_id": cell_id.detach() if cell_id is not None else None,
+                        "valid_types": [],
+                    }
+                return torch.zeros((), device=device, dtype=dtype), 0
+
+            # ``participates[c]`` <=> cell c is masked AND in a valid type.
+            participates = mask_b & torch.isin(cell_class, valid_types_t)
+            classes_kept = cell_class[participates]
+            # ``valid_types_t`` is sorted (output of ``torch.unique``), so
+            # ``searchsorted`` gives each cell its valid-type index in [0, T).
+            cell_type_idx = torch.searchsorted(valid_types_t, classes_kept)
+
+            # Single ``tolist()`` so the cache stores Python-friendly type
+            # ids too (one sync, used only for logging/introspection).
+            valid_types = valid_types_t.tolist()
+
+            # 2) GT-only grid (decoupled from pred so the cache stays valid).
+            # The bbox spans **all real GT cells** of the sample (every
+            # cell with ``mask_b == True``), regardless of whether their
+            # type passed the ``min_cells_per_type`` filter. This makes
+            # the grid extent independent of the type-validity threshold:
+            # the same square is used for every (a, b) pair on this
+            # sample, and for both GT and pred sides. Cells of
+            # non-valid types still don't contribute to any distance
+            # field (see ``cell_type_idx`` below) -- they only widen the
+            # bbox so the grid covers the actual spatial extent of the
+            # sample.
+            gt_bbox_pts = true_xy[mask_b]
+            grid_x, grid_y, dx, dy = shared_square_grid(
+                gt_bbox_pts, gt_bbox_pts,
+                grid_resolution=self.grid_resolution,
+                margin=self.margin,
+                square=self.square_bbox,
+            )
+
+            # 3) Pre-build the flat grid + its squared norms once and cache
+            # them (avenue 9). These are reused on every pred step.
+            ny, nx = grid_y.shape[0], grid_x.shape[0]
+            gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+            grid_xy = torch.stack([gx.flatten(), gy.flatten()], dim=-1)  # [G, 2]
+            grid_norm_sq = (grid_xy * grid_xy).sum(-1)                   # [G]
+
+            # 4) Pair indices, computed once on the (cached) grid.
+            pair_idx = torch.triu_indices(
+                num_types, num_types, offset=1, device=device,
+            )  # [2, P]
+            pair_idx_a = pair_idx[0]
+            pair_idx_b = pair_idx[1]
+
+            # 5) GT distance fields + GT pair energies (avenues 1+2+3),
+            # all under no_grad: the target side carries no autograd graph.
+            with torch.no_grad():
+                gt_cells_xy = true_xy[participates]
+                gt_dists = compute_distance_fields_per_type_fused(
+                    grid_xy=grid_xy,
+                    grid_norm_sq=grid_norm_sq,
+                    cells_xy=gt_cells_xy,
+                    cell_type_idx=cell_type_idx,
+                    num_types=num_types,
+                    soft_beta=self.soft_beta,
+                    chunk=self.chunk,
+                ).view(num_types, ny, nx)
+
+                # Stack the pair fields in one shot, then the CH energy
+                # is a single fused kernel returning [P] energies. This
+                # replaces the Python (i, j) loop entirely.
+                phi_gt = voronoi_phase_field(
+                    gt_dists[pair_idx_a],
+                    gt_dists[pair_idx_b],
+                    self.transition_width,
+                )  # [P, ny, nx]
+                e_gt_vec = cahn_hilliard_energy(
+                    phi_gt, dx, dy, self.kappa,
+                )  # [P]
+
+                # Free the [T, ny, nx] GT distance fields and the [P,
+                # ny, nx] phi tensor before pred-side work allocates.
+                del gt_dists, phi_gt
+
+            cached = {
+                "cell_id": cell_id.detach() if cell_id is not None else None,
+                "grid_x": grid_x,
+                "grid_y": grid_y,
+                "grid_xy": grid_xy,
+                "grid_norm_sq": grid_norm_sq,
+                "dx": float(dx),
+                "dy": float(dy),
+                "ny": ny,
+                "nx": nx,
+                "valid_types": valid_types,
+                "valid_types_t": valid_types_t,
+                "num_types": num_types,
+                "participates": participates,
+                "cell_type_idx": cell_type_idx,
+                "pair_idx_a": pair_idx_a,
+                "pair_idx_b": pair_idx_b,
+                "e_gt": e_gt_vec,
+            }
+            if cache_key is not None:
+                self._gt_cache[cache_key] = cached
+
+        # ---- Use cached GT data --------------------------------------
+        if len(cached.get("valid_types", [])) < 2:
             return torch.zeros((), device=device, dtype=dtype), 0
 
-        # 2) Single shared grid covering the union of cells we will use.
-        # We restrict the bbox to cells of the participating types so the
-        # grid is as tight as possible around the actually-used data.
-        used_mask = torch.zeros_like(mask_b)
-        for ct in valid_types:
-            used_mask = used_mask | type_masks[ct]
-        grid_x, grid_y, dx, dy = shared_square_grid(
-            true_xy[used_mask], pred_xy[used_mask],
-            grid_resolution=self.grid_resolution,
-            margin=self.margin,
-            square=self.square_bbox,
-        )
+        # Bind locals for clarity / avoiding repeated dict lookups in the
+        # hot path.
+        grid_xy = cached["grid_xy"]
+        grid_norm_sq = cached["grid_norm_sq"]
+        dx = cached["dx"]
+        dy = cached["dy"]
+        ny = cached["ny"]
+        nx = cached["nx"]
+        num_types = cached["num_types"]
+        participates = cached["participates"]
+        cell_type_idx = cached["cell_type_idx"]
+        pair_idx_a = cached["pair_idx_a"]
+        pair_idx_b = cached["pair_idx_b"]
+        e_gt_vec = cached["e_gt"]
 
-        # 3) Per-type distance fields, computed once per side and reused
-        # across every pair that touches that type. GT side runs under
-        # no_grad so we don't track an autograd graph for a constant target.
-        with torch.no_grad():
-            gt_dists = compute_distance_field_per_type(
-                true_xy, type_masks, grid_x, grid_y,
-                soft_beta=self.soft_beta, chunk=self.chunk,
-            )
-        pred_dists = compute_distance_field_per_type(
-            pred_xy, type_masks, grid_x, grid_y,
-            soft_beta=self.soft_beta, chunk=self.chunk,
-        )
+        # ---- Pred side: fused distance fields + stacked pair energies
+        pred_cells_xy = pred_xy[participates]
+        pred_dists = compute_distance_fields_per_type_fused(
+            grid_xy=grid_xy,
+            grid_norm_sq=grid_norm_sq,
+            cells_xy=pred_cells_xy,
+            cell_type_idx=cell_type_idx,
+            num_types=num_types,
+            soft_beta=self.soft_beta,
+            chunk=self.chunk,
+        ).view(num_types, ny, nx)
 
-        # 4) Iterate over unordered pairs (i < j). Each iteration is O(G):
-        # build phi via tanh of precomputed differences, then evaluate the
-        # CH energy. No new cdist / no new distance computation here.
-        total = torch.zeros((), device=device, dtype=dtype)
-        n_pairs = 0
-        for i in range(len(valid_types)):
-            ta = valid_types[i]
-            if ta not in gt_dists or ta not in pred_dists:
-                continue
-            for j in range(i + 1, len(valid_types)):
-                tb = valid_types[j]
-                if tb not in gt_dists or tb not in pred_dists:
-                    continue
+        phi_pred = voronoi_phase_field(
+            pred_dists[pair_idx_a],
+            pred_dists[pair_idx_b],
+            self.transition_width,
+        )  # [P, ny, nx]
+        e_pred_vec = cahn_hilliard_energy(phi_pred, dx, dy, self.kappa)  # [P]
 
-                with torch.no_grad():
-                    phi_gt = voronoi_phase_field(
-                        gt_dists[ta], gt_dists[tb], self.transition_width
-                    )
-                    e_gt = cahn_hilliard_energy(phi_gt, dx, dy, self.kappa)
-
-                phi_pred = voronoi_phase_field(
-                    pred_dists[ta], pred_dists[tb], self.transition_width
-                )
-                e_pred = cahn_hilliard_energy(phi_pred, dx, dy, self.kappa)
-
-                total = total + self._normalized_exp_diff(e_pred, e_gt)
-                n_pairs += 1
+        # Per-pair normalised loss; one element-wise call over [P].
+        loss_per_pair = self._normalized_exp_diff(e_pred_vec, e_gt_vec)
+        n_pairs = int(pair_idx_a.numel())
 
         if n_pairs == 0:
             return torch.zeros((), device=device, dtype=dtype), 0
 
-        # 5) Sample loss = total divided by the number of pairs squared
-        return total / float(n_pairs), n_pairs
+        return loss_per_pair.sum() / float(n_pairs), n_pairs
 
     # ---------------- forward ----------------
 
@@ -1050,6 +1400,7 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         train_stage: bool = True,
         log: bool = False,
         cell_class: Optional[torch.Tensor] = None,
+        batch_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
         """Compute the Voronoi phase-pair CH energy loss.
 
@@ -1062,6 +1413,13 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
             log: whether to emit a WandB log line.
             cell_class: optional override for the per-cell integer class
                 tensor, shape ``[B, N]``.
+            batch_idx: index of the current batch within the epoch. When
+                provided together with ``cache_gt=True`` (set in
+                ``__init__``), GT-side data are cached per
+                ``(batch_idx, sample_idx)`` and reused on subsequent
+                calls -- skipping the dominant cost (GT distance fields
+                + GT pair energies). Pass ``None`` (the default) to
+                disable caching for this call (e.g. validation).
         """
         if cell_class is None:
             cell_class = masked_true.cell_class
@@ -1074,15 +1432,28 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         true_positions = masked_true.positions
         node_mask = masked_true.node_mask
 
+        # Optional fingerprint used to invalidate cache entries when the
+        # GT cells change (e.g. dataset rechunking). ``cell_ID`` may be
+        # ``[B, N]`` or ``[B, N, 1]`` depending on the data path; we
+        # squeeze the trailing dim for the per-sample compare.
+        cell_id_full = getattr(masked_true, "cell_ID", None)
+        if cell_id_full is not None and cell_id_full.dim() == 3 \
+                and cell_id_full.shape[-1] == 1:
+            cell_id_full = cell_id_full.squeeze(-1)
+
         B = pred_positions.shape[0]
         losses = []
         pair_counts = []
         for b in range(B):
+            cell_id_b = None if cell_id_full is None else cell_id_full[b]
             loss_b, n_pairs_b = self._sample_loss(
                 pred_positions[b],
                 true_positions[b],
                 node_mask[b],
                 cell_class[b],
+                batch_idx=batch_idx,
+                sample_idx=b,
+                cell_id=cell_id_b,
             )
             losses.append(loss_b)
             pair_counts.append(n_pairs_b)
@@ -1108,8 +1479,6 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
             }
             if wandb.run:
                 wandb.log(to_log, commit=True)
-        
-        print(f"Voronoi phase-pair CH energy loss: {loss.item()}")
 
         return loss, to_log
 
@@ -1406,6 +1775,8 @@ class CombinedLossFunction(nn.Module):
         voronoi_margin: float = 0.05,
         voronoi_min_cells_per_type: int = 2,
         voronoi_chunk: int = 4096,
+        voronoi_cache_gt: bool = False,
+        voronoi_cache_key_mode: Literal["content", "slot"] = "content",
     ) -> None:
         super().__init__()
         self.mse_weight = float(mse_weight)
@@ -1441,7 +1812,18 @@ class CombinedLossFunction(nn.Module):
             eps=eps,
             min_cells_per_type=voronoi_min_cells_per_type,
             chunk=voronoi_chunk,
+            cache_gt=voronoi_cache_gt,
+            cache_key_mode=voronoi_cache_key_mode,
         )
+
+    def clear_voronoi_gt_cache(self) -> None:
+        """Drop the cached GT-side data of the Voronoi sub-loss.
+
+        Useful as a manual safety net after dataset rechunking; with
+        ``voronoi_cache_gt=True`` the cache also auto-invalidates per
+        entry whenever a sample's ``cell_ID`` fingerprint changes.
+        """
+        self.voronoi_loss.clear_gt_cache()
 
     def forward(
         self,
@@ -1450,6 +1832,7 @@ class CombinedLossFunction(nn.Module):
         train_stage: bool = True,
         log: bool = False,
         verbose: bool = False,
+        batch_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
 
         if verbose:
@@ -1474,11 +1857,16 @@ class CombinedLossFunction(nn.Module):
             )
             loss = loss + self.ch_weight * ch_val
 
-        # Voronoi phase-pair: same short-circuit pattern.
+        # Voronoi phase-pair: same short-circuit pattern. ``batch_idx`` is
+        # forwarded so the sub-loss can cache GT-side energies per batch
+        # (only effective when ``voronoi_cache_gt=True`` was passed at
+        # construction time).
         voronoi_log: Optional[Dict[str, float]] = None
         if self.voronoi_weight != 0.0:
             voronoi_val, voronoi_log = self.voronoi_loss(
-                masked_pred, masked_true, train_stage=train_stage, log=log
+                masked_pred, masked_true,
+                train_stage=train_stage, log=log,
+                batch_idx=batch_idx,
             )
             loss = loss + self.voronoi_weight * voronoi_val
 

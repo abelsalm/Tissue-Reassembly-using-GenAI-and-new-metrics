@@ -56,10 +56,23 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
 
     pred = self.forward(z_t)
 
-    # Compute the training loss
-    loss, tl_log_dict = self.train_loss(
-        masked_pred=pred, masked_true=batched_data, log=i % self.log_every_steps == 0
-    )
+    # Compute the training loss. ``batch_idx=i`` lets the (optional)
+    # Voronoi GT-energy cache key its entries by (batch_idx, sample_idx)
+    # and skip recomputing the constant target-side fields every step.
+    # BUT BATCH_ID is here only for combined loss function
+    if self.train_loss.__class__.__name__ == "CombinedLossFunction":
+        loss, tl_log_dict = self.train_loss(
+            masked_pred=pred,
+            masked_true=batched_data,
+            log=i % self.log_every_steps == 0,
+            batch_idx=i,
+        )
+    else:
+        loss, tl_log_dict = self.train_loss(
+            masked_pred=pred,
+            masked_true=batched_data,
+            log=i % self.log_every_steps == 0,
+        )
     loss = loss
 
     # Log the training loss and metrics if available
