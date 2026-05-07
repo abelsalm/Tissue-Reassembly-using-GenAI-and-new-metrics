@@ -8,26 +8,26 @@ distribute:
 
 dataset:
     dataset_name: 'Axolotl'
-    gene_columns_start: 5   # first column after the index is a gene
+    gene_columns_start: 7   # first column after the index is a gene
     gene_columns_end: -1 
-    train_data_path: "/data-master/biodata/Axolotl/train_cells_expression.csv"
-    test_data_path: "/data-master/biodata/Axolotl/test_cells_expression.csv"
+    train_data_path: "/data-master/biodata/Axolotl/train_cells_expression_shuffled.csv"
+    test_data_path: "/data-master/biodata/Axolotl/test_cells_expression_shuffled.csv"
     validation_data_path: ""
     maximum_graph_size:
-        train:  3000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
-        test: 3000
+        train:  2000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: 2000
         validation: null
 
 train: # !!!!
-    n_epochs: 3000        # tiny number for a smoke-test; increase for real training
+    n_epochs: 1000        # tiny number for a smoke-test; increase for real training
     batch_size: 2      # keep small on CPU
     lr: 5e-4
 
 test:
     save_dir: '/data-master/code/outputs'
-    checkpoints_parent_dir: null #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
-    checkpoints_name_list: all
+    checkpoints_parent_dir: null #"/data-master/code/outputs/2026-05-06/17-51-12-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
+    checkpoints_name_list: all #['epoch=1999.ckpt']
 
 validation: # !!!!
     if_validate: False
-    save_model_every_n_epochs: 250  # save every epoch during the smoke-test
+    save_model_every_n_epochs: 100  # save every epoch during the smoke-test

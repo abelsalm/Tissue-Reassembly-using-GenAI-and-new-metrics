@@ -1,11 +1,11 @@
 
-n_epochs: 3000 # Number of epochs
+n_epochs: 1000 # Number of epochs
 batch_size: 2 # Batch size for training
 lr: 5e-4 # Learning rate
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
-rechunk_every_n_epochs: 0 # Re-randomise chunk boundaries every N epochs (0 = disabled)
-debug_print_shuffle_every_n_epochs: 100 # Print a shuffle canary every N epochs (0 = disabled)
+rechunk_every_n_epochs: 1 # Re-randomise chunk boundaries every N epochs (0 = disabled)
+debug_print_shuffle_every_n_epochs: 10 # Print a shuffle canary every N epochs (0 = disabled)
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 loss_type: "position_mse" # "combined" or "position_mse"
 mse_weight: 1.0
