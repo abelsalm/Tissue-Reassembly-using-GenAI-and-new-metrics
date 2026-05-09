@@ -1,4 +1,4 @@
-name : 'Axolotl' # name of the experiment
+name : 'MERFISH_ABC' # name of the experiment
 wandb: 'online' # run, disabled, online, dryrun or offline
 mode: 'train_and_test' # 'train_and_test', 'test_only'
 seed: 0 # random seed

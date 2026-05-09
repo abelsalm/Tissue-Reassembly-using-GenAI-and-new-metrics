@@ -1,0 +1,33 @@
+# @package _global_
+general:
+    name : 'MERFISH_ABC'
+    mode : 'train_and_test'
+
+distribute:
+    gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
+
+dataset:
+    dataset_name: 'MERFISH_ABC'
+    gene_columns_start: 7   # first column after the index is a gene
+    gene_columns_end: -1 
+    train_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv"
+    test_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
+    validation_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
+    maximum_graph_size:
+        train:  3000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: 3000
+        validation: 3000
+
+train: # !!!!
+    n_epochs: 70        # tiny number for a smoke-test; increase for real training
+    batch_size: 4      # keep small on CPU
+    lr: 5e-4
+
+test:
+    save_dir: '/data-master/code/outputs'
+    checkpoints_parent_dir: "/data-master/code/outputs/2026-05-07/15-53-16-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
+    checkpoints_name_list: all #['epoch=1999.ckpt']
+
+validation: # !!!!
+    if_validate: True
+    save_model_every_n_epochs: 100  # save every epoch during the smoke-test

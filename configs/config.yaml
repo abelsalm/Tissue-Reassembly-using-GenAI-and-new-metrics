@@ -5,7 +5,7 @@ defaults:
     - general: default
     - train: default
     - model: default
-    - experiment: Axolotl
+    - experiment: MERFISH_ABC
 
 hydra:
   job:
