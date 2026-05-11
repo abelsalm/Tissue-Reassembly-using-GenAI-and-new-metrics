@@ -21,7 +21,7 @@ dataset:
 train: # !!!!
     n_epochs: 3000        # tiny number for a smoke-test; increase for real training
     batch_size: 2      # keep small on CPU
-    lr: 5e-4
+    lr: 8e-4
 
 test:
     save_dir: '/data-master/code/outputs'

@@ -79,9 +79,11 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     if tl_log_dict is not None:
         self.log_dict(tl_log_dict, batch_size=self.BS)
 
-    # Log epoch metrics for training loss
+    # Log epoch metrics for training loss. ``on_epoch=True`` is required so
+    # the key is guaranteed to be in ``trainer.callback_metrics`` at the end
+    # of the epoch (otherwise the per-epoch print below silently no-ops).
     tle_log = self.train_loss.log_epoch_metrics()
-    self.log_dict(tle_log, batch_size=self.BS)
+    self.log_dict(tle_log, batch_size=self.BS, on_step=False, on_epoch=True)
 
     # Log the epoch number if using WandB
     if wandb.run:
@@ -96,9 +98,20 @@ def on_train_epoch_end_func(self) -> None:
     Returns:
     - None
     """
-    epoch_loss = self.trainer.callback_metrics.get("train_epoch/position_mse")
+    cm = self.trainer.callback_metrics
+    epoch_loss = (
+        cm.get("train_epoch/position_mse")
+        or cm.get("train_epoch/position_mse_epoch")
+        or cm.get("train_loss/position_mse_epoch")
+        or cm.get("train_loss/position_mse")
+    )
     if epoch_loss is not None:
-        print(f"[Epoch {self.current_epoch}] Loss: {epoch_loss:.6f}")
+        try:
+            print(f"[Epoch {self.current_epoch}] Loss: {float(epoch_loss):.6f}", flush=True)
+        except (TypeError, ValueError):
+            print(f"[Epoch {self.current_epoch}] Loss: {epoch_loss}", flush=True)
+    else:
+        print(f"[Epoch {self.current_epoch}] done (no loss in callback_metrics)", flush=True)
 
 
 def on_train_epoch_start_func(self) -> None:
@@ -114,7 +127,7 @@ def on_train_epoch_start_func(self) -> None:
         ch_weight = _compute_ch_weight(self.cfg, self.current_epoch)
         self.train_loss.ch_weight = ch_weight
         if self.cfg.train.voronoi_weight == -1:
-            self.train_loss.voronoi_weight = ch_weight
+            self.train_loss.voronoi_weight = ch_weight*8
 
     # Reset training loss and metrics for the new epoch
     self.train_loss.reset()

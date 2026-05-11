@@ -12,8 +12,8 @@ class AbstractDataModule(LightningDataset):
             val_dataset,
             test_dataset,
             batch_size=cfg.train.batch_size,
-            num_workers=32,
-            pin_memory=getattr(cfg.dataset, "pin_memory", False),
+            num_workers=int(getattr(cfg.dataset, "num_workers", 1)),
+            pin_memory=bool(getattr(cfg.dataset, "pin_memory", False)),
         )
         self.cfg = cfg
 
@@ -32,16 +32,20 @@ class AbstractDataModule(LightningDataset):
         # Do not shuffle for validation/test; shuffling can break deterministic evaluation
         # and is explicitly discouraged by Lightning.
         shuffle = dataset is self.train_dataset
-        return DataLoader(
-            dataset,
+        num_workers = int(getattr(self.cfg.dataset, "num_workers", 1))
+        kwargs = dict(
             batch_size=batch_size,
             shuffle=shuffle,
             # Avoid oversubscribing CPUs on shared/HPC nodes; allow override via cfg.dataset.num_workers
-            num_workers=int(getattr(self.cfg.dataset, "num_workers", 1)),
+            num_workers=num_workers,
             pin_memory=bool(getattr(self.cfg.dataset, "pin_memory", True)),
             collate_fn=self.collate,
-            multiprocessing_context="fork",
         )
+        # ``multiprocessing_context`` is only valid when workers are actually
+        # spawned. Setting it with num_workers=0 raises a ValueError in PyTorch.
+        if num_workers > 0:
+            kwargs["multiprocessing_context"] = "fork"
+        return DataLoader(dataset, **kwargs)
 
 
 class AbstractDatasetInfos:

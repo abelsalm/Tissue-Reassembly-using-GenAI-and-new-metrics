@@ -1,6 +1,6 @@
 n_layers: 8 # Number of transformer layers
 diffusion_noise_schedule: cosine # noise schedule for diffusion time
-diffusion_steps: 1000 # number of diffusion steps
+diffusion_steps: 1526 # number of diffusion steps
 nu:
     p: 2
 hidden_mlp_dims:

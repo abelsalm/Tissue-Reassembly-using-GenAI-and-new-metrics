@@ -210,7 +210,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     '''args = _parse_args()'''
-    shuffle_csv(
+    '''shuffle_csv(
         input_path= "/data-master/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene.csv",
         output_path= "/data-master/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv",
         n_buckets=64,
@@ -221,7 +221,7 @@ if __name__ == "__main__":
         output_path= "/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv",
         n_buckets=64,
         seed=42,
-    )
+    )'''
     head_csv(
         input_path= "/data-master/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv",
         output_path= "./train_cells_expression_shuffled_head.csv",

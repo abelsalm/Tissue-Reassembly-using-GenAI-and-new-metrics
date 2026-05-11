@@ -8,26 +8,41 @@ distribute:
 
 dataset:
     dataset_name: 'MERFISH_ABC'
-    gene_columns_start: 7   # first column after the index is a gene
+    gene_columns_start: 6   # first column after the index is a gene
     gene_columns_end: -1 
     train_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv"
     test_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
-    validation_data_path: "/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
+    validation_data_path: null #"/data-master/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
     maximum_graph_size:
         train:  3000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
         test: 3000
         validation: 3000
+    # ── Memory-handling options for very large datasets ───────────────
+    # Cap how many rows are kept per split (null = use everything).
+    # If subsample_per_section: true, the cap is applied per cell_section.
+    subsample_n: null
+    subsample_per_section: false
+    # DataLoader memory knobs (already wired up in AbstractDataModule).
+    # 0 keeps everything in the main process and avoids forking the
+    # in-memory tensors per worker (multi-GB savings on big datasets).
+    num_workers: 0
+    pin_memory: false
 
 train: # !!!!
-    n_epochs: 70        # tiny number for a smoke-test; increase for real training
+    n_epochs: 3000        # tiny number for a smoke-test; increase for real training
     batch_size: 4      # keep small on CPU
     lr: 5e-4
+    # Mixed precision halves GPU memory and is usually safe.
+    # "16-mixed" on V100/T4, "bf16-mixed" on A100/H100, "32-true" to disable.
+    precision: "16-mixed"
+    # Effective batch size = batch_size * accumulate_grad_batches.
+    accumulate_grad_batches: 1
 
 test:
     save_dir: '/data-master/code/outputs'
-    checkpoints_parent_dir: "/data-master/code/outputs/2026-05-07/15-53-16-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
+    checkpoints_parent_dir: null # "/data-master/code/outputs/2026-05-07/15-53-16-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
     checkpoints_name_list: all #['epoch=1999.ckpt']
 
 validation: # !!!!
-    if_validate: True
-    save_model_every_n_epochs: 100  # save every epoch during the smoke-test
+    if_validate: False
+    save_model_every_n_epochs: 250  # save every epoch during the smoke-test

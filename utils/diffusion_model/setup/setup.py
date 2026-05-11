@@ -173,6 +173,11 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     if wandb.run and local_rank == 0:
         setup_wandb(cfg)
 
+    # Optional mixed-precision and gradient-accumulation knobs. They are
+    # opt-in via the ``train`` config so existing experiments behave the same.
+    precision = getattr(cfg.train, "precision", "32-true")
+    accumulate_grad_batches = int(getattr(cfg.train, "accumulate_grad_batches", 1))
+
     return Trainer(
         devices=gpus,
         max_epochs=max_epochs,
@@ -182,5 +187,7 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         strategy='ddp_find_unused_parameters_true',
         log_every_n_steps=50 if fast_dev_run else 1,
         enable_progress_bar=cfg.general.enable_progress_bar,
+        precision=precision,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
 

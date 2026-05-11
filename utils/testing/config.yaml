@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration for utils/testing/diffusion2spatial_probs.py
+#
+# This experiment runs LUNA inference many times on a *single* slice of the
+# test dataset (selected by `cell_section`) and aggregates the predicted
+# positions of a given cell class into a spatial probability map.
+#
+# The script first composes the main LUNA config from `configs/config.yaml`
+# (so dataset/model/checkpoint paths come from the regular experiment file),
+# then layers the parameters below on top.
+#
+# CLI overrides are supported with Hydra-style dot-list syntax, e.g.:
+#   python utils/testing/diffusion2spatial_probs.py \
+#       cell_section=mouse2.AUDp \
+#       analysis.cell_class="L2/3 IT CTX Glut" \
+#       num_samples=128
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Path to a trained LUNA checkpoint. Required.
+checkpoint_path: "/data-master/code/outputs/2026-04-30/17-48-34-MERFISH_small_cortex/checkpoints/epoch=2999.ckpt"
+
+# Value of the `cell_section` column to keep from the test CSV. The script
+# will run inference on exactly the cells in that section. Required.
+# (Use null to fall back to the first section it finds — handy for smoke tests.)
+cell_section: "mouse2_slice300"
+
+# ── Dataset overrides ───────────────────────────────────────────────────────
+# By default the dataset config (CSV paths, gene columns, subsampling, …) is
+# pulled from the experiment file selected in `configs/config.yaml`
+# (currently `configs/experiment/MERFISH_small_cortex.yaml` → `dataset.*`).
+#
+# Set any field below to override that experiment file *just for this run*
+# without touching the main config. Leave null to keep the value from the
+# experiment file. To switch to a completely different experiment, prefer
+# adding `experiment=MERFISH_ABC` (or similar) to `luna_overrides`.
+dataset:
+  # Path to the CSV used for inference. The selected `cell_section` must exist
+  # in this file. Leave null to use whatever the LUNA experiment config defines.
+  test_data_path: null
+  # Path to the train CSV. The current DataModule always loads it (used to
+  # build the class encoder) — set this if the experiment's train path is not
+  # available locally and you want to point it at something lighter.
+  train_data_path: null
+
+# Number of LUNA inferences to run on the selected slice.
+num_samples: 128
+
+# Seed for sample `i` is `seed_start + i`. The diffusion noise inside LUNA is
+# always re-seeded to 0 after the initial draw, so only the initial position
+# noise actually depends on this seed — but that is what produces the spread
+# of plausible reconstructions we want to map.
+seed_start: 0
+
+# Compute device. "auto" picks cuda if available, otherwise cpu.
+device: auto
+
+# Where to write predictions/plots. Resolved relative to the repository root.
+output_dir: "/data-master/code/outputs/testing/"
+
+# Sub-directory under `output_dir` for this run. Use ${now:...} interpolations
+# for unique timestamps (Hydra/OmegaConf style).
+experiment_name: spatial_probs_${now:%Y%m%d_%H%M%S}
+
+# Hydra overrides applied to the main LUNA config (configs/config.yaml) before
+# we instantiate the data module / model. These force a lightweight, inference-
+# only setup regardless of what the experiment file defaults to.
+luna_overrides:
+  - general.mode=test_only
+  - validation.if_validate=false
+  - distribute.gpus_per_node=1
+  - train.batch_size=1
+  - test.batch_size=1
+  - general.wandb=disabled
+
+# ── Analysis (spatial probability map) ──────────────────────────────────────
+analysis:
+  # Cell class label (decoded string) for which the spatial map is computed.
+  # Required when running the analysis phase.
+  cell_class: "L4/5 IT"
+
+  # Standard deviation of each per-cell Gaussian, in normalised coords
+  # (LUNA positions live in roughly [-0.5, 0.5]).
+  gaussian_sigma: 0.002
+
+  # Resolution of the spatial probability map (pixels per side).
+  grid_resolution: 512
+
+  # Padding around the bounding box of the reference (aligned) sample, in
+  # normalised coords.
+  grid_margin: 0.05
+
+  # Sample index used as the reference for the optimal rotation alignment.
+  align_reference: 0
+
+  # File names (saved inside the experiment directory).
+  plot_filename: spatial_probability_map.png
+  density_npy_filename: spatial_density.npy
+
+  # Whether to overlay the reference sample's predictions for the cell class
+  # on top of the heatmap.
+  overlay_reference_scatter: true
+
+# ── Phase control (useful when iterating on the analysis) ───────────────────
+# - run_sampling: if false, skip sampling and read predictions from
+#                 `predictions_csv` instead (e.g. to re-run only the analysis).
+# - run_analysis: if false, only run sampling and stop.
+# - predictions_csv: path to the predictions CSV. When `run_sampling` is true
+#                    this is where the CSV will be written; when it is false
+#                    this is where it will be read from. Resolved relative to
+#                    the experiment directory if not absolute.
+run_sampling: true
+run_analysis: true
+predictions_csv: predictions.csv
+ground_truth_csv: ground_truth.csv

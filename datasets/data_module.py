@@ -1,3 +1,5 @@
+import gc
+
 import numpy as np
 import omegaconf
 import pandas as pd
@@ -85,6 +87,15 @@ class Dataset(InMemoryDataset):
             cell_class_decoder,
         )
 
+        # Everything we need is now in ``self._data`` (tensors) and in the
+        # ``_cell_sections_clean`` / ``_cell_ids_clean`` arrays. The original
+        # DataFrame can be very large (~ size_of_csv) and would otherwise stay
+        # pinned to this object for the entire run, doubling resident RAM per
+        # split. Release it explicitly.
+        del self.input_data
+        self.input_data = None
+        gc.collect()
+
     def _convert_data_to_tensors(self, gene_names: list):
         positions = torch.tensor(self.input_data[["coord_X", "coord_Y"]].values).float()
         node_features = torch.tensor(self.input_data[gene_names].values).float()
@@ -110,7 +121,18 @@ class Dataset(InMemoryDataset):
         cell_class_decoder,
     ):
         # IMPORTANT: must match the cleaned tensors length/order (NaN rows removed)
-        cell_ID = torch.tensor(self._cell_ids_clean)
+        # Some datasets (e.g. MERFISH ABC) use string cell identifiers as the
+        # CSV index, while older ones (e.g. Axolotl) use integers. ``torch.tensor``
+        # cannot store strings, so map non-numeric IDs to integer codes here and
+        # keep the original labels on the side for debugging / export.
+        cell_ids_arr = np.asarray(self._cell_ids_clean)
+        if cell_ids_arr.dtype.kind in ("U", "S", "O"):
+            codes, uniques = pd.factorize(cell_ids_arr)
+            cell_ID = torch.tensor(codes, dtype=torch.long)
+            self._cell_ids_original = uniques
+        else:
+            cell_ID = torch.tensor(cell_ids_arr.astype(np.int64))
+            self._cell_ids_original = cell_ids_arr
 
         self._data.positions = clean_positions
         self._data.node_features = clean_node_features
@@ -282,12 +304,56 @@ class DataModule(AbstractDataModule):
             data_path = cfg.dataset.validation_data_path
         else:
             data_path = cfg.dataset.test_data_path
-        data = pd.read_csv(f"{data_path}", index_col=0)
-        
-        # Ensure that the data contains the necessary columns, if not call standardise_dataframe_colnames:
+
+        # ── Memory-efficient CSV read for huge datasets ──────────────────
+        # 1. Sniff the header so we can identify gene + coordinate columns.
+        header_df = pd.read_csv(data_path, nrows=0, index_col=0)
+        cols = list(header_df.columns)
+        g_start = cfg.dataset.gene_columns_start
+        g_end = cfg.dataset.gene_columns_end
+        gene_col_names = cols[g_start:g_end]
+
+        # 2. Force float32 for the heavy columns. Pandas defaults to float64
+        #    so this halves the peak RAM during parsing.
+        dtype_hints = {c: np.float32 for c in gene_col_names}
+        for c in ("coord_X", "coord_Y", "x", "y"):
+            if c in cols:
+                dtype_hints[c] = np.float32
+
+        print(
+            f"[DataModule] Reading '{data_path}' (split={split}) "
+            f"with float32 dtype on {len(gene_col_names)} gene cols + coord cols …"
+        )
+        data = pd.read_csv(data_path, index_col=0, dtype=dtype_hints)
+        print(f"[DataModule] Loaded {len(data):,} rows for split={split}.")
+
+        # 3. Optional subsampling — set ``dataset.subsample_n`` to cap the
+        #    number of rows kept per split. Useful to fit very large datasets
+        #    in CPU RAM. ``subsample_per_section: True`` keeps at most N rows
+        #    *per section* instead of N rows total.
+        subsample_n = getattr(cfg.dataset, "subsample_n", None)
+        if subsample_n:
+            seed = int(getattr(cfg.general, "seed", 0))
+            per_section = bool(getattr(cfg.dataset, "subsample_per_section", False))
+            if per_section and "cell_section" in data.columns:
+                data = (
+                    data.groupby("cell_section", group_keys=False)
+                    .apply(lambda g: g.sample(
+                        n=min(int(subsample_n), len(g)), random_state=seed
+                    ))
+                )
+            else:
+                n = min(int(subsample_n), len(data))
+                data = data.sample(n=n, random_state=seed).sort_index()
+            print(
+                f"[DataModule] Subsampled split={split} to {len(data):,} rows "
+                f"(per_section={per_section}, seed={seed})."
+            )
+
+        # 4. Standardise column names and validate.
         data = standardise_dataframe_colnames(data)
         assert all(column in data.columns for column in ['coord_X', 'coord_Y', 'cell_section', 'cell_class'])
-        
+
         return data
 
 
