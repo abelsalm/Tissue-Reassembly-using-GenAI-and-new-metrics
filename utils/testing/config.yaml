@@ -17,7 +17,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Path to a trained LUNA checkpoint. Required.
-checkpoint_path: "/data-master/code/outputs/2026-04-30/17-48-34-MERFISH_small_cortex/checkpoints/epoch=2999.ckpt"
+checkpoint_path: "/data-master/code/outputs/2026-05-01/21-46-50-MERFISH_small_cortex/checkpoints/epoch=2999.ckpt" # "/data-master/code/outputs/2026-04-13/11-15-30-MERFISH_small_cortex/checkpoints/epoch=2999.ckpt" #  
 
 # Value of the `cell_section` column to keep from the test CSV. The script
 # will run inference on exactly the cells in that section. Required.
@@ -49,17 +49,17 @@ num_samples: 128
 # always re-seeded to 0 after the initial draw, so only the initial position
 # noise actually depends on this seed — but that is what produces the spread
 # of plausible reconstructions we want to map.
-seed_start: 0
+seed_start: 100
 
 # Compute device. "auto" picks cuda if available, otherwise cpu.
 device: auto
 
 # Where to write predictions/plots. Resolved relative to the repository root.
-output_dir: "/data-master/code/outputs/testing/"
+output_dir: "/data-master/code/outputs/testing_with_single_ch/"
 
 # Sub-directory under `output_dir` for this run. Use ${now:...} interpolations
 # for unique timestamps (Hydra/OmegaConf style).
-experiment_name: spatial_probs_${now:%Y%m%d_%H%M%S}
+experiment_name: spatial_probs_${now:%Y%m%d_%H%M%S}  #spatial_probs_20260512_113700 #spatial_probs_20260512_132129 
 
 # Hydra overrides applied to the main LUNA config (configs/config.yaml) before
 # we instantiate the data module / model. These force a lightweight, inference-
@@ -76,11 +76,11 @@ luna_overrides:
 analysis:
   # Cell class label (decoded string) for which the spatial map is computed.
   # Required when running the analysis phase.
-  cell_class: "L4/5 IT"
+  cell_class: "Astro"
 
   # Standard deviation of each per-cell Gaussian, in normalised coords
   # (LUNA positions live in roughly [-0.5, 0.5]).
-  gaussian_sigma: 0.002
+  gaussian_sigma: 0.02
 
   # Resolution of the spatial probability map (pixels per side).
   grid_resolution: 512

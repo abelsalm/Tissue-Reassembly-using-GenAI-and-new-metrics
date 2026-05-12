@@ -532,7 +532,7 @@ def compute_spatial_probability_map(
 def plot_density(
     result: dict,
     save_path: Path,
-    overlay_reference_scatter: bool = True,
+    overlay_reference_scatter: bool = False,
     title: Optional[str] = None,
 ) -> None:
     """Save the mean spatial probability map produced by ``compute_spatial_probability_map``."""
@@ -558,13 +558,13 @@ def plot_density(
             ax.scatter(
                 ref_pts[:, 0],
                 ref_pts[:, 1],
-                s=12,
-                facecolors="none",
-                edgecolors="cyan",
-                linewidths=0.6,
+                s=4,  # size of the dots; decrease for smaller points
+                color="cyan",  # use filled dots, not line circles
+                marker="o",    # full circle marker
                 label="reference sample (class cells)",
             )
             ax.legend(loc="upper right", fontsize=8, framealpha=0.7)
+      
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("probability density (per unit area)")

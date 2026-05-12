@@ -333,7 +333,7 @@ class NoiseModel:
             node_mask.shape[0], node_mask.shape[1], 2, device=node_mask.device
         )
 
-        torch.manual_seed(0)
+        # torch.manual_seed(0)
 
         # Apply node mask to the sampled positions
         positions = positions * node_mask.unsqueeze(-1)
