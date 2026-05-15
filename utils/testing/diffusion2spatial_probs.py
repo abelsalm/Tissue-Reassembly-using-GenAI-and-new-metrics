@@ -29,39 +29,35 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Hydra registers ``${now:...}`` lazily when ``@hydra.main`` runs; we call
-# ``OmegaConf.resolve`` directly so we register it here ourselves.
-if not OmegaConf.has_resolver("now"):
-    OmegaConf.register_new_resolver(
-        "now", lambda fmt: datetime.now().strftime(fmt), replace=False
-    )
-
-from datasets.data_module import DataModule, Infos  # noqa: E402
-from diffusion_model import FullDenoisingDiffusion  # noqa: E402
 from metrics.evaluation_statistics import align_point_clouds  # noqa: E402
-from utils.data.dataholder import DataHolder  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration loading
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_omegaconf():
+    """Import OmegaConf only for the config-driven CLI workflow."""
+    from omegaconf import OmegaConf
+
+    # Hydra registers ``${now:...}`` lazily when ``@hydra.main`` runs; we call
+    # ``OmegaConf.resolve`` directly so we register it here ourselves.
+    if not OmegaConf.has_resolver("now"):
+        OmegaConf.register_new_resolver(
+            "now", lambda fmt: datetime.now().strftime(fmt), replace=False
+        )
+    return OmegaConf
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,8 +78,9 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_testing_config(config_path: Path, overrides: list[str]) -> DictConfig:
+def load_testing_config(config_path: Path, overrides: list[str]) -> Any:
     """Load the testing YAML config and apply CLI dot-list overrides."""
+    OmegaConf = _load_omegaconf()
     cfg = OmegaConf.load(config_path)
     if overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
@@ -92,8 +89,10 @@ def load_testing_config(config_path: Path, overrides: list[str]) -> DictConfig:
     return cfg
 
 
-def compose_luna_config(overrides: list[str]) -> DictConfig:
+def compose_luna_config(overrides: list[str]) -> Any:
     """Compose the main LUNA config (``configs/config.yaml``) programmatically."""
+    from hydra import compose, initialize_config_dir
+
     configs_dir = (REPO_ROOT / "configs").resolve()
     with initialize_config_dir(config_dir=str(configs_dir), version_base="1.3"):
         cfg = compose(config_name="config", overrides=list(overrides))
@@ -109,7 +108,7 @@ def compose_luna_config(overrides: list[str]) -> DictConfig:
 class SliceBatch:
     """Holds the dense, single-graph batch fed to LUNA plus bookkeeping."""
 
-    holder: DataHolder
+    holder: Any
     cell_class_int: np.ndarray  # (N,) integer codes
     cell_class_labels: list[str]  # (N,) decoded strings
     cell_ids: np.ndarray  # (N,)
@@ -155,11 +154,15 @@ def _find_section_slice(test_dataset, cell_section) -> tuple[int, int, str]:
 
 
 def build_section_batch(
-    datamodule: DataModule,
-    dataset_infos: Infos,
+    datamodule: Any,
+    dataset_infos: Any,
     cell_section,
 ) -> SliceBatch:
     """Extract a dense, padded batch for a single ``cell_section`` of the test split."""
+    import torch
+
+    from utils.data.dataholder import DataHolder
+
     test_dataset = datamodule.test_dataset
     start, end, section_str = _find_section_slice(test_dataset, cell_section)
 
@@ -220,19 +223,23 @@ def build_section_batch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_device(name: str) -> torch.device:
+def _resolve_device(name: str) -> Any:
+    import torch
+
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
 
 
 def load_model(
-    luna_cfg: DictConfig,
-    dataset_infos: Infos,
+    luna_cfg: Any,
+    dataset_infos: Any,
     checkpoint_path: str,
-    device: torch.device,
-) -> FullDenoisingDiffusion:
+    device: Any,
+) -> Any:
     """Load a trained LUNA model and move it to ``device`` in eval mode."""
+    from diffusion_model import FullDenoisingDiffusion
+
     model = FullDenoisingDiffusion.load_from_checkpoint(
         checkpoint_path,
         dataset_infos=dataset_infos,
@@ -245,6 +252,8 @@ def load_model(
 
 
 def _set_seed(seed: int) -> None:
+    import torch
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -253,11 +262,11 @@ def _set_seed(seed: int) -> None:
 
 
 def run_inferences(
-    model: FullDenoisingDiffusion,
+    model: Any,
     batch: SliceBatch,
     num_samples: int,
     seed_start: int,
-    device: torch.device,
+    device: Any,
 ) -> np.ndarray:
     """Run LUNA ``num_samples`` times on the same input batch.
 
@@ -265,6 +274,7 @@ def run_inferences(
     -------
     np.ndarray of shape (num_samples, N, 2) — predicted, masked positions.
     """
+    from utils.data.dataholder import DataHolder
     from utils.diffusion_model.sample.sample import sample_from_single_graph
 
     holder = batch.holder
@@ -349,7 +359,7 @@ def save_predictions_csv(
 
 def load_predictions_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    required = {"sample_index", "cell_class", "coord_X", "coord_Y"}
+    required = {"sample_index", "cell_ID", "cell_class", "coord_X", "coord_Y"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Predictions CSV is missing columns: {missing}")
@@ -459,6 +469,10 @@ def compute_spatial_probability_map(
     """
     df = load_predictions_csv(predictions_csv)
     samples = _predictions_to_array(df)
+    first_sample_df = (
+        df[df["sample_index"] == df["sample_index"].min()]
+        .sort_values("cell_ID", kind="stable")
+    )
     cell_class_per_row = (
         df.sort_values(["sample_index", "cell_ID"], kind="stable")
         .drop_duplicates(subset=["cell_ID"])
@@ -469,11 +483,7 @@ def compute_spatial_probability_map(
     # row-wise class array above (taken from the first sample) is valid for
     # every sample. Recompute the mask explicitly from the first sample to be
     # safe against any reordering surprises.
-    first_sample_classes = (
-        df[df["sample_index"] == df["sample_index"].min()]
-        .sort_values("cell_ID", kind="stable")["cell_class"]
-        .to_numpy()
-    )
+    first_sample_classes = first_sample_df["cell_class"].to_numpy()
     class_mask = first_sample_classes == cell_class
     n_class_cells = int(class_mask.sum())
     if n_class_cells == 0:
@@ -522,6 +532,10 @@ def compute_spatial_probability_map(
         "grid_y": grid_y,
         "extent": extent,
         "reference_points": ref_class_points,
+        "reference_all_points": aligned[align_reference],
+        "reference_cell_ids": first_sample_df["cell_ID"].astype(str).to_numpy(),
+        "reference_cell_classes": first_sample_classes.astype(str),
+        "align_reference": align_reference,
         "num_samples": n_samples,
         "num_class_cells": n_class_cells,
         "cell_class": cell_class,
@@ -536,6 +550,11 @@ def plot_density(
     title: Optional[str] = None,
 ) -> None:
     """Save the mean spatial probability map produced by ``compute_spatial_probability_map``."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     density = result["density"]
     extent = result["extent"]
     cell_class = result["cell_class"]
@@ -597,6 +616,7 @@ def _resolve_path(p: str | os.PathLike, base: Path) -> Path:
 def main() -> None:
     args = _parse_args()
     cfg = load_testing_config(Path(args.config), args.overrides)
+    OmegaConf = _load_omegaconf()
 
     # Resolve filesystem paths up front, relative to the repo root.
     output_dir = _resolve_path(cfg.output_dir, REPO_ROOT) / cfg.experiment_name
@@ -623,6 +643,10 @@ def main() -> None:
     OmegaConf.save(cfg, output_dir / "effective_config.yaml")
 
     if cfg.run_sampling:
+        import torch
+
+        from datasets.data_module import DataModule, Infos
+
         if not cfg.checkpoint_path:
             raise ValueError("checkpoint_path must be set when run_sampling=true.")
 
