@@ -129,6 +129,12 @@ def on_train_epoch_start_func(self) -> None:
         if self.cfg.train.voronoi_weight == -1:
             self.train_loss.voronoi_weight = ch_weight*8
 
+    # Tell the loss which epoch we're on (used to gate periodic viz
+    # logging, e.g. CH and Voronoi landscapes -> WandB). Defensive
+    # ``hasattr`` so swapping in a plain ``LossFunction`` keeps working.
+    if hasattr(self.train_loss, "set_current_epoch"):
+        self.train_loss.set_current_epoch(self.current_epoch)
+
     # Reset training loss and metrics for the new epoch
     self.train_loss.reset()
 
