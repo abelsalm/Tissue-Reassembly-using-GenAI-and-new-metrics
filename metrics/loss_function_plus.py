@@ -113,7 +113,7 @@ class LossFunction(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Cahn-Hilliard energy-curve AUC loss
+# Cahn-Hilliard energy-curve loss (vector comparison across radii)
 # ---------------------------------------------------------------------------
 #
 # This is a differentiable (PyTorch) port of the notebook-side analysis
@@ -142,13 +142,15 @@ class LossFunction(nn.Module):
 #     grid obtained as the union of their (square) bounding boxes -- this
 #     mirrors ``common_match_key`` from the reference.
 #
-#   * A radius sweep gives an energy curve ``E(r)``, and the loss builds on
-#     its trapezoidal AUC.
+#   * A radius sweep gives an energy curve ``E(r)``; the loss compares
+#     the per-radius energies directly (no integration / AUC step).
 #
 # Per cell-type loss:
-#     L_t = 1 - exp( - |AUC_pred - AUC_gt| / (|AUC_gt| + eps) )
-# (bounded in ``[0, 1)``, zero iff the AUCs match, smooth everywhere; the
-#  denominator is detached so the normalisation doesn't leak gradients).
+#     L_t = mean_r [ 1 - exp( - |E_pred(r) - E_gt(r)| / (|E_gt(r)| + eps) ) ]
+# (each per-radius term is bounded in ``[0, 1)``, zero iff the energies
+#  match, smooth everywhere; the denominator is detached so the
+#  normalisation doesn't leak gradients; the mean over radii is also in
+#  ``[0, 1)``).
 #
 # Sample loss is the sum over cell types; batch loss is the mean over
 # samples. The whole pipeline is differentiable w.r.t. ``pred_positions``
@@ -463,11 +465,79 @@ def cahn_hilliard_energy(
     return density.sum(dim=(-2, -1)) * dx * dy
 
 
+# ---------------------------------------------------------------------------
+# Visualization helper (off the training hot path; called every N epochs)
+# ---------------------------------------------------------------------------
+
+
+def _build_phi_energy_figure(
+    phi_pred: np.ndarray,
+    phi_gt: np.ndarray,
+    ed_pred: np.ndarray,
+    ed_gt: np.ndarray,
+    extent: Tuple[float, float, float, float],
+    e_pred: float,
+    e_gt: float,
+    title: str,
+):
+    """Build a 2x2 matplotlib figure: phi (landscape) above energy density,
+    pred on the left and GT on the right.
+
+    Inputs are detached numpy arrays of shape ``[ny, nx]``. Returns the
+    ``matplotlib.figure.Figure`` (caller is responsible for ``plt.close``).
+    Imports matplotlib lazily so the loss module stays import-cheap.
+    """
+    # Force a non-interactive backend (training nodes have no display).
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+    # Top row: phi field (the "landscape"). Bounded in [-1, 1] by tanh
+    # (Voronoi) or by the soft_max combine clip (CH-curve), so we fix the
+    # color range to make pred vs GT visually comparable.
+    im00 = axes[0, 0].imshow(
+        phi_pred, origin="lower", extent=extent,
+        vmin=-1.0, vmax=1.0, cmap="RdBu_r",
+    )
+    axes[0, 0].set_title("phi_pred (landscape)")
+    plt.colorbar(im00, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    im01 = axes[0, 1].imshow(
+        phi_gt, origin="lower", extent=extent,
+        vmin=-1.0, vmax=1.0, cmap="RdBu_r",
+    )
+    axes[0, 1].set_title("phi_gt (landscape)")
+    plt.colorbar(im01, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    # Bottom row: energy density (>= 0). Share the color range across
+    # pred and GT so they're visually comparable.
+    ed_max = float(max(ed_pred.max(), ed_gt.max(), 1e-12))
+    im10 = axes[1, 0].imshow(
+        ed_pred, origin="lower", extent=extent,
+        vmin=0.0, vmax=ed_max, cmap="viridis",
+    )
+    axes[1, 0].set_title(f"energy density pred  (E={e_pred:.3e})")
+    plt.colorbar(im10, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    im11 = axes[1, 1].imshow(
+        ed_gt, origin="lower", extent=extent,
+        vmin=0.0, vmax=ed_max, cmap="viridis",
+    )
+    axes[1, 1].set_title(f"energy density gt    (E={e_gt:.3e})")
+    plt.colorbar(im11, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
 # ---------- Loss module ----------------------------------------------------
 
 
-class CahnHilliardEnergyAUCLoss(nn.Module):
-    """Per-cell-type Cahn-Hilliard energy-curve AUC loss.
+class CahnHilliardEnergyCurveLoss(nn.Module):
+    """Per-cell-type Cahn-Hilliard energy-curve loss (vector-wise).
 
     For every sample in the batch and every cell type present in its mask:
 
@@ -478,13 +548,18 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         2. For each radius ``r`` in ``self.radii``, build the continuous
            landscape ``phi(x; r)`` (values in ``[-1, 1]``) on that grid
            for both GT and prediction, then evaluate the CH energy.
-        3. Integrate the resulting ``E(r)`` curve via the trapezoidal rule
-           to get ``AUC_gt`` and ``AUC_pred``.
-        4. Per-type loss:
-               ``L_t = 1 - exp( -|AUC_pred - AUC_gt| / (|AUC_gt| + eps) )``.
+        3. Compare the two energy vectors ``E_pred = [E_pred(r_1), ...]``
+           and ``E_gt = [E_gt(r_1), ...]`` *vector-wise*, with the same
+           scale-invariant exponential form as :class:`VoronoiPhasePairEnergyLoss`
+           applied **per radius** and then averaged:
 
-    The sample loss is the sum over cell types; the batch loss is the mean
-    over samples. Fully differentiable w.r.t. the predicted positions.
+               ``L_t = mean_r [ 1 - exp(-|E_pred(r) - E_gt(r)|
+                                          / (|E_gt(r)| + eps)) ]``.
+
+           No trapezoidal integration / AUC step is involved.
+
+    The sample loss is the mean over cell types; the batch loss is the
+    mean over samples. Fully differentiable w.r.t. the predicted positions.
 
     Args:
         radii: sequence of bump radii (in position coordinate units) defining
@@ -522,10 +597,12 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         margin: float = 0.05,
         eps: float = 1e-6,
         min_cells_per_type: int = 2,
+        viz_every_n_epochs: int = 0,
+        viz_num_figures: int = 1,
     ) -> None:
         super().__init__()
-        if len(radii) < 2:
-            raise ValueError("Need at least two radii to compute an AUC.")
+        if len(radii) < 1:
+            raise ValueError("Need at least one radius for the energy curve.")
         self.radii = tuple(float(r) for r in sorted(radii))
         self.grid_resolution = int(grid_resolution)
         self.kappa = float(kappa)
@@ -539,16 +616,28 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         self.margin = float(margin)
         self.eps = float(eps)
         self.min_cells_per_type = int(min_cells_per_type)
+        # Periodic visualization (every N epochs); see comments on the
+        # Voronoi loss for the same mechanism.
+        self.viz_every_n_epochs = int(viz_every_n_epochs)
+        self.viz_num_figures = int(viz_num_figures)
+        self.current_epoch: int = 0
 
     # ---------------- internals ----------------
 
     def _normalized_exp_diff(
         self,
-        auc_pred: torch.Tensor,
-        auc_gt: torch.Tensor,
+        e_pred: torch.Tensor,
+        e_gt: torch.Tensor,
     ) -> torch.Tensor:
-        """``1 - exp(-|diff| / |auc_gt|)``; denominator is detached."""
-        rel = (auc_pred - auc_gt).abs() / (auc_gt.detach().abs() + self.eps)
+        """``1 - exp(-|e_pred - e_gt| / (|e_gt| + eps))``.
+
+        Operates element-wise so it returns a tensor with the same shape
+        as its inputs (a vector when comparing the two ``[len(radii)]``
+        energy curves, a scalar when comparing two scalars). The
+        denominator is ``detached`` so the relative normalisation
+        doesn't leak gradient into the GT side.
+        """
+        rel = (e_pred - e_gt).abs() / (e_gt.detach().abs() + self.eps)
         return 1.0 - torch.exp(-rel)
 
     def _landscape(
@@ -585,7 +674,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             cell_class = cell_class.squeeze(-1)
         elif cell_class.dim() != 1:
             raise ValueError(
-                f"CahnHilliardEnergyAUCLoss expected cell_class shape [N] or [N, 1], "
+                f"CahnHilliardEnergyCurveLoss expected cell_class shape [N] or [N, 1], "
                 f"got {tuple(cell_class.shape)}."
             )
 
@@ -597,7 +686,6 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         true_xy = true_pos[..., :2]
 
         unique_types = torch.unique(cell_class[mask_b])
-        radii_t = torch.tensor(self.radii, device=device, dtype=dtype)
 
         total = torch.zeros((), device=device, dtype=dtype)
         n_types = 0
@@ -632,18 +720,22 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
                 phi_pred = self._landscape(pred_xy, type_mask, grid_x, grid_y, r)
                 e_pred_curve.append(cahn_hilliard_energy(phi_pred, dx, dy, self.kappa))
 
+            # Stack into [len(radii)] vectors and compare *vector-wise*
+            # (no trapezoidal integration / AUC). The exponential
+            # normalisation is applied per radius and then averaged --
+            # equivalent to ``_normalized_exp_diff(e_pred_t, e_gt_t).mean()``
+            # but spelt out to make the per-radius nature explicit.
             e_gt_t = torch.stack(e_gt_curve)
             e_pred_t = torch.stack(e_pred_curve)
-
-            auc_gt = torch.trapezoid(e_gt_t, radii_t)
-            auc_pred = torch.trapezoid(e_pred_t, radii_t)
-
-            total = total + self._normalized_exp_diff(auc_pred, auc_gt)
+            per_radius_loss = self._normalized_exp_diff(e_pred_t, e_gt_t)
+            total = total + per_radius_loss.mean()
             n_types += 1
 
-        # no reason to have to divide by the number of pairs squared, we can just divide by the number of pairs
-        # PLZ CHANGE THIS
-        return total/(n_types), n_types
+        if n_types == 0:
+            return torch.zeros((), device=device, dtype=dtype), 0
+
+        # Per-sample loss = mean of per-type (mean-over-radii) losses.
+        return total / float(n_types), n_types
 
     # ---------------- forward ----------------
 
@@ -654,8 +746,9 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         train_stage: bool = True,
         log: bool = False,
         cell_class: Optional[torch.Tensor] = None,
+        batch_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
-        """Compute the CH energy-AUC loss.
+        """Compute the CH energy-curve loss (vector-wise, no AUC).
 
         Args:
             masked_pred: DataHolder with predicted ``.positions`` of shape
@@ -673,7 +766,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             cell_class = masked_true.cell_class
         if cell_class is None:
             raise ValueError(
-                "CahnHilliardEnergyAUCLoss requires cell_class; none was provided."
+                "CahnHilliardEnergyCurveLoss requires cell_class; none was provided."
             )
 
         pred_positions = masked_pred.positions
@@ -699,9 +792,9 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
         to_log = None
         if log:
             key = (
-                "train_loss/ch_energy_auc"
+                "train_loss/ch_energy_curve"
                 if train_stage
-                else "val_loss/ch_energy_auc"
+                else "val_loss/ch_energy_curve"
             )
             to_log = {
                 key: loss.item(),
@@ -712,7 +805,154 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
             if wandb.run:
                 wandb.log(to_log, commit=True)
 
+        # Periodic visualization (training only, batch_idx == 0 of an
+        # epoch divisible by ``viz_every_n_epochs``).
+        if train_stage and self._should_log_viz(batch_idx):
+            self._log_viz_to_wandb(
+                pred_positions=pred_positions,
+                true_positions=true_positions,
+                node_mask=node_mask,
+                cell_class=cell_class,
+            )
+
         return loss, to_log
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Track the trainer's current epoch so viz can be gated."""
+        self.current_epoch = int(epoch)
+
+    def _should_log_viz(self, batch_idx: Optional[int]) -> bool:
+        if self.viz_every_n_epochs <= 0:
+            return False
+        if batch_idx is None or int(batch_idx) != 0:
+            return False
+        return (self.current_epoch % self.viz_every_n_epochs) == 0
+
+    def _compute_type_radius_viz_data(
+        self,
+        pred_pos: torch.Tensor,
+        true_pos: torch.Tensor,
+        mask: torch.Tensor,
+        cell_class_b: torch.Tensor,
+        sample_idx: int,
+        rng: np.random.Generator,
+    ) -> Optional[Dict]:
+        """Rebuild phi_pred / phi_gt / energy densities for one random
+        (sample, type, radius). Returns ``None`` if the sample has no
+        type passing the ``min_cells_per_type`` filter.
+        """
+        mask_b = mask.bool() if mask.dtype != torch.bool else mask
+        if cell_class_b.dim() == 2 and cell_class_b.shape[-1] == 1:
+            cell_class_b = cell_class_b.squeeze(-1)
+        if mask_b.sum() == 0:
+            return None
+
+        pred_xy = pred_pos[..., :2]
+        true_xy = true_pos[..., :2]
+
+        # Identify valid types (vectorised, single sync) -- mirrors the
+        # filter used by ``_sample_loss``.
+        masked_classes = cell_class_b[mask_b]
+        masked_classes = masked_classes[masked_classes >= 0]
+        if masked_classes.numel() == 0:
+            return None
+        uniq, counts = torch.unique(masked_classes, return_counts=True)
+        keep = counts >= self.min_cells_per_type
+        valid_types_t = uniq[keep]
+        if int(valid_types_t.numel()) == 0:
+            return None
+
+        # Random type + random radius.
+        ti = int(rng.integers(0, int(valid_types_t.numel())))
+        ct = int(valid_types_t[ti].item())
+        type_mask = mask_b & (cell_class_b == ct)
+
+        radius = float(rng.choice(np.asarray(self.radii)))
+
+        grid_x, grid_y, dx, dy = shared_square_grid(
+            true_xy[type_mask], pred_xy[type_mask],
+            grid_resolution=self.grid_resolution,
+            margin=self.margin, square=self.square_bbox,
+        )
+
+        with torch.no_grad():
+            phi_gt = self._landscape(true_xy, type_mask, grid_x, grid_y, radius)
+            phi_pred = self._landscape(pred_xy, type_mask, grid_x, grid_y, radius)
+            ed_gt = cahn_hilliard_energy_density(phi_gt, dx, dy, self.kappa)
+            ed_pred = cahn_hilliard_energy_density(phi_pred, dx, dy, self.kappa)
+            e_gt = float((ed_gt.sum() * dx * dy).item())
+            e_pred = float((ed_pred.sum() * dx * dy).item())
+
+        return {
+            "phi_pred": phi_pred.detach().cpu().numpy(),
+            "phi_gt": phi_gt.detach().cpu().numpy(),
+            "ed_pred": ed_pred.detach().cpu().numpy(),
+            "ed_gt": ed_gt.detach().cpu().numpy(),
+            "extent": (
+                float(grid_x[0].item()), float(grid_x[-1].item()),
+                float(grid_y[0].item()), float(grid_y[-1].item()),
+            ),
+            "ct": ct, "radius": radius,
+            "e_pred": e_pred, "e_gt": e_gt,
+            "sample_idx": int(sample_idx),
+        }
+
+    def _log_viz_to_wandb(
+        self,
+        pred_positions: torch.Tensor,
+        true_positions: torch.Tensor,
+        node_mask: torch.Tensor,
+        cell_class: torch.Tensor,
+    ) -> None:
+        """Render ``viz_num_figures`` random (sample, type, radius)
+        panels and push them to WandB.
+        """
+        if not wandb.run:
+            return
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            return
+
+        B = int(pred_positions.shape[0])
+        rng = np.random.default_rng(seed=int(self.current_epoch))
+
+        log_dict: Dict[str, "wandb.Image"] = {}
+        max_attempts = max(self.viz_num_figures * 4, 8)
+        figs_logged = 0
+        attempt = 0
+        while figs_logged < self.viz_num_figures and attempt < max_attempts:
+            attempt += 1
+            b = int(rng.integers(0, B))
+            viz = self._compute_type_radius_viz_data(
+                pred_pos=pred_positions[b],
+                true_pos=true_positions[b],
+                mask=node_mask[b],
+                cell_class_b=cell_class[b],
+                sample_idx=b,
+                rng=rng,
+            )
+            if viz is None:
+                continue
+            title = (
+                f"CH-curve viz | epoch {self.current_epoch} | "
+                f"sample {viz['sample_idx']} | type {viz['ct']} | "
+                f"radius {viz['radius']:.4f}"
+            )
+            fig = _build_phi_energy_figure(
+                phi_pred=viz["phi_pred"], phi_gt=viz["phi_gt"],
+                ed_pred=viz["ed_pred"], ed_gt=viz["ed_gt"],
+                extent=viz["extent"],
+                e_pred=viz["e_pred"], e_gt=viz["e_gt"],
+                title=title,
+            )
+            log_dict[f"viz/ch_curve/fig_{figs_logged}"] = wandb.Image(fig)
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+            figs_logged += 1
+
+        if log_dict:
+            wandb.log(log_dict, commit=False)
 
     def reset(self) -> None:
         """No running state to reset."""
@@ -746,7 +986,7 @@ class CahnHilliardEnergyAUCLoss(nn.Module):
 #     L_AB = 1 - exp( -|E_pred - E_gt| / (|E_gt| + eps) )
 #
 # This mirrors the bounded, scale-invariant form already used by
-# :class:`CahnHilliardEnergyAUCLoss` (denominator is detached so the
+# :class:`CahnHilliardEnergyCurveLoss` (denominator is detached so the
 # normalisation does not leak gradients). The sample loss is the mean over
 # pairs; the batch loss is the mean over samples.
 #
@@ -1083,6 +1323,8 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         chunk: int = 4096,
         cache_gt: bool = False,
         cache_key_mode: Literal["content", "slot"] = "content",
+        viz_every_n_epochs: int = 0,
+        viz_num_figures: int = 4,
     ) -> None:
         super().__init__()
         self.transition_width = float(transition_width)
@@ -1094,6 +1336,19 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         self.eps = float(eps)
         self.min_cells_per_type = int(min_cells_per_type)
         self.chunk = int(chunk)
+        # Visualization: every N epochs (> 0 enables; 0 disables) we
+        # detach a small slice of the loss's intermediate tensors,
+        # render them to a matplotlib figure and push it to WandB so
+        # you can verify the loss is doing what you think it's doing.
+        # The work happens only on ``batch_idx == 0`` of the chosen
+        # epoch, so it costs at most one extra forward of the loss
+        # every N epochs.
+        self.viz_every_n_epochs = int(viz_every_n_epochs)
+        self.viz_num_figures = int(viz_num_figures)
+        # Tracked by the training loop via ``set_current_epoch`` and
+        # gated by ``viz_every_n_epochs``. Default 0 means "no viz
+        # until the trainer tells us otherwise".
+        self.current_epoch: int = 0
         # When ``cache_gt`` is enabled, the grid is built from GT cells
         # *only* (instead of the GT u pred union), which makes the grid --
         # and therefore the GT distance fields and pair energies -- depend
@@ -1137,6 +1392,187 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         """
         self._gt_cache.clear()
 
+    def set_current_epoch(self, epoch: int) -> None:
+        """Track the trainer's current epoch so viz can be gated."""
+        self.current_epoch = int(epoch)
+
+    def _should_log_viz(self, batch_idx: Optional[int]) -> bool:
+        """True iff this is a viz-logging step.
+
+        Triggers on ``batch_idx == 0`` of any epoch divisible by
+        ``viz_every_n_epochs`` (and only when viz is enabled). Restricting
+        to ``batch_idx == 0`` makes "every N epochs" mean exactly that --
+        one set of figures per epoch, regardless of the number of batches.
+        """
+        if self.viz_every_n_epochs <= 0:
+            return False
+        if batch_idx is None or int(batch_idx) != 0:
+            return False
+        return (self.current_epoch % self.viz_every_n_epochs) == 0
+
+    def _compute_pair_viz_data(
+        self,
+        pred_pos: torch.Tensor,
+        true_pos: torch.Tensor,
+        mask: torch.Tensor,
+        cell_class_b: torch.Tensor,
+        sample_idx: int,
+        rng: np.random.Generator,
+    ) -> Optional[Dict]:
+        """Rebuild phi_pred / phi_gt / energy densities for one random
+        (sample, type pair). Returns ``None`` if the sample has < 2 valid
+        types. Runs under ``torch.no_grad`` -- viz must not influence the
+        training graph.
+        """
+        device = pred_pos.device
+
+        mask_b = mask.bool() if mask.dtype != torch.bool else mask
+        if cell_class_b.dim() == 2 and cell_class_b.shape[-1] == 1:
+            cell_class_b = cell_class_b.squeeze(-1)
+        if mask_b.sum() == 0:
+            return None
+
+        pred_xy = pred_pos[..., :2]
+        true_xy = true_pos[..., :2]
+
+        masked_classes = cell_class_b[mask_b]
+        masked_classes = masked_classes[masked_classes >= 0]
+        if masked_classes.numel() == 0:
+            return None
+
+        uniq, counts = torch.unique(masked_classes, return_counts=True)
+        keep = counts >= self.min_cells_per_type
+        valid_types_t = uniq[keep]
+        num_types = int(valid_types_t.numel())
+        if num_types < 2:
+            return None
+
+        # Pick a random *valid* pair of types.
+        pair = rng.choice(num_types, size=2, replace=False)
+        i_a, i_b = int(min(pair)), int(max(pair))
+        ta = int(valid_types_t[i_a].item())
+        tb = int(valid_types_t[i_b].item())
+
+        participates = mask_b & torch.isin(cell_class_b, valid_types_t)
+        cell_type_idx = torch.searchsorted(valid_types_t, cell_class_b[participates])
+
+        # Same grid the loss itself uses (bbox over *all* real GT cells).
+        gt_bbox_pts = true_xy[mask_b]
+        grid_x, grid_y, dx, dy = shared_square_grid(
+            gt_bbox_pts, gt_bbox_pts,
+            grid_resolution=self.grid_resolution,
+            margin=self.margin, square=self.square_bbox,
+        )
+        ny, nx = grid_y.shape[0], grid_x.shape[0]
+        gy, gx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        grid_xy = torch.stack([gx.flatten(), gy.flatten()], dim=-1)
+        grid_norm_sq = (grid_xy * grid_xy).sum(-1)
+
+        with torch.no_grad():
+            gt_cells = true_xy[participates]
+            pred_cells = pred_xy[participates]
+            gt_dists = compute_distance_fields_per_type_fused(
+                grid_xy=grid_xy, grid_norm_sq=grid_norm_sq,
+                cells_xy=gt_cells, cell_type_idx=cell_type_idx,
+                num_types=num_types, soft_beta=self.soft_beta,
+                chunk=self.chunk,
+            ).view(num_types, ny, nx)
+            pred_dists = compute_distance_fields_per_type_fused(
+                grid_xy=grid_xy, grid_norm_sq=grid_norm_sq,
+                cells_xy=pred_cells, cell_type_idx=cell_type_idx,
+                num_types=num_types, soft_beta=self.soft_beta,
+                chunk=self.chunk,
+            ).view(num_types, ny, nx)
+
+            phi_gt = voronoi_phase_field(
+                gt_dists[i_a], gt_dists[i_b], self.transition_width
+            )
+            phi_pred = voronoi_phase_field(
+                pred_dists[i_a], pred_dists[i_b], self.transition_width
+            )
+            ed_gt = cahn_hilliard_energy_density(phi_gt, dx, dy, self.kappa)
+            ed_pred = cahn_hilliard_energy_density(phi_pred, dx, dy, self.kappa)
+            e_gt = float((ed_gt.sum() * dx * dy).item())
+            e_pred = float((ed_pred.sum() * dx * dy).item())
+
+        # Squeeze tensors to numpy on CPU. ``detach`` is redundant under
+        # ``no_grad`` but cheap and makes intent explicit.
+        return {
+            "phi_pred": phi_pred.detach().cpu().numpy(),
+            "phi_gt": phi_gt.detach().cpu().numpy(),
+            "ed_pred": ed_pred.detach().cpu().numpy(),
+            "ed_gt": ed_gt.detach().cpu().numpy(),
+            "extent": (
+                float(grid_x[0].item()), float(grid_x[-1].item()),
+                float(grid_y[0].item()), float(grid_y[-1].item()),
+            ),
+            "ta": ta, "tb": tb,
+            "e_pred": e_pred, "e_gt": e_gt,
+            "sample_idx": int(sample_idx),
+        }
+
+    def _log_viz_to_wandb(
+        self,
+        pred_positions: torch.Tensor,
+        true_positions: torch.Tensor,
+        node_mask: torch.Tensor,
+        cell_class: torch.Tensor,
+    ) -> None:
+        """Render ``viz_num_figures`` random (sample, pair) panels and
+        push them to WandB. No-op if WandB isn't initialised.
+        """
+        if not wandb.run:
+            return
+        try:
+            import matplotlib  # noqa: F401  (figure builder will import)
+        except ImportError:
+            return  # matplotlib not installed -> silently skip viz
+
+        B = int(pred_positions.shape[0])
+        # Seed by epoch so multiple runs that line up step-for-step
+        # produce comparable diagnostic panels.
+        rng = np.random.default_rng(seed=int(self.current_epoch))
+
+        log_dict: Dict[str, "wandb.Image"] = {}
+        # We may not get a successful viz on every try (e.g. a sample
+        # without two valid types), so we bound the number of attempts.
+        max_attempts = max(self.viz_num_figures * 4, 8)
+        figs_logged = 0
+        attempt = 0
+        while figs_logged < self.viz_num_figures and attempt < max_attempts:
+            attempt += 1
+            b = int(rng.integers(0, B))
+            viz = self._compute_pair_viz_data(
+                pred_pos=pred_positions[b],
+                true_pos=true_positions[b],
+                mask=node_mask[b],
+                cell_class_b=cell_class[b],
+                sample_idx=b,
+                rng=rng,
+            )
+            if viz is None:
+                continue
+            title = (
+                f"Voronoi pair viz | epoch {self.current_epoch} | "
+                f"sample {viz['sample_idx']} | types ({viz['ta']}, {viz['tb']})"
+            )
+            fig = _build_phi_energy_figure(
+                phi_pred=viz["phi_pred"], phi_gt=viz["phi_gt"],
+                ed_pred=viz["ed_pred"], ed_gt=viz["ed_gt"],
+                extent=viz["extent"],
+                e_pred=viz["e_pred"], e_gt=viz["e_gt"],
+                title=title,
+            )
+            # Fixed-key images so WandB groups them as a time series
+            # rather than creating a new key per epoch.
+            log_dict[f"viz/voronoi/fig_{figs_logged}"] = wandb.Image(fig)
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+            figs_logged += 1
+
+        if log_dict:
+            wandb.log(log_dict, commit=False)
+
     # ---------------- internals ----------------
 
     def _normalized_exp_diff(
@@ -1147,7 +1583,7 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         """``1 - exp(-|e_pred - e_gt| / |e_gt|)``; denominator is detached.
 
         Same bounded, scale-invariant form as
-        :class:`CahnHilliardEnergyAUCLoss._normalized_exp_diff` -- so
+        :class:`CahnHilliardEnergyCurveLoss._normalized_exp_diff` -- so
         per-pair contributions remain comparable across pairs with very
         different absolute energies, and the loss is bounded in ``[0, 1)``.
         """
@@ -1480,6 +1916,19 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
             if wandb.run:
                 wandb.log(to_log, commit=True)
 
+        # Periodic visualization (training only, batch_idx == 0 of an
+        # epoch divisible by ``viz_every_n_epochs``). Push a small
+        # number of (sample, pair) landscape + energy-density figures
+        # to WandB so you can eyeball whether the loss is computing
+        # what you think it's computing.
+        if train_stage and self._should_log_viz(batch_idx):
+            self._log_viz_to_wandb(
+                pred_positions=pred_positions,
+                true_positions=true_positions,
+                node_mask=node_mask,
+                cell_class=cell_class,
+            )
+
         return loss, to_log
 
     def reset(self) -> None:
@@ -1729,19 +2178,21 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
 class CombinedLossFunction(nn.Module):
     """Convenience wrapper combining:
        * the pairwise-distance MSE (``LossFunction``),
-       * the Cahn-Hilliard energy-AUC loss (``CahnHilliardEnergyAUCLoss``),
+       * the Cahn-Hilliard energy-curve loss
+         (``CahnHilliardEnergyCurveLoss``, per-radius vector comparison,
+         no AUC integration),
        * the Voronoi phase-pair CH-energy loss
          (``VoronoiPhasePairEnergyLoss``).
 
-           L = mse_weight   * L_mse
-             + ch_weight    * L_ch_auc
+           L = mse_weight     * L_mse
+             + ch_weight      * L_ch_curve
              + voronoi_weight * L_voronoi_pair
 
     Any component can be turned off by setting its weight to ``0`` (we
     short-circuit those branches so we don't pay their cost).
 
     Parameters are split by component using a ``voronoi_*`` prefix to
-    avoid colliding with the existing CH-AUC parameters (some of which
+    avoid colliding with the existing CH-curve parameters (some of which
     have similar names, e.g. ``grid_resolution``).
     """
 
@@ -1749,7 +2200,7 @@ class CombinedLossFunction(nn.Module):
         self,
         mse_weight: float = 1.0,
         ch_weight: float = 1.0,
-        # --- CH-AUC parameters --------------------------------------------
+        # --- CH energy-curve parameters -----------------------------------
         radii: Sequence[float] = np.linspace(0.0004, 0.01, 25),
         grid_resolution: int = 64,
         kappa: float = 1.0,
@@ -1777,6 +2228,10 @@ class CombinedLossFunction(nn.Module):
         voronoi_chunk: int = 4096,
         voronoi_cache_gt: bool = False,
         voronoi_cache_key_mode: Literal["content", "slot"] = "content",
+        # --- Visualization (every N epochs, both sub-losses) --------------
+        viz_every_n_epochs: int = 0,
+        ch_viz_num_figures: int = 1,
+        voronoi_viz_num_figures: int = 4,
     ) -> None:
         super().__init__()
         self.mse_weight = float(mse_weight)
@@ -1784,7 +2239,7 @@ class CombinedLossFunction(nn.Module):
         self.voronoi_weight = float(voronoi_weight) if voronoi_weight != -1 else float(ch_weight)
 
         self.mse_loss = LossFunction()
-        self.ch_loss = CahnHilliardEnergyAUCLoss(
+        self.ch_loss = CahnHilliardEnergyCurveLoss(
             radii=radii,
             grid_resolution=grid_resolution,
             kappa=kappa,
@@ -1798,6 +2253,8 @@ class CombinedLossFunction(nn.Module):
             margin=margin,
             eps=eps,
             min_cells_per_type=min_cells_per_type,
+            viz_every_n_epochs=viz_every_n_epochs,
+            viz_num_figures=ch_viz_num_figures,
         )
         # We always instantiate the Voronoi loss so users can introspect /
         # toggle it without recreating the combined module; if the weight
@@ -1814,7 +2271,18 @@ class CombinedLossFunction(nn.Module):
             chunk=voronoi_chunk,
             cache_gt=voronoi_cache_gt,
             cache_key_mode=voronoi_cache_key_mode,
+            viz_every_n_epochs=viz_every_n_epochs,
+            viz_num_figures=voronoi_viz_num_figures,
         )
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Forward the trainer's current epoch to the sub-losses that
+        gate visualization on it.
+        """
+        if hasattr(self.ch_loss, "set_current_epoch"):
+            self.ch_loss.set_current_epoch(epoch)
+        if hasattr(self.voronoi_loss, "set_current_epoch"):
+            self.voronoi_loss.set_current_epoch(epoch)
 
     def clear_voronoi_gt_cache(self) -> None:
         """Drop the cached GT-side data of the Voronoi sub-loss.
@@ -1848,12 +2316,14 @@ class CombinedLossFunction(nn.Module):
 
         
 
-        # CH-AUC: skip entirely if disabled (it's the most expensive of
+        # CH-curve: skip entirely if disabled (it's the most expensive of
         # the three; no point running it just to multiply by zero).
         ch_log: Optional[Dict[str, float]] = None
         if self.ch_weight != 0.0:
             ch_val, ch_log = self.ch_loss(
-                masked_pred, masked_true, train_stage=train_stage, log=log
+                masked_pred, masked_true,
+                train_stage=train_stage, log=log,
+                batch_idx=batch_idx,
             )
             loss = loss + self.ch_weight * ch_val
 

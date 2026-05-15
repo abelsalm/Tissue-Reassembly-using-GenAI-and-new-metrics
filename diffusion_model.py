@@ -71,6 +71,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 voronoi_cache_key_mode=getattr(
                     cfg.train, "voronoi_cache_key_mode", "content"
                 ),
+                viz_every_n_epochs=getattr(cfg.train, "viz_every_n_epochs", 0),
+                ch_viz_num_figures=getattr(cfg.train, "ch_viz_num_figures", 1),
+                voronoi_viz_num_figures=getattr(
+                    cfg.train, "voronoi_viz_num_figures", 4
+                ),
             )
         elif cfg.train.loss_type == "position_mse":
             self.train_loss = LossFunction()

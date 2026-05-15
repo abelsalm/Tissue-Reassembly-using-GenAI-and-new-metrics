@@ -9,7 +9,7 @@ debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 loss_type: "combined" # "combined" or "position_mse"
 mse_weight: 1.0
 # --- CH-AUC parameters --------------------------------------------
-ch_final_weight: 0.04
+ch_final_weight: 0.02
 ch_warmup_fraction: 0.4
 ch_ramp_fraction: 0.2
 ch_ramp_every_n_epochs: 10
@@ -35,3 +35,7 @@ voronoi_min_cells_per_type: 10
 voronoi_chunk: 128
 voronoi_cache_gt: True # Cache GT-side Voronoi energies; skips recomputing the constant target side every step
 voronoi_cache_key_mode: "content" # "content" (shuffle-safe, keys by cell_ID hash) or "slot" (keys by (batch_idx, sample_idx); only correct when DataLoader shuffle=False AND no rechunking)
+# --- Visualization (CH and Voronoi sub-losses) --------------------
+viz_every_n_epochs: 100 # Push landscape + energy-density figures to wandb every N epochs (0 = disabled). Fires on batch_idx == 0 only.
+ch_viz_num_figures: 1 # Number of CH-AUC (sample, type, radius) panels per logging event
+voronoi_viz_num_figures: 4 # Number of Voronoi (sample, pair) panels per logging event
