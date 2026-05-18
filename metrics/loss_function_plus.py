@@ -63,7 +63,7 @@ class LossFunction(nn.Module):
         masked_pred: DataHolder,
         masked_true: DataHolder,
         train_stage: bool = True,  # Default value set to True
-        log: bool = False,  # Default value set to False
+        log: bool = True,  # Default value set to True
         **_unused: object,  # accept (and ignore) e.g. ``batch_idx`` from
         # the training loop so this loss stays drop-in compatible with
         # the richer loss APIs (``CombinedLossFunction``, etc.).
@@ -1834,7 +1834,7 @@ class VoronoiPhasePairEnergyLoss(nn.Module):
         masked_pred: DataHolder,
         masked_true: DataHolder,
         train_stage: bool = True,
-        log: bool = False,
+        log: bool = True,
         cell_class: Optional[torch.Tensor] = None,
         batch_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
@@ -2115,7 +2115,7 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
         masked_true: DataHolder,
         cached_gt_avg: Optional[torch.Tensor] = None,
         train_stage: bool = True,
-        log: bool = False,
+        log: bool = True,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
         node_mask = masked_true.node_mask
         node_features = masked_true.node_features
@@ -2298,7 +2298,7 @@ class CombinedLossFunction(nn.Module):
         masked_pred: DataHolder,
         masked_true: DataHolder,
         train_stage: bool = True,
-        log: bool = False,
+        log: bool = True,
         verbose: bool = False,
         batch_idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:

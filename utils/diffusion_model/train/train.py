@@ -127,7 +127,7 @@ def on_train_epoch_start_func(self) -> None:
         ch_weight = _compute_ch_weight(self.cfg, self.current_epoch)
         self.train_loss.ch_weight = ch_weight
         if self.cfg.train.voronoi_weight == -1:
-            self.train_loss.voronoi_weight = ch_weight*8
+            self.train_loss.voronoi_weight = ch_weight*self.cfg.train.voronoi_multiplier
 
     # Tell the loss which epoch we're on (used to gate periodic viz
     # logging, e.g. CH and Voronoi landscapes -> WandB). Defensive
