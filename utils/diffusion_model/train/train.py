@@ -67,6 +67,12 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
             log=i % self.log_every_steps == 0,
             batch_idx=i,
         )
+    elif self.train_loss.__class__.__name__ == "NeighborhoodTranscriptomeRMSELoss":
+        loss, tl_log_dict = self.train_loss(
+            masked_pred=pred,
+            masked_true=batched_data,
+            log=i % self.log_every_steps == 0,
+        )
     else:
         loss, tl_log_dict = self.train_loss(
             masked_pred=pred,
@@ -99,11 +105,26 @@ def on_train_epoch_end_func(self) -> None:
     - None
     """
     cm = self.trainer.callback_metrics
+    # Pick the first key Lightning actually produced for this run. The
+    # epoch suffix is appended automatically when ``on_epoch=True`` is
+    # used in ``log_dict``. The order matters: position-MSE keys come
+    # first to preserve the previous behaviour for combined / MSE-only
+    # runs, then the neighborhood-RMSE keys for runs configured with
+    # ``loss_type: "neighborhood_rmse"``.
     epoch_loss = (
         cm.get("train_epoch/position_mse")
         or cm.get("train_epoch/position_mse_epoch")
         or cm.get("train_loss/position_mse_epoch")
         or cm.get("train_loss/position_mse")
+        or cm.get("train_epoch/neighborhood_transcriptome_rmse")
+        or cm.get("train_epoch/neighborhood_transcriptome_rmse_epoch")
+        or cm.get("train_loss/neighborhood_transcriptome_rmse")
+        or cm.get("train_epoch/neighborhood_multi_radius")
+        or cm.get("train_epoch/neighborhood_multi_radius_epoch")
+        or cm.get("train_loss/neighborhood_multi_radius")
+        or cm.get("train_epoch/neighborhood_transcriptome_cov")
+        or cm.get("train_epoch/neighborhood_transcriptome_cov_epoch")
+        or cm.get("train_loss/neighborhood_transcriptome_cov")
     )
     if epoch_loss is not None:
         try:

@@ -2087,6 +2087,11 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
         self.soft_beta = None if soft_beta is None else float(soft_beta)
         self.eps = float(eps)
         self.include_self = bool(include_self)
+        # Cached scalar of the last forward pass; consumed by
+        # :meth:`log_epoch_metrics` so the trainer can emit a single
+        # ``train_epoch/...`` key that PyTorch-Lightning will aggregate
+        # across the epoch.
+        self._last_loss: float = -1.0
 
     # ---------------- GT precompute / caching ----------------
 
@@ -2116,6 +2121,9 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
         cached_gt_avg: Optional[torch.Tensor] = None,
         train_stage: bool = True,
         log: bool = True,
+        **_unused: object,  # accept (and ignore) ``batch_idx`` etc. so this
+        # loss is drop-in compatible with the richer Combined/CH APIs the
+        # training loop dispatches to.
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
         node_mask = masked_true.node_mask
         node_features = masked_true.node_features
@@ -2158,6 +2166,13 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
         n_valid = valid_i.sum().clamp_min(1.0)
         loss = (per_cell_rmse * valid_i).sum() / n_valid
 
+        # Always update the cached scalar (one CPU sync per step). This
+        # is what :meth:`log_epoch_metrics` and the epoch-end print in
+        # ``utils/diffusion_model/train/train.py`` consume.
+        loss_val = float(loss.detach().item())
+        if train_stage:
+            self._last_loss = loss_val
+
         to_log: Optional[Dict[str, float]] = None
         if log:
             key = (
@@ -2165,14 +2180,1038 @@ class NeighborhoodTranscriptomeRMSELoss(nn.Module):
                 if train_stage
                 else "val_loss/neighborhood_transcriptome_rmse"
             )
-            to_log = {key: loss.item()}
+            to_log = {key: loss_val}
             if wandb.run:
                 wandb.log(to_log, commit=True)
         return loss, to_log
 
     def reset(self) -> None:
-        """No running state to reset."""
+        """No running state to reset (the last-loss cache is intentionally
+        carried across the epoch boundary; it is overwritten by the next
+        ``forward`` call)."""
         pass
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        """Expose the last-step loss under a ``train_epoch/...`` key.
+
+        Returned every step from ``training_step_func`` and forwarded to
+        ``self.log_dict(..., on_step=False, on_epoch=True)``; Lightning
+        therefore averages the per-step values into a single
+        end-of-epoch metric that downstream code (epoch-end print, early
+        stopping, checkpointing) can consume.
+        """
+        to_log = {
+            "train_epoch/neighborhood_transcriptome_rmse": float(self._last_loss),
+        }
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+        return to_log
+
+
+# ---------------------------------------------------------------------------
+# Multi-radius neighborhood loss (transcriptome RMSE + log-density diff)
+# ---------------------------------------------------------------------------
+#
+# Generalisation of :class:`NeighborhoodTranscriptomeRMSELoss` along two
+# axes:
+#
+#   1. Radii are sorted ascending; each index defines an **annulus** (ring),
+#      not a cumulative ball. For sorted ``[r_0, r_1, ..., r_{R-1}]``::
+#
+#        shell_0: ball(r_0)
+#        shell_k: ball(r_k) \\ ball(r_{k-1})   (mask_k = mask_cum_k - mask_cum_{k-1})
+#
+#      Transcriptome / density / global-sum terms use only neighbors in
+#      that shell, so scales do not double-count smaller neighborhoods.
+#   2. Per shell we compare log (soft) cell count and averaged / summed
+#      transcriptomes between pred and GT.
+#   3. Optionally, pred vs. GT neighborhood *weighted sums* (no / count)
+#      in the same shells -- the ``global`` counterpart to the average.
+#
+# Each shell reuses one cumulative ball mask minus the previous shell's
+# cumulative mask. ``cdist`` is once per side; one sigmoid (or cutoff) and
+# one matmul per listed radius.
+# ---------------------------------------------------------------------------
+
+
+def compute_neighborhood_avg_and_density_multi_radius(
+    positions: torch.Tensor,        # [B, N, D]
+    features: torch.Tensor,         # [B, N, F]
+    mask: torch.Tensor,             # [B, N] (bool / 0-1)
+    radii: Sequence[float],
+    *,
+    soft_beta: Optional[float] = None,
+    eps: float = 1e-6,
+    include_self: bool = True,
+    cached_dists: Optional[torch.Tensor] = None,
+    return_neighborhood_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Per-shell neighborhood averages, log-density, and optional sums.
+
+    ``radii`` may be given in any order; they are sorted ascending internally.
+    Output axis ``R`` indexes annuli: shell ``0`` is the ball of radius
+    ``r_0``; shell ``k > 0`` is the ring between ``r_{k-1}`` and ``r_k``
+    (cumulative mask at ``r_k`` minus cumulative mask at ``r_{k-1}``).
+
+    Returns:
+        avg:         ``[B, R, N, F]`` -- features averaged over neighbors
+                     in each shell only. Padded rows are zeroed out.
+        log_density: ``[B, R, N]`` -- ``log(sum_j w^shell_ij + eps)`` per
+                     shell (soft count in that annulus only).
+        neighborhood_sum: ``[B, R, N, F]`` or ``None`` -- weighted feature
+                     sum in each shell before dividing by the soft count.
+
+    Sharing across shells:
+      * ``cdist`` is computed **once** (or reused via ``cached_dists``)
+        -- this is the only ``O(B N^2 D)`` op.
+      * ``valid_j`` (padding mask broadcast across ``i``) and the
+        self-exclusion ``eye`` are built once.
+      * Per listed radius we build one cumulative ball mask, subtract the
+        previous cumulative mask to get the shell, then one matmul.
+
+    Memory:
+      Peak memory stays the same as the single-radius helper
+      (``O(B N^2 + B N F)``). We deliberately *do not* materialise a
+      ``[B, R, N, N]`` stacked-weights tensor (which would be ``R x``
+      more memory) -- the python loop over typically ``R <= 8`` radii
+      is negligible compared to the matmul cost.
+    """
+    if len(radii) < 1:
+        raise ValueError("Need at least one radius.")
+    B, N, _ = positions.shape
+    dtype = features.dtype
+    device = positions.device
+
+    # ONE cdist per side, shared by every radius. We allow the caller to
+    # pass a cached one (e.g. GT-side reused across epochs when positions
+    # are frozen) but most callers leave it at ``None`` -- the GT side is
+    # already wrapped in ``torch.no_grad`` upstream, so there is no
+    # autograd graph to worry about.
+    if cached_dists is None:
+        dists = torch.cdist(positions, positions, p=2)  # [B, N, N]
+    else:
+        dists = cached_dists
+
+    # Padding mask for neighbors j -- broadcast over the i axis.
+    valid_j = mask.to(dtype).unsqueeze(1)  # [B, 1, N]
+
+    # Pre-build self-exclusion if requested; identical for every radius.
+    eye: Optional[torch.Tensor] = None
+    if not include_self:
+        eye = torch.eye(N, device=device, dtype=dtype)  # [N, N], broadcasts over B
+
+    def _cumulative_ball_weights(radius: float) -> torch.Tensor:
+        if soft_beta is None:
+            w_cum = (dists <= float(radius)).to(dtype)
+        else:
+            w_cum = torch.sigmoid(float(soft_beta) * (float(radius) - dists))
+        w_cum = w_cum * valid_j
+        if eye is not None:
+            w_cum = w_cum * (1.0 - eye)
+        return w_cum
+
+    avgs = []
+    log_densities = []
+    neighborhood_sums: list = []
+    w_cum_prev: Optional[torch.Tensor] = None
+    for r in sorted(float(x) for x in radii):
+        w_cum = _cumulative_ball_weights(r)
+        if w_cum_prev is None:
+            w = w_cum
+        else:
+            # Annulus: membership in (r_prev, r], not the full ball(r).
+            w = (w_cum - w_cum_prev).clamp_min(0.0)
+        w_cum_prev = w_cum
+
+        # Soft cell-count = sum of shell weights along the neighbor axis.
+        sum_w = w.sum(dim=-1)            # [B, N]
+        log_d = torch.log(sum_w + eps)   # [B, N]
+
+        # Averaged features: same single-matmul trick as the single-radius
+        # helper. Reusing ``sum_w`` avoids re-summing inside ``denom``.
+        sum_f = torch.matmul(w, features)            # [B, N, F]
+        denom = sum_w.unsqueeze(-1).clamp_min(eps)   # [B, N, 1]
+        avg = sum_f / denom                          # [B, N, F]
+
+        if return_neighborhood_sum:
+            neighborhood_sums.append(sum_f)
+
+        avgs.append(avg)
+        log_densities.append(log_d)
+
+    avg_t = torch.stack(avgs, dim=1)            # [B, R, N, F]
+    log_density_t = torch.stack(log_densities, dim=1)  # [B, R, N]
+    neighborhood_sum_t = (
+        torch.stack(neighborhood_sums, dim=1)
+        if return_neighborhood_sum
+        else None
+    )
+
+    # Zero out rows for padded cells i so they cannot contaminate the
+    # later mean. ``log_density`` is left untouched here; the loss class
+    # multiplies it by the same valid_i mask before aggregating.
+    valid_i = mask.to(dtype).unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+    avg_t = avg_t * valid_i
+    if neighborhood_sum_t is not None:
+        neighborhood_sum_t = neighborhood_sum_t * valid_i
+    return avg_t, log_density_t, neighborhood_sum_t
+
+
+def precompute_gt_neighborhood_multi_radius(
+    true_positions: torch.Tensor,
+    node_features: torch.Tensor,
+    node_mask: torch.Tensor,
+    radii: Sequence[float],
+    *,
+    save_path: Optional[str] = None,
+    soft_beta: Optional[float] = None,
+    include_self: bool = True,
+    eps: float = 1e-6,
+    return_neighborhood_sum: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Multi-radius analogue of :func:`precompute_gt_neighborhood_features`.
+
+    Computes the GT-side ``(avg, log_density[, neighborhood_sum])`` tensors
+    once under ``torch.no_grad`` so they can be looked up at every training
+    step instead of being recomputed.
+
+    If ``save_path`` is provided we write the tensors to disk via
+    ``torch.save`` so they can be reloaded across runs.
+    """
+    with torch.no_grad():
+        avg, log_density, neighborhood_sum = (
+            compute_neighborhood_avg_and_density_multi_radius(
+                true_positions, node_features, node_mask,
+                radii=radii,
+                soft_beta=soft_beta,
+                eps=eps,
+                include_self=include_self,
+                return_neighborhood_sum=return_neighborhood_sum,
+            )
+        )
+    if save_path is not None:
+        payload = {
+            "avg": avg.detach().cpu(),
+            "log_density": log_density.detach().cpu(),
+        }
+        if neighborhood_sum is not None:
+            payload["neighborhood_sum"] = neighborhood_sum.detach().cpu()
+        torch.save(payload, save_path)
+    return avg, log_density, neighborhood_sum
+
+
+class MultiRadiusNeighborhoodLoss(nn.Module):
+    """Multi-radius neighborhood loss: transcriptome RMSE + log-density diff.
+
+    Pipeline (per side: ``pred``, ``gt``):
+      1. Sort ``radii`` ascending and build **annulus** masks (each shell
+         is ``ball(r_k) \\ ball(r_{k-1})``). Compute ``avg``, ``log_density``,
+         and optional neighborhood sums per shell via
+         :func:`compute_neighborhood_avg_and_density_multi_radius`.
+      2. Per-cell per-radius transcriptome term (averaged vs averaged)::
+
+             rmse(i, r) = sqrt( mean_f (avg_pred - avg_gt)^2 + eps )
+
+      3. Per-cell per-radius density term::
+
+             dens(i, r) = | log_density_pred(i, r) - log_density_gt(i, r) |
+
+      4. Per-cell per-radius *global* transcriptome term (pred vs GT
+         neighborhood **without** averaging over neighbor count)::
+
+             global_rmse(i, r) = sqrt( mean_f (sum_pred - sum_gt)^2 + eps )
+
+         where ``sum_side = sum_j w_ij * features[j]`` (same weights as
+         the averaged term, but no division by ``sum_j w_ij``).
+
+      5. Scale only the global term by ``loss_radius_scale * r`` (default
+         ``512 * r``) before aggregation.
+      6. Aggregate: mean over valid cells, then mean over radii, then::
+
+             L = transcriptome_term
+               + density_weight * density_term
+               + global_transcriptome_weight * global_term
+
+    Differentiability is governed by ``soft_beta`` exactly like the
+    single-radius variant (set it to ``None`` for a non-differentiable
+    diagnostic, set it to a positive float for training).
+
+    The GT side does **not** depend on the model and can be precomputed
+    via :meth:`precompute_gt` and passed as ``cached_gt_avg`` /
+    ``cached_gt_log_density`` / ``cached_gt_neighborhood_sum`` to skip the
+    GT recomputation every step.
+    """
+
+    def __init__(
+        self,
+        radii: Sequence[float] = (0.005, 0.01, 0.05, 0.1),
+        density_weight: float = 1.0,
+        global_transcriptome_weight: float = 0.0,
+        loss_radius_scale: float = 512.0,
+        soft_beta: Optional[float] = None,
+        eps: float = 1e-6,
+        include_self: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(radii) < 1:
+            raise ValueError("Need at least one radius.")
+        # Sorted ascending: index k is the annulus with outer radius r_k.
+        self.radii = tuple(float(r) for r in sorted(radii))
+        self.density_weight = float(density_weight)
+        self.global_transcriptome_weight = float(global_transcriptome_weight)
+        self.loss_radius_scale = float(loss_radius_scale)
+        self.soft_beta = None if soft_beta is None else float(soft_beta)
+        self.eps = float(eps)
+        self.include_self = bool(include_self)
+        # Per-step caches surfaced through ``log_epoch_metrics``.
+        self._last_loss: float = -1.0
+        self._last_transcriptome: float = -1.0
+        self._last_density: float = -1.0
+        self._last_global_transcriptome: float = -1.0
+
+    # ---------------- GT precompute / caching ----------------
+
+    def precompute_gt(
+        self,
+        true_positions: torch.Tensor,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        save_path: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Convenience wrapper around
+        :func:`precompute_gt_neighborhood_multi_radius`."""
+        return precompute_gt_neighborhood_multi_radius(
+            true_positions, node_features, node_mask,
+            radii=self.radii,
+            save_path=save_path,
+            soft_beta=self.soft_beta,
+            include_self=self.include_self,
+            eps=self.eps,
+            return_neighborhood_sum=self.global_transcriptome_weight > 0.0,
+        )
+
+    # ---------------- forward ----------------
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        cached_gt_avg: Optional[torch.Tensor] = None,
+        cached_gt_log_density: Optional[torch.Tensor] = None,
+        cached_gt_neighborhood_sum: Optional[torch.Tensor] = None,
+        train_stage: bool = True,
+        log: bool = True,
+        **_unused: object,  # accept ``batch_idx`` etc. for drop-in compat.
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        node_mask = masked_true.node_mask
+        node_features = masked_true.node_features
+        true_xy = masked_true.positions[..., :2]
+        pred_xy = masked_pred.positions[..., :2]
+        use_global = self.global_transcriptome_weight > 0.0
+
+        # ---- GT side: either reuse the cache or recompute under no_grad.
+        gt_provided = (
+            cached_gt_avg is not None and cached_gt_log_density is not None
+        )
+        if not gt_provided:
+            with torch.no_grad():
+                gt_avg, gt_logd, gt_sum = (
+                    compute_neighborhood_avg_and_density_multi_radius(
+                        true_xy, node_features, node_mask,
+                        radii=self.radii,
+                        soft_beta=self.soft_beta,
+                        eps=self.eps,
+                        include_self=self.include_self,
+                        return_neighborhood_sum=use_global,
+                    )
+                )
+        else:
+            gt_avg = cached_gt_avg.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+            gt_logd = cached_gt_log_density.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+            if use_global:
+                if cached_gt_neighborhood_sum is None:
+                    # Recover sum from avg and soft count: sum_f = avg * sum_w.
+                    sum_w = torch.exp(gt_logd) - self.eps
+                    gt_sum = gt_avg * sum_w.unsqueeze(-1).clamp_min(0.0)
+                else:
+                    gt_sum = cached_gt_neighborhood_sum.detach().to(
+                        device=node_features.device, dtype=node_features.dtype
+                    )
+            else:
+                gt_sum = None
+
+        # ---- Pred side: features come from GT (we're learning positions,
+        # not gene expressions), neighborhoods come from predicted xys.
+        pred_avg, pred_logd, pred_sum = (
+            compute_neighborhood_avg_and_density_multi_radius(
+                pred_xy, node_features, node_mask,
+                radii=self.radii,
+                soft_beta=self.soft_beta,
+                eps=self.eps,
+                include_self=self.include_self,
+                return_neighborhood_sum=use_global,
+            )
+        )
+
+        # ---- Transcriptome term: per-cell RMSE over the feature axis,
+        # for each (sample, radius). ``+ eps`` keeps ``sqrt`` differentiable
+        # at the optimum (i.e. when ``pred_avg == gt_avg``).
+        sq_err = (pred_avg - gt_avg).pow(2)            # [B, R, N, F]
+        per_cell_mse = sq_err.mean(dim=-1)             # [B, R, N]
+        per_cell_rmse = torch.sqrt(per_cell_mse + self.eps)
+
+        # ---- Density term: |log d_pred - log d_gt|, per cell per radius.
+        per_cell_dens = (pred_logd - gt_logd).abs()    # [B, R, N]
+
+        # ---- Global transcriptome term: pred vs GT neighborhood weighted
+        # sums (same comparison as transcriptome, but without / sum_w).
+        if use_global:
+            assert pred_sum is not None and gt_sum is not None
+            sq_err_global = (pred_sum - gt_sum).pow(2)       # [B, R, N, F]
+            per_cell_global = torch.sqrt(
+                sq_err_global.mean(dim=-1) + self.eps
+            )                                              # [B, R, N]
+            radius_div = torch.tensor(
+                [self.loss_radius_scale * r for r in self.radii],
+                device=per_cell_global.device,
+                dtype=per_cell_global.dtype,
+            ).view(1, -1, 1)
+            per_cell_global = per_cell_global / radius_div
+        else:
+            per_cell_global = torch.zeros_like(per_cell_dens)
+
+        # ---- Aggregation: mean over valid cells -> mean over radii ->
+        # mean over batch. Doing it in two steps (cells, then radii)
+        # means a sample with many cells does not dominate per-radius
+        # statistics.
+        valid_i = node_mask.to(per_cell_rmse.dtype).unsqueeze(1)   # [B, 1, N]
+        n_valid = valid_i.sum(dim=-1).clamp_min(1.0)               # [B, 1]
+        rmse_per_r = (per_cell_rmse * valid_i).sum(dim=-1) / n_valid  # [B, R]
+        dens_per_r = (per_cell_dens * valid_i).sum(dim=-1) / n_valid  # [B, R]
+        global_per_r = (per_cell_global * valid_i).sum(dim=-1) / n_valid  # [B, R]
+
+        transcriptome_term = rmse_per_r.mean()
+        density_term = dens_per_r.mean()
+        global_term = global_per_r.mean()
+        loss = (
+            transcriptome_term
+            + self.density_weight * density_term
+            + self.global_transcriptome_weight * global_term
+        )
+
+        # Cache scalars for log_epoch_metrics (Lightning aggregates these
+        # into a single per-epoch metric via on_epoch=True).
+        if train_stage:
+            self._last_transcriptome = float(transcriptome_term.detach().item())
+            self._last_density = float(density_term.detach().item())
+            self._last_global_transcriptome = float(global_term.detach().item())
+            self._last_loss = float(loss.detach().item())
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            prefix = "train_loss" if train_stage else "val_loss"
+            to_log = {
+                f"{prefix}/neighborhood_multi_radius": float(loss.detach().item()),
+                f"{prefix}/neighborhood_multi_radius_transcriptome": float(
+                    transcriptome_term.detach().item()
+                ),
+                #f"{prefix}/neighborhood_multi_radius_density": float(
+                #    density_term.detach().item()
+                #),
+                f"{prefix}/neighborhood_multi_radius_global_transcriptome": float(
+                    global_term.detach().item()
+                ),
+            }
+            # Also expose per-radius diagnostics (one number per (B, r) pair
+            # averaged over the batch). Useful for tuning the radius set:
+            # if the smallest radius dominates ``rmse`` you may want to
+            # add a larger one and vice-versa.
+            rmse_per_r_mean = rmse_per_r.mean(dim=0).detach()
+            dens_per_r_mean = dens_per_r.mean(dim=0).detach()
+            for ri, r in enumerate(self.radii):
+                to_log[f"{prefix}/neighborhood_multi_radius_rmse_r{r:g}"] = float(
+                    rmse_per_r_mean[ri].item()
+                )
+                #to_log[f"{prefix}/neighborhood_multi_radius_density_r{r:g}"] = float(
+                #    dens_per_r_mean[ri].item()
+                #)
+                to_log[
+                    f"{prefix}/neighborhood_multi_radius_global_transcriptome_r{r:g}"
+                ] = float(global_per_r.mean(dim=0).detach()[ri].item())
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+
+        return loss, to_log
+
+    def reset(self) -> None:
+        """No running state; the last-loss caches are intentionally
+        carried across the epoch boundary (overwritten by next forward)."""
+        pass
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        """Expose the last-step components under ``train_epoch/...`` keys.
+
+        Per-step call from ``training_step_func`` + ``on_epoch=True`` in
+        ``log_dict`` makes Lightning average each key over the epoch.
+        Four keys: the combined loss plus the transcriptome / density /
+        global-transcriptome breakdown -- useful for monitoring which side
+        dominates.
+        """
+        to_log = {
+            "train_epoch/neighborhood_multi_radius": float(self._last_loss),
+            "train_epoch/neighborhood_multi_radius_transcriptome": float(
+                self._last_transcriptome
+            ),
+            "train_epoch/neighborhood_multi_radius_density": float(
+                self._last_density
+            ),
+            "train_epoch/neighborhood_multi_radius_global_transcriptome": float(
+                self._last_global_transcriptome
+            ),
+        }
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+        return to_log
+
+
+# ---------------------------------------------------------------------------
+# Neighborhood weighted-spatial-covariance loss (trace + det per (cell, gene))
+# ---------------------------------------------------------------------------
+#
+# For every cell ``c`` and every gene ``g`` we build the 2x2 *spatial*
+# covariance matrix of the (x, y) positions of cells in the neighborhood
+# of ``c``, weighted by ``exp(features[i, g])`` for each neighbor ``i``::
+#
+#     w_i = exp(F[i, g])
+#     S_α = Σ_i a_{c,i} w_i · α_i             (α ∈ {1, x, y, xx, xy, yy})
+#     μ_x = S_x / (S_1 + eps),   μ_y = S_y / (S_1 + eps)
+#     C_xx = S_xx / (S_1 + eps) - μ_x^2
+#     C_yy = S_yy / (S_1 + eps) - μ_y^2
+#     C_xy = S_xy / (S_1 + eps) - μ_x μ_y
+#     trace(c, g) = C_xx + C_yy
+#     det(c, g)   = C_xx · C_yy - C_xy^2
+#
+# Reasoning behind ``exp(F)`` rather than ``F`` directly:
+#   * ``exp`` is strictly positive, so ``S_1 = Σ a w`` cannot vanish for
+#     any cell that has at least one (soft) neighbor -- the
+#     "no zero-division" property the user asked for.
+#   * Multiplicatively, ``exp(F)`` amplifies the contribution of
+#     high-expressing cells, so the covariance summarises the spatial
+#     spread of *expressing* cells in the neighborhood.
+#   * ``exp(F)`` is evaluated in a numerically stable, max-shifted form
+#     (subtract the per-(sample, gene) max before exponentiating) so raw
+#     un-normalised counts cannot overflow float32 to ``+inf``. Since the
+#     covariance is a weighted average, this rescale is mathematically
+#     transparent -- see ``compute_neighborhood_weighted_covariance_trace_det``.
+#
+# Broadcasting / speed trick: instead of six separate matmuls (one per
+# moment 1, x, y, xx, xy, yy) we pack the moment weights along a new
+# axis and run ONE big ``[B, N, N] @ [B, N, 6F]`` matmul that computes
+# all six moments in a single CUDA kernel. ``cdist`` and the membership
+# matrix ``A`` are computed once per side.
+#
+# Numerical clamps: ``C_xx``, ``C_yy`` and ``det`` are mathematically
+# non-negative (Cauchy-Schwarz on the weighted samples) but the
+# bias-variance identity ``E[X^2] - E[X]^2`` can produce tiny negative
+# values from float roundoff. We ``clamp_min(0)`` after the identity to
+# protect the downstream ``sqrt`` in the RMSE term.
+# ---------------------------------------------------------------------------
+
+
+def compute_neighborhood_weighted_covariance_trace_det(
+    positions: torch.Tensor,        # [B, N, >=2]
+    features: torch.Tensor,         # [B, N, F]
+    mask: torch.Tensor,             # [B, N]
+    radius: float,
+    *,
+    soft_beta: Optional[float] = None,
+    eps: float = 1e-6,
+    include_self: bool = True,
+    cached_dists: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-cell-per-gene 2x2 spatial-covariance trace + determinant.
+
+    Returns:
+        trace: ``[B, N, F]`` -- ``C_xx + C_yy`` for every (cell, gene).
+                Rows for padded cells are zeroed out.
+        det:   ``[B, N, F]`` -- ``C_xx * C_yy - C_xy^2`` for every
+                (cell, gene). Rows for padded cells are zeroed out.
+
+    Args:
+        positions: ``[B, N, D]``; only the first two dims (x, y) are used.
+        features:  ``[B, N, F]`` per-cell gene-expression matrix.
+        mask:      ``[B, N]`` per-cell validity (1 = real cell, 0 = padding).
+        radius:    neighborhood radius (position-coord units).
+        soft_beta: sigmoid sharpness; ``None`` = hard cutoff (gradient
+            through positions is zero almost everywhere -- diagnostic
+            only). For training use a positive float (e.g. 256).
+        eps: numerical floor for the divisions and the moment denominators.
+        include_self: include cell ``c`` itself in its own neighborhood.
+        cached_dists: optional precomputed ``[B, N, N]`` distance matrix.
+            Skips the ``cdist`` call (useful when the same matrix is
+            already needed by another sub-loss).
+
+    Performance:
+        Per side: one ``cdist`` ``O(B N^2 D)``, one membership matrix
+        ``[B, N, N]``, one fused matmul ``[B, N, N] @ [B, N, 6F]`` whose
+        cost is ``6x`` the transcriptome-average matmul. The "six
+        moments stacked along an axis" packing means we pay this 6x
+        cost as a *single* GPU kernel launch, not six.
+    """
+    B, N, _ = positions.shape
+    F = features.shape[-1]
+    dtype = features.dtype
+    device = positions.device
+
+    # ---- Neighborhood membership matrix A (shared by all genes).
+    if cached_dists is None:
+        dists = torch.cdist(positions[..., :2], positions[..., :2], p=2)
+    else:
+        dists = cached_dists
+
+    if soft_beta is None:
+        A = (dists <= float(radius)).to(dtype)
+    else:
+        A = torch.sigmoid(float(soft_beta) * (float(radius) - dists))
+
+    valid_j = mask.to(dtype).unsqueeze(1)  # [B, 1, N], broadcasts over i
+    A = A * valid_j
+
+    if not include_self:
+        eye = torch.eye(N, device=device, dtype=dtype)
+        A = A * (1.0 - eye)
+
+    # ---- Per-cell-per-gene weights ``w = exp(F)``. ``exp`` is strictly
+    # positive, so the moment denominator S_1 cannot vanish when at
+    # least one (soft) neighbor exists.
+    #
+    # Numerical stability: raw gene counts (the real pipeline does NOT
+    # log-normalise ``node_features``) can exceed ~88, where ``exp``
+    # overflows float32 to ``+inf`` and the weighted means collapse to
+    # ``inf/inf = NaN``. We therefore subtract the per-(sample, gene)
+    # maximum over valid cells before exponentiating. Because every
+    # quantity below is a *weighted average* (numerator and denominator
+    # both scale linearly in the weights), multiplying all of a gene's
+    # weights by the same positive constant ``exp(-max)`` cancels
+    # exactly -- so this rescale leaves trace/det unchanged in the
+    # well-behaved regime while guaranteeing the largest weight is
+    # ``exp(0) = 1``. The ``clamp_min`` floors the shifted exponent so
+    # very-low-expression neighbors cannot underflow to exactly zero,
+    # keeping ``S_1`` strictly positive. The same shift is applied to
+    # GT and prediction (both use the GT ``node_features``), so the two
+    # sides stay directly comparable.
+    neg_inf = torch.finfo(features.dtype).min
+    valid_feat = features.masked_fill(~mask.bool().unsqueeze(-1), neg_inf)
+    f_max = valid_feat.amax(dim=1, keepdim=True)  # [B, 1, F]
+    # Guard an all-padding sample (amax would be -inf -> use 0 shift).
+    f_max = torch.where(torch.isfinite(f_max), f_max, torch.zeros_like(f_max))
+    W = torch.exp((features - f_max).clamp_min(-50.0))  # [B, N, F], in (0, 1]
+
+    # ---- Build the six moment-weighted tensors all at once.
+    # Shapes are kept explicit for readability; PyTorch broadcasts
+    # ``[B, N, 1]`` * ``[B, N, F]`` into ``[B, N, F]``.
+    x = positions[..., 0:1]              # [B, N, 1]
+    y = positions[..., 1:2]              # [B, N, 1]
+    Wx  = W * x                          # [B, N, F]
+    Wy  = W * y
+    Wxx = W * (x * x)
+    Wxy = W * (x * y)
+    Wyy = W * (y * y)
+
+    # Stack along a new "moment" axis and flatten (moment, gene) so we
+    # can run ONE batched matmul instead of six. The order here
+    # (1, x, y, xx, xy, yy) is preserved when we unpack below.
+    V = torch.stack([W, Wx, Wy, Wxx, Wxy, Wyy], dim=2)  # [B, N, 6, F]
+    V_flat = V.reshape(B, N, 6 * F)
+
+    # ---- Single fused matmul: A @ V_flat gives all six moments per (c, g).
+    S = torch.matmul(A, V_flat).reshape(B, N, 6, F)  # [B, N, 6, F]
+    S0  = S[:, :, 0]
+    Sx  = S[:, :, 1]
+    Sy  = S[:, :, 2]
+    Sxx = S[:, :, 3]
+    Sxy = S[:, :, 4]
+    Syy = S[:, :, 5]
+
+    # ---- Weighted means.
+    denom = S0 + eps                              # [B, N, F]
+    mu_x = Sx / denom
+    mu_y = Sy / denom
+
+    # ---- 2x2 weighted covariance entries, using the user-supplied
+    # *exact* formula (numerator form). This is algebraically equal to
+    # the bias-variance identity ``S_αβ/(S_0+ε) - μ_α μ_β`` only up to
+    # an O(ε)-sized term, so we use the explicit numerator
+    # ``S_αβ - μ_α S_β - μ_β S_α + μ_α μ_β S_0`` (which simplifies to
+    # ``S_αα - 2 μ_α S_α + μ_α^2 S_0`` on the diagonal) and then divide
+    # by ``S_0 + ε``. This guarantees the loss matches the formula in
+    # the docstring bit-for-bit.
+    num_xx = Sxx - 2.0 * mu_x * Sx + mu_x * mu_x * S0
+    num_yy = Syy - 2.0 * mu_y * Sy + mu_y * mu_y * S0
+    num_xy = Sxy - mu_x * Sy - mu_y * Sx + mu_x * mu_y * S0
+
+    C_xx = (num_xx / denom).clamp_min(0.0)
+    C_yy = (num_yy / denom).clamp_min(0.0)
+    C_xy = num_xy / denom
+
+    trace = C_xx + C_yy
+    det = (C_xx * C_yy - C_xy * C_xy).clamp_min(0.0)
+
+    # ---- Zero out rows for padded cells i.
+    valid_i = mask.to(dtype).unsqueeze(-1)  # [B, N, 1]
+    trace = trace * valid_i
+    det = det * valid_i
+    return trace, det
+
+
+def precompute_gt_neighborhood_weighted_covariance(
+    true_positions: torch.Tensor,
+    node_features: torch.Tensor,
+    node_mask: torch.Tensor,
+    radius: float,
+    *,
+    save_path: Optional[str] = None,
+    soft_beta: Optional[float] = None,
+    include_self: bool = True,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One-shot helper to precompute the GT-side (trace, det) tensors.
+
+    Runs under ``torch.no_grad`` so no autograd graph is built. Mirrors
+    :func:`precompute_gt_neighborhood_features` for the single-radius
+    transcriptome loss; the GT trace/det are constant per batch and can
+    therefore be looked up at every step instead of being recomputed.
+    """
+    with torch.no_grad():
+        tr, det = compute_neighborhood_weighted_covariance_trace_det(
+            true_positions, node_features, node_mask,
+            radius=radius,
+            soft_beta=soft_beta,
+            eps=eps,
+            include_self=include_self,
+        )
+    if save_path is not None:
+        torch.save(
+            {"trace": tr.detach().cpu(), "det": det.detach().cpu()},
+            save_path,
+        )
+    return tr, det
+
+
+class NeighborhoodWeightedCovarianceLoss(nn.Module):
+    """RMSE between predicted and GT (trace, det) of the weighted-spatial
+    covariance matrix per (cell, gene).
+
+    For every (cell ``c``, gene ``g``) we build the 2x2 covariance matrix
+    of cell positions in the neighborhood of ``c`` weighted by
+    ``exp(feature[i, g])`` (see
+    :func:`compute_neighborhood_weighted_covariance_trace_det` for the
+    exact formula). The loss compares the trace and determinant tensors
+    between predicted and GT positions with a per-cell RMSE over genes.
+
+    Per-cell-per-side aggregation:
+        rmse_trace(c) = sqrt( mean_g (trace_pred(c, g) - trace_gt(c, g))^2 + eps )
+        rmse_det(c)   = sqrt( mean_g (det_pred(c, g)   - det_gt(c, g))^2   + eps )
+
+    Then::
+
+        L = trace_weight * mean_c rmse_trace(c)
+          + det_weight   * mean_c rmse_det(c)
+
+    Differentiability is governed by ``soft_beta`` exactly like the
+    other neighborhood losses.
+
+    The GT side does not depend on the model and can be precomputed
+    once via :meth:`precompute_gt` and supplied through
+    ``cached_gt_trace`` / ``cached_gt_det`` to skip the GT
+    recomputation every step.
+    """
+
+    def __init__(
+        self,
+        radius: float,
+        soft_beta: Optional[float] = None,
+        eps: float = 1e-6,
+        include_self: bool = True,
+        trace_weight: float = 1.0,
+        det_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.radius = float(radius)
+        self.soft_beta = None if soft_beta is None else float(soft_beta)
+        self.eps = float(eps)
+        self.include_self = bool(include_self)
+        self.trace_weight = float(trace_weight)
+        self.det_weight = float(det_weight)
+        # Per-step caches surfaced through ``log_epoch_metrics``.
+        self._last_loss: float = -1.0
+        self._last_trace: float = -1.0
+        self._last_det: float = -1.0
+
+    # ---------------- GT precompute / caching ----------------
+
+    def precompute_gt(
+        self,
+        true_positions: torch.Tensor,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        save_path: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convenience wrapper around
+        :func:`precompute_gt_neighborhood_weighted_covariance`."""
+        return precompute_gt_neighborhood_weighted_covariance(
+            true_positions, node_features, node_mask,
+            radius=self.radius,
+            save_path=save_path,
+            soft_beta=self.soft_beta,
+            include_self=self.include_self,
+            eps=self.eps,
+        )
+
+    # ---------------- forward ----------------
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        cached_gt_trace: Optional[torch.Tensor] = None,
+        cached_gt_det: Optional[torch.Tensor] = None,
+        train_stage: bool = True,
+        log: bool = True,
+        **_unused: object,  # swallow ``batch_idx`` etc. for drop-in compat
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        node_mask = masked_true.node_mask
+        node_features = masked_true.node_features
+        pred_xy = masked_pred.positions[..., :2]
+        true_xy = masked_true.positions[..., :2]
+
+        # ---- GT side: either reuse the cache or recompute under no_grad.
+        gt_provided = (
+            cached_gt_trace is not None and cached_gt_det is not None
+        )
+        if not gt_provided:
+            with torch.no_grad():
+                gt_trace, gt_det = compute_neighborhood_weighted_covariance_trace_det(
+                    true_xy, node_features, node_mask,
+                    radius=self.radius,
+                    soft_beta=self.soft_beta,
+                    eps=self.eps,
+                    include_self=self.include_self,
+                )
+        else:
+            gt_trace = cached_gt_trace.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+            gt_det = cached_gt_det.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+
+        # ---- Pred side (with gradient through positions).
+        pred_trace, pred_det = compute_neighborhood_weighted_covariance_trace_det(
+            pred_xy, node_features, node_mask,
+            radius=self.radius,
+            soft_beta=self.soft_beta,
+            eps=self.eps,
+            include_self=self.include_self,
+        )
+
+        # ---- Per-cell RMSE over the gene axis (mirrors the transcriptome
+        # RMSE aggregation in ``NeighborhoodTranscriptomeRMSELoss``).
+        sq_err_trace = (pred_trace - gt_trace).pow(2)    # [B, N, F]
+        sq_err_det = (pred_det - gt_det).pow(2)          # [B, N, F]
+        per_cell_mse_trace = sq_err_trace.mean(dim=-1)   # [B, N]
+        per_cell_mse_det = sq_err_det.mean(dim=-1)       # [B, N]
+        # ``+ eps`` keeps ``sqrt`` differentiable at the optimum.
+        per_cell_rmse_trace = torch.sqrt(per_cell_mse_trace + self.eps)
+        per_cell_rmse_det = torch.sqrt(per_cell_mse_det + self.eps)
+
+        # ---- Mean over valid cells.
+        valid_i = node_mask.to(per_cell_rmse_trace.dtype)
+        n_valid = valid_i.sum().clamp_min(1.0)
+        trace_term = (per_cell_rmse_trace * valid_i).sum() / n_valid
+        det_term = (per_cell_rmse_det * valid_i).sum() / n_valid
+
+        loss = self.trace_weight * trace_term + self.det_weight * det_term
+
+        # Cache scalars for log_epoch_metrics.
+        if train_stage:
+            self._last_trace = float(trace_term.detach().item())
+            self._last_det = float(det_term.detach().item())
+            self._last_loss = float(loss.detach().item())
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            prefix = "train_loss" if train_stage else "val_loss"
+            to_log = {
+                f"{prefix}/neighborhood_cov": float(loss.detach().item()),
+                f"{prefix}/neighborhood_cov_trace": float(
+                    trace_term.detach().item()
+                ),
+                f"{prefix}/neighborhood_cov_det": float(det_term.detach().item()),
+            }
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss, to_log
+
+    def reset(self) -> None:
+        """No running state to reset (last-step caches are intentionally
+        carried across the epoch boundary; overwritten by next forward)."""
+        pass
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        """Expose the last-step loss + trace/det breakdown under
+        ``train_epoch/...`` keys for Lightning epoch-aggregation."""
+        to_log = {
+            "train_epoch/neighborhood_cov": float(self._last_loss),
+            "train_epoch/neighborhood_cov_trace": float(self._last_trace),
+            "train_epoch/neighborhood_cov_det": float(self._last_det),
+        }
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+        return to_log
+
+
+class NeighborhoodTranscriptomeAndCovarianceLoss(nn.Module):
+    """Combined loss: transcriptome-RMSE + weighted-spatial-covariance.
+
+    Wraps two existing single-radius neighborhood sub-losses (both
+    sharing the **same** radius, ``soft_beta``, ``eps`` and
+    ``include_self``):
+
+      * :class:`NeighborhoodTranscriptomeRMSELoss` -- per-cell RMSE
+        between predicted and GT neighborhood-averaged gene profiles.
+      * :class:`NeighborhoodWeightedCovarianceLoss` -- per-cell RMSE
+        between predicted and GT (trace, det) of the
+        ``exp(expression)``-weighted 2x2 spatial-covariance matrix.
+
+    The total is::
+
+        L = transcriptome_weight * L_transcriptome
+          + cov_weight           * L_covariance
+
+    where ``L_covariance = trace_weight * trace_rmse + det_weight * det_rmse``
+    (see :class:`NeighborhoodWeightedCovarianceLoss`).
+    """
+
+    def __init__(
+        self,
+        radius: float,
+        soft_beta: Optional[float] = None,
+        eps: float = 1e-6,
+        include_self: bool = True,
+        transcriptome_weight: float = 1.0,
+        cov_weight: float = 1.0,
+        trace_weight: float = 16.0,
+        det_weight: float = 32.0,
+    ) -> None:
+        super().__init__()
+        self.transcriptome_weight = float(transcriptome_weight)
+        self.cov_weight = float(cov_weight)
+        self.transcriptome = NeighborhoodTranscriptomeRMSELoss(
+            radius=radius,
+            soft_beta=soft_beta,
+            eps=eps,
+            include_self=include_self,
+        )
+        self.covariance = NeighborhoodWeightedCovarianceLoss(
+            radius=radius*4,
+            soft_beta=soft_beta,
+            eps=eps,
+            include_self=include_self,
+            trace_weight=trace_weight,
+            det_weight=det_weight,
+        )
+        # Caches for log_epoch_metrics. The sub-losses also expose their
+        # own caches so we keep separate fields here to log the combined
+        # total cleanly.
+        self._last_loss: float = -1.0
+        self._last_transcriptome: float = -1.0
+        self._last_covariance: float = -1.0
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        train_stage: bool = True,
+        log: bool = True,
+        **_unused: object,  # accept ``batch_idx`` etc. for drop-in compat
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        # The sub-losses each compute their own ``cdist`` (one per side
+        # for transcriptome, one per side for covariance). We *could*
+        # share them but it would require routing a cached-dists matrix
+        # through the transcriptome path too; the 2x cdist overhead is
+        # ~10% of total loss cost on typical GPU workloads so we keep
+        # the cleaner composition.
+        tx_loss, tx_log = self.transcriptome(
+            masked_pred, masked_true,
+            train_stage=train_stage, log=log,
+        )
+        cov_loss, cov_log = self.covariance(
+            masked_pred, masked_true,
+            train_stage=train_stage, log=log,
+        )
+
+        loss = (
+            self.transcriptome_weight * tx_loss
+            + self.cov_weight * cov_loss
+        )
+
+        if train_stage:
+            self._last_transcriptome = float(tx_loss.detach().item())
+            self._last_covariance = float(cov_loss.detach().item())
+            self._last_loss = float(loss.detach().item())
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            prefix = "train_loss" if train_stage else "val_loss"
+            to_log = {
+                f"{prefix}/neighborhood_transcriptome_cov": float(
+                    loss.detach().item()
+                ),
+                f"{prefix}/neighborhood_transcriptome_cov_transcriptome": float(
+                    tx_loss.detach().item()
+                ),
+                f"{prefix}/neighborhood_transcriptome_cov_covariance": float(
+                    cov_loss.detach().item()
+                ),
+            }
+            # Surface the sub-losses' detailed keys too (already emitted
+            # to WandB by their own ``wandb.log`` calls; we add them to
+            # the dict so the Lightning ``log_dict`` path also sees them).
+            if tx_log:
+                to_log.update(tx_log)
+            if cov_log:
+                to_log.update(cov_log)
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss, to_log
+
+    def reset(self) -> None:
+        self.transcriptome.reset()
+        self.covariance.reset()
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        to_log = {
+            "train_epoch/neighborhood_transcriptome_cov": float(self._last_loss),
+            "train_epoch/neighborhood_transcriptome_cov_transcriptome": float(
+                self._last_transcriptome
+            ),
+            "train_epoch/neighborhood_transcriptome_cov_covariance": float(
+                self._last_covariance
+            ),
+        }
+        # Forward to sub-losses so their own ``train_epoch/...`` keys
+        # (e.g. ``train_epoch/neighborhood_cov_trace``) get aggregated by
+        # Lightning too.
+        to_log.update(self.transcriptome.log_epoch_metrics())
+        to_log.update(self.covariance.log_epoch_metrics())
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+        return to_log
 
 
 class CombinedLossFunction(nn.Module):

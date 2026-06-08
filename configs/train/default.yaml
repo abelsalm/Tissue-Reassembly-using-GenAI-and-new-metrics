@@ -6,13 +6,13 @@ weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)
 debug_print_shuffle_every_n_epochs: 10 # Print a shuffle canary every N epochs (0 = disabled)
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
-loss_type: "combined" # "combined" or "position_mse"
+loss_type: "neighborhood_multi_radius" # "combined", "position_mse", "neighborhood_rmse", "neighborhood_multi_radius" or "neighborhood_transcriptome_cov"
 mse_weight: 1.0
 # --- CH-AUC parameters --------------------------------------------
 ch_final_weight: 0.01
 ch_warmup_fraction: 0.4
-ch_ramp_fraction: 0.2
-ch_ramp_every_n_epochs: 36
+ch_ramp_fraction: 0.3
+ch_ramp_every_n_epochs: 54
 ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01]
 ch_grid_resolution: 512
 ch_kappa: 0.5
@@ -40,3 +40,45 @@ voronoi_cache_key_mode: "content" # "content" (shuffle-safe, keys by cell_ID has
 viz_every_n_epochs: 200 # Push landscape + energy-density figures to wandb every N epochs (0 = disabled). Fires on batch_idx == 0 only.
 ch_viz_num_figures: 4 # Number of CH-AUC (sample, type, radius) panels per logging event
 voronoi_viz_num_figures: 4 # Number of Voronoi (sample, pair) panels per logging event
+# --- Neighborhood-transcriptome RMSE parameters -------------------
+# Only consumed when ``loss_type: "neighborhood_rmse"``. Compares the
+# predicted vs. GT neighborhood-averaged gene-expression profile per
+# cell and takes the RMSE over the feature dimension, then averages
+# over valid cells.
+neigh_radius: 0.04 # Neighborhood radius (in normalised position-coord units) used to average gene-expression profiles around each cell.
+neigh_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (gradient through positions is zero almost everywhere -- diagnostic only).
+neigh_eps: 1.0e-6 # Numerical floor used inside the sqrt and the weight normalisation.
+neigh_include_self: True # Include cell i itself in its own neighborhood when averaging.
+# --- Multi-radius neighborhood loss parameters --------------------
+# Only consumed when ``loss_type: "neighborhood_multi_radius"``. Compares
+# neighborhood-averaged transcriptomes, log cell densities, and (optionally)
+# pred-vs-GT neighborhood weighted sums per **annulus** (radii sorted ascending;
+# each shell is ball(r_k) minus ball(r_{k-1}), not overlapping balls). Aggregated as
+#   L = transcriptome_rmse(avg_pred, avg_gt)
+#     + multi_radius_density_weight * |log d_pred - log d_gt|
+#     + multi_radius_global_transcriptome_weight
+#       * mean_{i,r} rmse(sum_pred(i,r), sum_gt(i,r)) / (scale * r)
+multi_radius_radii: [ 0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
+multi_radius_density_weight: 0.0 # Relative weight of the log-density term vs. the transcriptome-RMSE term.
+multi_radius_global_transcriptome_weight: 1.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
+multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is this times r.
+multi_radius_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (no gradient through positions; diagnostic only).
+multi_radius_eps: 1.0e-6 # Numerical floor for sqrt + log + weight normalisation.
+multi_radius_include_self: True # Include cell i itself in its own neighborhood when averaging / counting.
+# --- Neighborhood transcriptome + weighted-covariance combined loss ----
+# Only consumed when ``loss_type: "neighborhood_transcriptome_cov"``.
+# Single radius, shared by both sub-losses. Combines the per-cell
+# transcriptome-RMSE loss with a per-cell-per-gene weighted spatial
+# covariance loss (trace + det of the 2x2 covariance of (x, y) positions,
+# weighted by ``exp(gene_expression)``).
+#   L = neigh_cov_transcriptome_weight * L_transcriptome
+#     + neigh_cov_covariance_weight    * (neigh_cov_trace_weight * trace_rmse
+#                                         + neigh_cov_det_weight   * det_rmse)
+neigh_cov_radius: 0.03 # Shared neighborhood radius for both sub-losses.
+neigh_cov_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (diagnostic only).
+neigh_cov_eps: 1.0e-6 # Numerical floor for sqrt + division.
+neigh_cov_include_self: True # Include cell i itself in its own neighborhood.
+neigh_cov_transcriptome_weight: 1.0 # Top-level weight of the transcriptome-RMSE sub-loss.
+neigh_cov_covariance_weight: 16.0 # Top-level weight of the covariance (trace+det) sub-loss.
+neigh_cov_trace_weight: 16.0 # Inner weight: trace-RMSE term inside the covariance sub-loss.
+neigh_cov_det_weight: 64.0 # Inner weight: det-RMSE  term inside the covariance sub-loss.

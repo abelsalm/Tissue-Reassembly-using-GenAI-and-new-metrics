@@ -1,7 +1,12 @@
 import pytorch_lightning as pl
 import torch
 ## HERE ADD NEW LOSS
-from metrics.loss_function_plus import CombinedLossFunction
+from metrics.loss_function_plus import (
+    CombinedLossFunction,
+    NeighborhoodTranscriptomeRMSELoss,
+    MultiRadiusNeighborhoodLoss,
+    NeighborhoodTranscriptomeAndCovarianceLoss,
+)
 from metrics.loss_function import LossFunction
 from models.model import Model
 from utils.data.dataholder import DataHolder
@@ -79,6 +84,60 @@ class FullDenoisingDiffusion(pl.LightningModule):
             )
         elif cfg.train.loss_type == "position_mse":
             self.train_loss = LossFunction()
+        elif cfg.train.loss_type == "neighborhood_rmse":
+            # Train only with the neighborhood-averaged transcriptome
+            # RMSE loss. ``soft_beta`` controls differentiability through
+            # the predicted positions: set it to ``null`` in YAML for a
+            # hard cutoff (metric / diagnostic mode -- gradient is zero
+            # almost everywhere) and to a positive float for a soft
+            # sigmoid membership (recommended for training).
+            self.train_loss = NeighborhoodTranscriptomeRMSELoss(
+                radius=cfg.train.neigh_radius,
+                soft_beta=getattr(cfg.train, "neigh_soft_beta", None),
+                eps=getattr(cfg.train, "neigh_eps", 1e-6),
+                include_self=getattr(cfg.train, "neigh_include_self", True),
+            )
+        elif cfg.train.loss_type == "neighborhood_multi_radius":
+            # Multi-radius neighborhood loss combining (a) the
+            # transcriptome RMSE evaluated at each radius in
+            # ``multi_radius_radii`` and (b) the log-density difference at
+            # each radius. ``density_weight`` rescales the density term
+            # relative to the transcriptome term; see
+            # ``MultiRadiusNeighborhoodLoss`` for the exact aggregation.
+            self.train_loss = MultiRadiusNeighborhoodLoss(
+                radii=list(cfg.train.multi_radius_radii),
+                density_weight=getattr(cfg.train, "multi_radius_density_weight", 1.0),
+                global_transcriptome_weight=getattr(
+                    cfg.train, "multi_radius_global_transcriptome_weight", 0.0
+                ),
+                loss_radius_scale=getattr(
+                    cfg.train, "multi_radius_loss_radius_scale", 512.0
+                ),
+                soft_beta=getattr(cfg.train, "multi_radius_soft_beta", None),
+                eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
+                include_self=getattr(cfg.train, "multi_radius_include_self", True),
+            )
+        elif cfg.train.loss_type == "neighborhood_transcriptome_cov":
+            # Combined single-radius loss: per-cell transcriptome RMSE
+            # **plus** per-cell-per-gene weighted-spatial-covariance loss
+            # (trace + det of the 2x2 covariance of (x, y) positions,
+            # weights = exp(gene expression)). Both sub-losses share the
+            # same radius / softness. Two top-level weights control the
+            # transcriptome vs. covariance balance; two inner weights
+            # control the trace vs. det balance within the covariance
+            # term.
+            self.train_loss = NeighborhoodTranscriptomeAndCovarianceLoss(
+                radius=cfg.train.neigh_cov_radius,
+                soft_beta=getattr(cfg.train, "neigh_cov_soft_beta", None),
+                eps=getattr(cfg.train, "neigh_cov_eps", 1e-6),
+                include_self=getattr(cfg.train, "neigh_cov_include_self", True),
+                transcriptome_weight=getattr(
+                    cfg.train, "neigh_cov_transcriptome_weight", 1.0
+                ),
+                cov_weight=getattr(cfg.train, "neigh_cov_covariance_weight", 1.0),
+                trace_weight=getattr(cfg.train, "neigh_cov_trace_weight", 1.0),
+                det_weight=getattr(cfg.train, "neigh_cov_det_weight", 1.0),
+            )
         else:
             raise ValueError(f"Unsupported train loss_type: {cfg.train.loss_type}")
         self.val_loss = LossFunction()

@@ -1,6 +1,6 @@
 n_layers: 8 # Number of transformer layers
 diffusion_noise_schedule: cosine # noise schedule for diffusion time
-diffusion_steps: 1526 # number of diffusion steps
+diffusion_steps: 1024 # number of diffusion steps
 nu:
     p: 2
 hidden_mlp_dims:
@@ -14,4 +14,4 @@ hidden_dims:
     dim_ffX: 256 # hidden dimension of the cellular features feedforward network in the transformer
     dim_ffy: 256 # hidden dimension of the diffusion time feedforward network in the transformer
     dd: 64 # hidden dimension of the MLP for positions
-    output_features_to_pos_dims: 4 # hidden dimension of the MLP for the output features to positions
+    output_features_to_pos_dims: 4 # hidden dimension of the MLP for the output features to positions2048

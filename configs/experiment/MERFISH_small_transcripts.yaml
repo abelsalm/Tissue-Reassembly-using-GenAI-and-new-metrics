@@ -1,7 +1,7 @@
 # @package _global_
 general:
-    name : 'MERFISH_small_cortex'
-    mode : 'train_and_test'
+    name : 'MERFISH_small_transcripts'
+    mode : 'train_and_test' # 'test_only'
 
 distribute:
     gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
@@ -19,9 +19,14 @@ dataset:
         validation: null
 
 train: # !!!!
-    n_epochs: 3600        # tiny number for a smoke-test; increase for real training
-    batch_size: 1     # keep small on CPU
-    lr: 1e-3
+    n_epochs: 20000        # tiny number for a smoke-test; increase for real training
+    batch_size: 2     # keep small on CPU
+    lr: 5e-4
+    # ----- Train ONLY with the neighborhood-averaged transcriptome RMSE
+    # loss. The MSE / CH-curve / Voronoi components of CombinedLossFunction
+    # are not instantiated, so their knobs (mse_weight, ch_*, voronoi_*,
+    # viz_*) are silently unused for this run.
+    loss_type: "neighborhood_multi_radius"
 
 test:
     save_dir: '/data-master/code/outputs'
@@ -30,4 +35,4 @@ test:
 
 validation: # !!!!
     if_validate: False
-    save_model_every_n_epochs: 250  # save every epoch during the smoke-test
+    save_model_every_n_epochs: 1000  # save every epoch during the smoke-test
