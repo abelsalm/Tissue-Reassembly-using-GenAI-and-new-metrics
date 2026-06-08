@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import os
 import pathlib
+import wandb
 from omegaconf import DictConfig
 from yaml import safe_load
 import pytorch_lightning as pl
@@ -29,6 +30,8 @@ def main(cfg: DictConfig):
     # Run training or testing based on mode
     if cfg.general.mode == "train_and_test":
         train_model(cfg, datamodule, dataset_infos)
+        if wandb.run is not None:
+            wandb.finish()
         test_model(cfg, datamodule, dataset_infos)
     elif cfg.general.mode == "test_only":
         test_model(cfg, datamodule, dataset_infos)

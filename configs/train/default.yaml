@@ -54,13 +54,17 @@ neigh_include_self: True # Include cell i itself in its own neighborhood when av
 # neighborhood-averaged transcriptomes, log cell densities, and (optionally)
 # pred-vs-GT neighborhood weighted sums per **annulus** (radii sorted ascending;
 # each shell is ball(r_k) minus ball(r_{k-1}), not overlapping balls). Aggregated as
-#   L = transcriptome_rmse(avg_pred, avg_gt)
+#   L = transcriptome_rmse(avg_pred, avg_gt)   # per-gene GT band: see tolerance below
 #     + multi_radius_density_weight * |log d_pred - log d_gt|
 #     + multi_radius_global_transcriptome_weight
 #       * mean_{i,r} rmse(sum_pred(i,r), sum_gt(i,r)) / (scale * r)
-multi_radius_radii: [ 0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
+# Transcriptome + global: per cell, per shell, per **gene** f, loss ~0 inside
+# [gt_f - tol*|gt_f|, gt_f + tol*|gt_f|] (sigmoid gate); outside band, squared error unchanged.
+multi_radius_radii: [0.02,0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
 multi_radius_density_weight: 0.0 # Relative weight of the log-density term vs. the transcriptome-RMSE term.
 multi_radius_global_transcriptome_weight: 1.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
+multi_radius_transcriptome_tolerance: 0.05 # Relative GT band half-width per gene (0 = disabled, plain RMSE).
+multi_radius_transcriptome_tolerance_soft_beta: 256.0 # Sigmoid sharpness for the per-gene tolerance gate; null = hard cutoff at band edge.
 multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is this times r.
 multi_radius_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (no gradient through positions; diagnostic only).
 multi_radius_eps: 1.0e-6 # Numerical floor for sqrt + log + weight normalisation.

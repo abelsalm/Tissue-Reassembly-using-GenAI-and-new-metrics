@@ -2400,6 +2400,34 @@ def precompute_gt_neighborhood_multi_radius(
     return avg, log_density, neighborhood_sum
 
 
+def _gt_relative_band_squared_error(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    tolerance: float,
+    *,
+    gate_beta: Optional[float] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-gene squared error with a GT-relative tolerance band.
+
+    Applied element-wise on ``[..., F]``: for each cell, shell, and gene
+    ``f``, the half-width is ``tolerance * |gt[..., f]|``. Inside the band
+    the loss is softly driven to zero; outside it matches ``(pred-gt)^2``
+    (hard gate when ``gate_beta is None``, sigmoid gate otherwise).
+    ``tolerance <= 0`` disables the band and returns plain ``(pred-gt)^2``.
+    """
+    diff = pred - gt
+    if tolerance <= 0.0:
+        return diff.pow(2)
+    half_width = tolerance * gt.abs().clamp_min(eps)
+    excess = diff.abs() - half_width
+    sq = diff.pow(2)
+    if gate_beta is None:
+        return torch.where(excess > 0, sq, torch.zeros_like(sq))
+    gate = torch.sigmoid(float(gate_beta) * excess)
+    return gate * sq
+
+
 class MultiRadiusNeighborhoodLoss(nn.Module):
     """Multi-radius neighborhood loss: transcriptome RMSE + log-density diff.
 
@@ -2408,9 +2436,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
          is ``ball(r_k) \\ ball(r_{k-1})``). Compute ``avg``, ``log_density``,
          and optional neighborhood sums per shell via
          :func:`compute_neighborhood_avg_and_density_multi_radius`.
-      2. Per-cell per-radius transcriptome term (averaged vs averaged)::
+      2. Per-cell per-shell per-**gene** transcriptome term (averaged vs averaged).
+         For each gene ``f``, predictions inside
+         ``gt_f +/- transcriptome_tolerance * |gt_f|`` contribute ~zero
+         squared error (sigmoid gate with ``transcriptome_tolerance_gate_beta``);
+         outside the band the squared error is unchanged::
 
-             rmse(i, r) = sqrt( mean_f (avg_pred - avg_gt)^2 + eps )
+             rmse(i, r) = sqrt( mean_f gated_sq_err_f + eps )
 
       3. Per-cell per-radius density term::
 
@@ -2419,10 +2451,10 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
       4. Per-cell per-radius *global* transcriptome term (pred vs GT
          neighborhood **without** averaging over neighbor count)::
 
-             global_rmse(i, r) = sqrt( mean_f (sum_pred - sum_gt)^2 + eps )
+             global_rmse(i, r) = sqrt( mean_f gated_sq_err_f + eps )
 
-         where ``sum_side = sum_j w_ij * features[j]`` (same weights as
-         the averaged term, but no division by ``sum_j w_ij``).
+         with the same GT-relative band as the transcriptome term.
+         ``sum_side = sum_j w_ij * features[j]`` (no division by count).
 
       5. Scale only the global term by ``loss_radius_scale * r`` (default
          ``512 * r``) before aggregation.
@@ -2448,6 +2480,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         density_weight: float = 1.0,
         global_transcriptome_weight: float = 0.0,
         loss_radius_scale: float = 512.0,
+        transcriptome_tolerance: float = 0.05,
+        transcriptome_tolerance_gate_beta: Optional[float] = 256.0,
         soft_beta: Optional[float] = None,
         eps: float = 1e-6,
         include_self: bool = True,
@@ -2460,6 +2494,12 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self.density_weight = float(density_weight)
         self.global_transcriptome_weight = float(global_transcriptome_weight)
         self.loss_radius_scale = float(loss_radius_scale)
+        self.transcriptome_tolerance = float(transcriptome_tolerance)
+        self.transcriptome_tolerance_gate_beta = (
+            None
+            if transcriptome_tolerance_gate_beta is None
+            else float(transcriptome_tolerance_gate_beta)
+        )
         self.soft_beta = None if soft_beta is None else float(soft_beta)
         self.eps = float(eps)
         self.include_self = bool(include_self)
@@ -2558,11 +2598,16 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         )
 
         # ---- Transcriptome term: per-cell RMSE over the feature axis,
-        # for each (sample, radius). ``+ eps`` keeps ``sqrt`` differentiable
-        # at the optimum (i.e. when ``pred_avg == gt_avg``).
-        sq_err = (pred_avg - gt_avg).pow(2)            # [B, R, N, F]
-        per_cell_mse = sq_err.mean(dim=-1)             # [B, R, N]
-        per_cell_rmse = torch.sqrt(per_cell_mse + self.eps)
+        # for each (sample, radius). GT-relative band zeros loss inside
+        # ``gt +/- tolerance * |gt|`` per gene; outside uses ``(pred-gt)^2``.
+        sq_err = _gt_relative_band_squared_error(
+            pred_avg,
+            gt_avg,
+            self.transcriptome_tolerance,
+            gate_beta=self.transcriptome_tolerance_gate_beta,
+            eps=self.eps,
+        )                                              # [B, R, N, F]
+        per_cell_rmse = torch.sqrt(sq_err.mean(dim=-1) + self.eps)
 
         # ---- Density term: |log d_pred - log d_gt|, per cell per radius.
         per_cell_dens = (pred_logd - gt_logd).abs()    # [B, R, N]
@@ -2571,7 +2616,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         # sums (same comparison as transcriptome, but without / sum_w).
         if use_global:
             assert pred_sum is not None and gt_sum is not None
-            sq_err_global = (pred_sum - gt_sum).pow(2)       # [B, R, N, F]
+            sq_err_global = _gt_relative_band_squared_error(
+                pred_sum,
+                gt_sum,
+                self.transcriptome_tolerance,
+                gate_beta=self.transcriptome_tolerance_gate_beta,
+                eps=self.eps,
+            )                                              # [B, R, N, F]
             per_cell_global = torch.sqrt(
                 sq_err_global.mean(dim=-1) + self.eps
             )                                              # [B, R, N]

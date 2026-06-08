@@ -169,10 +169,6 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     max_epochs = cfg.train.n_epochs
     check_val_every_n_epochs = 0 if not cfg.validation.if_validate else cfg.validation.check_val_every_n_epochs
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if wandb.run and local_rank == 0:
-        setup_wandb(cfg)
-
     # Optional mixed-precision and gradient-accumulation knobs. They are
     # opt-in via the ``train`` config so existing experiments behave the same.
     precision = getattr(cfg.train, "precision", "32-true")

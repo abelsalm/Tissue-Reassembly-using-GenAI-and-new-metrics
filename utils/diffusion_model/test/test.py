@@ -29,7 +29,9 @@ def on_test_epoch_start_func(self) -> None:
     """
     Callback function called at the start of the test.
     """
-    if self.local_rank == 0:
+    # In train_and_test mode, training already logged to WandB; skip re-init
+    # so each checkpoint test does not spawn a separate run.
+    if self.local_rank == 0 and self.cfg.general.mode == "test_only":
         setup_wandb(self.cfg)
 
 
