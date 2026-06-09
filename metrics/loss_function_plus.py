@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Dict, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -2400,32 +2400,74 @@ def precompute_gt_neighborhood_multi_radius(
     return avg, log_density, neighborhood_sum
 
 
+def _align_radii_and_transcriptome_tolerances(
+    radii: Sequence[float],
+    tolerance: Union[float, Sequence[float]],
+) -> Tuple[Tuple[float, ...], Tuple[float, ...]]:
+    """Sort radii ascending and permute tolerances to stay index-aligned.
+
+    ``tolerance[i]`` in the input pairs with ``radii[i]`` before sorting.
+    """
+    r_list = [float(r) for r in radii]
+    if isinstance(tolerance, (float, int)):
+        t_list = [float(tolerance)] * len(r_list)
+    else:
+        t_list = [float(t) for t in tolerance]
+        if len(t_list) != len(r_list):
+            raise ValueError(
+                "transcriptome_tolerance must have the same length as radii "
+                f"({len(t_list)} != {len(r_list)})."
+            )
+    pairs = sorted(zip(r_list, t_list), key=lambda pair: pair[0])
+    sorted_radii = tuple(r for r, _ in pairs)
+    sorted_tols = tuple(t for _, t in pairs)
+    return sorted_radii, sorted_tols
+
+
 def _gt_relative_band_squared_error(
     pred: torch.Tensor,
     gt: torch.Tensor,
-    tolerance: float,
+    tolerance: Union[float, torch.Tensor],
     *,
     gate_beta: Optional[float] = None,
+    forgiveness: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Per-gene squared error with a GT-relative tolerance band.
 
     Applied element-wise on ``[..., F]``: for each cell, shell, and gene
-    ``f``, the half-width is ``tolerance * |gt[..., f]|``. Inside the band
-    the loss is softly driven to zero; outside it matches ``(pred-gt)^2``
-    (hard gate when ``gate_beta is None``, sigmoid gate otherwise).
-    ``tolerance <= 0`` disables the band and returns plain ``(pred-gt)^2``.
+    ``f``, the half-width is ``tolerance * |gt[..., f]|``. ``tolerance``
+    may be a scalar or a per-shell tensor broadcastable as ``[1, R, 1, 1]``.
+    ``gate`` is 0 inside the band and 1 outside (sigmoid when ``gate_beta``
+    is set). Forgiveness ``f in [0, 1]`` linearly blends between plain
+    ``(pred-gt)^2`` (``f=0``) and ``gate * (pred-gt)^2`` (``f=1``)::
+
+        sq_err = (pred-gt)^2 * (1 - f * (1 - gate))
+
+    So at epoch ``k`` of an ``n``-epoch ramp (``f = k/n``), in-band loss is
+    scaled by ``(n-k)/n``. Scalar ``tolerance <= 0`` or ``f <= 0`` returns
+    plain ``(pred-gt)^2``.
     """
     diff = pred - gt
-    if tolerance <= 0.0:
-        return diff.pow(2)
-    half_width = tolerance * gt.abs().clamp_min(eps)
-    excess = diff.abs() - half_width
     sq = diff.pow(2)
+    if forgiveness <= 0.0:
+        return sq
+    if isinstance(tolerance, torch.Tensor):
+        tol = tolerance.to(device=sq.device, dtype=sq.dtype)
+    else:
+        if tolerance <= 0.0:
+            return sq
+        tol = tolerance
+    half_width = tol * gt.abs().clamp_min(eps)
+    excess = diff.abs() - half_width
     if gate_beta is None:
-        return torch.where(excess > 0, sq, torch.zeros_like(sq))
-    gate = torch.sigmoid(float(gate_beta) * excess)
-    return gate * sq
+        gate = torch.where(excess > 0, torch.ones_like(sq), torch.zeros_like(sq))
+    else:
+        gate = torch.sigmoid(float(gate_beta) * excess)
+    forgiveness_t = torch.tensor(
+        float(forgiveness), device=sq.device, dtype=sq.dtype
+    )
+    return sq * (1.0 - forgiveness_t * (1.0 - gate))
 
 
 class MultiRadiusNeighborhoodLoss(nn.Module):
@@ -2437,10 +2479,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
          and optional neighborhood sums per shell via
          :func:`compute_neighborhood_avg_and_density_multi_radius`.
       2. Per-cell per-shell per-**gene** transcriptome term (averaged vs averaged).
-         For each gene ``f``, predictions inside
-         ``gt_f +/- transcriptome_tolerance * |gt_f|`` contribute ~zero
-         squared error (sigmoid gate with ``transcriptome_tolerance_gate_beta``);
-         outside the band the squared error is unchanged::
+         For each gene ``f`` and shell ``k``, a GT-relative band
+         ``gt_f +/- tolerance[k] * |gt_f|`` softly zeros in-band error
+         (sigmoid gate). ``tolerance[k]`` aligns with ``radii[k]`` in the
+         config list (re-sorted with radii internally). Forgiveness ramps over the first
+         ``transcriptome_tolerance_warmup_epochs`` epochs: epoch ``0`` is
+         plain RMSE; epoch ``k`` keeps ``(n-k)/n`` of in-band loss; epoch
+         ``n+`` applies the full band::
 
              rmse(i, r) = sqrt( mean_f gated_sq_err_f + eps )
 
@@ -2480,8 +2525,9 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         density_weight: float = 1.0,
         global_transcriptome_weight: float = 0.0,
         loss_radius_scale: float = 512.0,
-        transcriptome_tolerance: float = 0.05,
+        transcriptome_tolerance: Union[float, Sequence[float]] = 0.05,
         transcriptome_tolerance_gate_beta: Optional[float] = 256.0,
+        transcriptome_tolerance_warmup_epochs: int = 100,
         soft_beta: Optional[float] = None,
         eps: float = 1e-6,
         include_self: bool = True,
@@ -2489,25 +2535,60 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         super().__init__()
         if len(radii) < 1:
             raise ValueError("Need at least one radius.")
-        # Sorted ascending: index k is the annulus with outer radius r_k.
-        self.radii = tuple(float(r) for r in sorted(radii))
+        # Sorted ascending: index k is the annulus with outer radius r_k;
+        # per-shell tolerances are permuted to stay aligned with radii.
+        self.radii, self.transcriptome_tolerance_per_shell = (
+            _align_radii_and_transcriptome_tolerances(radii, transcriptome_tolerance)
+        )
         self.density_weight = float(density_weight)
         self.global_transcriptome_weight = float(global_transcriptome_weight)
         self.loss_radius_scale = float(loss_radius_scale)
-        self.transcriptome_tolerance = float(transcriptome_tolerance)
         self.transcriptome_tolerance_gate_beta = (
             None
             if transcriptome_tolerance_gate_beta is None
             else float(transcriptome_tolerance_gate_beta)
         )
+        self.transcriptome_tolerance_warmup_epochs = int(
+            transcriptome_tolerance_warmup_epochs
+        )
         self.soft_beta = None if soft_beta is None else float(soft_beta)
         self.eps = float(eps)
         self.include_self = bool(include_self)
+        self.current_epoch: int = 0
         # Per-step caches surfaced through ``log_epoch_metrics``.
         self._last_loss: float = -1.0
         self._last_transcriptome: float = -1.0
         self._last_density: float = -1.0
         self._last_global_transcriptome: float = -1.0
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Track trainer epoch for tolerance-band warmup (called each epoch)."""
+        self.current_epoch = int(epoch)
+
+    def _tolerance_forgiveness(self) -> float:
+        """Fraction of in-band forgiveness active at ``current_epoch``.
+
+        Returns ``min(epoch, n) / n`` when ``n > 0``, else ``1.0``.
+        Epoch ``0`` -> ``0`` (no band); epoch ``n+`` -> ``1`` (full band).
+        """
+        n = self.transcriptome_tolerance_warmup_epochs
+        if n <= 0:
+            return 1.0
+        return min(max(self.current_epoch, 0), n) / float(n)
+
+    def _shell_tolerance_tensor(
+        self, *, device: torch.device, dtype: torch.dtype, n_shells: int
+    ) -> torch.Tensor:
+        """Per-shell tolerance as ``[1, R, 1, 1]`` for band gating."""
+        if len(self.transcriptome_tolerance_per_shell) != n_shells:
+            raise ValueError(
+                "Shell count mismatch between radii and transcriptome tolerances."
+            )
+        return torch.tensor(
+            self.transcriptome_tolerance_per_shell,
+            device=device,
+            dtype=dtype,
+        ).view(1, n_shells, 1, 1)
 
     # ---------------- GT precompute / caching ----------------
 
@@ -2600,11 +2681,18 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         # ---- Transcriptome term: per-cell RMSE over the feature axis,
         # for each (sample, radius). GT-relative band zeros loss inside
         # ``gt +/- tolerance * |gt|`` per gene; outside uses ``(pred-gt)^2``.
+        tolerance_forgiveness = self._tolerance_forgiveness()
+        shell_tolerance = self._shell_tolerance_tensor(
+            device=pred_avg.device,
+            dtype=pred_avg.dtype,
+            n_shells=pred_avg.shape[1],
+        )
         sq_err = _gt_relative_band_squared_error(
             pred_avg,
             gt_avg,
-            self.transcriptome_tolerance,
+            shell_tolerance,
             gate_beta=self.transcriptome_tolerance_gate_beta,
+            forgiveness=tolerance_forgiveness,
             eps=self.eps,
         )                                              # [B, R, N, F]
         per_cell_rmse = torch.sqrt(sq_err.mean(dim=-1) + self.eps)
@@ -2619,8 +2707,9 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
             sq_err_global = _gt_relative_band_squared_error(
                 pred_sum,
                 gt_sum,
-                self.transcriptome_tolerance,
+                shell_tolerance,
                 gate_beta=self.transcriptome_tolerance_gate_beta,
+                forgiveness=tolerance_forgiveness,
                 eps=self.eps,
             )                                              # [B, R, N, F]
             per_cell_global = torch.sqrt(

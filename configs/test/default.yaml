@@ -1,8 +1,8 @@
 save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/multiple_tests_17-18-26_7777" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
-checkpoints_parent_dir: null #"/data-master/code/outputs/2026-06-03/17-18-26-MERFISH_small_transcripts/checkpoints/" # only for 'test_only' mode, path to the checkpoint to test. 
-checkpoints_name_list: null # ["epoch=15999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
+checkpoints_parent_dir: '/data-master/code/outputs/2026-06-08/17-44-59-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
+checkpoints_name_list:  ["epoch=16999.ckpt", "epoch=17999.ckpt", "epoch=18999.ckpt", "epoch=19999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
 batch_size: 4 # Batch size for testing
-epoch_index: 15999
-checkpoint_path: "/data-master/code/outputs/2026-06-03/17-18-26-MERFISH_small_transcripts/checkpoints/epoch=15499.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
+epoch_index: null
+checkpoint_path: null #"/data-master/code/outputs/2026-06-08/17-44-59-MERFISH_small_transcripts/checkpoints/ " # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.

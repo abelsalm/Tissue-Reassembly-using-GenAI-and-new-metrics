@@ -119,6 +119,13 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 transcriptome_tolerance_gate_beta=getattr(
                     cfg.train, "multi_radius_transcriptome_tolerance_soft_beta", 256.0
                 ),
+                transcriptome_tolerance_warmup_epochs=int(
+                    getattr(
+                        cfg.train,
+                        "multi_radius_transcriptome_tolerance_warmup_epochs",
+                        100,
+                    )
+                ),
                 soft_beta=getattr(cfg.train, "multi_radius_soft_beta", None),
                 eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
                 include_self=getattr(cfg.train, "multi_radius_include_self", True),

@@ -1,6 +1,6 @@
 n_epochs: 3200 # Number of epochs
 batch_size: 1 # Batch size for training
-lr: 5e-4 # Learning rate
+lr: 1e-3 # Learning rate
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)
@@ -58,13 +58,14 @@ neigh_include_self: True # Include cell i itself in its own neighborhood when av
 #     + multi_radius_density_weight * |log d_pred - log d_gt|
 #     + multi_radius_global_transcriptome_weight
 #       * mean_{i,r} rmse(sum_pred(i,r), sum_gt(i,r)) / (scale * r)
-# Transcriptome + global: per cell, per shell, per **gene** f, loss ~0 inside
-# [gt_f - tol*|gt_f|, gt_f + tol*|gt_f|] (sigmoid gate); outside band, squared error unchanged.
-multi_radius_radii: [0.02,0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
+# Transcriptome + global: per cell, per shell, per **gene** f, in-band loss ramps
+# from full RMSE (epoch 0) to ~0 (epoch n+): sq *= (n-k)/n inside band at epoch k.
+multi_radius_radii: [0.02, 0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
 multi_radius_density_weight: 0.0 # Relative weight of the log-density term vs. the transcriptome-RMSE term.
 multi_radius_global_transcriptome_weight: 1.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
-multi_radius_transcriptome_tolerance: 0.05 # Relative GT band half-width per gene (0 = disabled, plain RMSE).
+multi_radius_transcriptome_tolerance: [0.04, 0.04, 0.08, 0.08] # Per-shell GT band half-width per gene (same length/order as multi_radius_radii; scalar = same for all shells).
 multi_radius_transcriptome_tolerance_soft_beta: 256.0 # Sigmoid sharpness for the per-gene tolerance gate; null = hard cutoff at band edge.
+multi_radius_transcriptome_tolerance_warmup_epochs: 12000 # Epochs n to ramp band forgiveness: epoch k keeps (n-k)/n of in-band loss; 0 = full band from epoch 0.
 multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is this times r.
 multi_radius_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (no gradient through positions; diagnostic only).
 multi_radius_eps: 1.0e-6 # Numerical floor for sqrt + log + weight normalisation.
