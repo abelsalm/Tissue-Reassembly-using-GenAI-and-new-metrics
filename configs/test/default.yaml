@@ -1,8 +1,23 @@
-save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/multiple_tests_17-18-26_7777" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/multiple_tests" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
-checkpoints_parent_dir: '/data-master/code/outputs/2026-06-08/17-44-59-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
-checkpoints_name_list:  ["epoch=16999.ckpt", "epoch=17999.ckpt", "epoch=18999.ckpt", "epoch=19999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
-batch_size: 4 # Batch size for testing
+checkpoints_parent_dir: null # '/data-master/code/outputs/2026-06-04/23-30-17-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
+checkpoints_name_list:  null # ["epoch=14999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
+batch_size: 12 # Batch size for testing
 epoch_index: null
-checkpoint_path: null #"/data-master/code/outputs/2026-06-08/17-44-59-MERFISH_small_transcripts/checkpoints/ " # only for 'test_only' mode, path to the checkpoint to test.
+checkpoint_path: "/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+
+# Statistical testing pipeline (metrics/testing_pipeline.py)
+pipeline:
+  num_samples: 16          # denoising runs per cell_section (different seeds)
+  seed_start: 100             # seed for sample i is seed_start + i
+  device: auto                # auto | cpu | cuda
+  min_cells_per_class: 10     # skip cell classes with fewer GT cells
+  spatial_analysis:
+    gaussian_sigma: 0.02
+    grid_resolution: 256
+    grid_margin: 0.05
+    align_reference: 0
+    epsilon: 1.0e-12
+    overlay_gt_scatter_size: 6.0   # GT dot size on section density grid plots
+    section_density_plot_cols: 4    # max columns in the per-section multi-class figure

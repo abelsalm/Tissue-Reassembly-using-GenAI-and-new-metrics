@@ -2765,6 +2765,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
                 f"{prefix}/neighborhood_multi_radius_global_transcriptome": float(
                     global_term.detach().item()
                 ),
+                f"{prefix}/tolerance_forgiveness": float(tolerance_forgiveness),
             }
             # Also expose per-radius diagnostics (one number per (B, r) pair
             # averaged over the batch). Useful for tuning the radius set:

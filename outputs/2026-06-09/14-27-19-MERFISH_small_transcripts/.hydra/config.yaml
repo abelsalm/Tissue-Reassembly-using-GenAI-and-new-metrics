@@ -1,0 +1,146 @@
+validation:
+  if_validate: false
+  batch_size: 4
+  save_model_every_n_epochs: 1000
+  check_val_every_n_epochs: 32
+  check_val_monitor: val_loss/absolute_rssd
+  save_top_k_models: 8
+  early_stopping: false
+  early_stopping_patience: 100
+test:
+  save_dir: /data-master/code/outputs
+  checkpoints_parent_dir: null
+  checkpoints_name_list: all
+  batch_size: 12
+  epoch_index: null
+  checkpoint_path: null
+  test_save_parent_path: null
+  pipeline:
+    num_samples: 16
+    seed_start: 100
+    device: auto
+    min_cells_per_class: 10
+    spatial_analysis:
+      gaussian_sigma: 0.02
+      grid_resolution: 256
+      grid_margin: 0.05
+      align_reference: 0
+      epsilon: 1.0e-12
+      overlay_gt_scatter_size: 6.0
+      section_density_plot_cols: 4
+general:
+  name: MERFISH_small_transcripts
+  wandb: online
+  mode: test_only
+  seed: 0
+  enable_progress_bar: true
+  local_saved_path: null
+train:
+  n_epochs: 20000
+  batch_size: 1
+  lr: 0.0005
+  fast_dev_run: false
+  weight_decay: 1.0e-12
+  rechunk_every_n_epochs: 10
+  debug_print_shuffle_every_n_epochs: 10
+  debug_shuffle_row_index: 10
+  loss_type: neighborhood_multi_radius
+  mse_weight: 1.0
+  ch_final_weight: 0.01
+  ch_warmup_fraction: 0.4
+  ch_ramp_fraction: 0.3
+  ch_ramp_every_n_epochs: 54
+  ch_radii:
+  - 0.001
+  - 0.0022857143
+  - 0.0035714286
+  - 0.0048571429
+  - 0.0061428571
+  - 0.0074285714
+  - 0.0087142857
+  - 0.01
+  ch_grid_resolution: 512
+  ch_kappa: 0.5
+  ch_soft_max_beta: 32.0
+  ch_support_factor: 8
+  ch_landscape_chunk_size: 128
+  ch_square_bbox: true
+  ch_margin: 0.01
+  ch_eps: 1.0e-06
+  ch_min_cells_per_type: 10
+  voronoi_weight: -1
+  voronoi_multiplier: 4.0
+  voronoi_transition_width: 0.005
+  voronoi_grid_resolution: 512
+  voronoi_kappa: 0.5
+  voronoi_soft_beta: 1024.0
+  voronoi_square_bbox: true
+  voronoi_margin: 0.01
+  voronoi_min_cells_per_type: 10
+  voronoi_chunk: 128
+  voronoi_cache_gt: true
+  voronoi_cache_key_mode: content
+  viz_every_n_epochs: 200
+  ch_viz_num_figures: 4
+  voronoi_viz_num_figures: 4
+  neigh_radius: 0.04
+  neigh_soft_beta: 256.0
+  neigh_eps: 1.0e-06
+  neigh_include_self: true
+  multi_radius_radii:
+  - 0.02
+  - 0.04
+  - 0.08
+  - 0.16
+  multi_radius_density_weight: 0.0
+  multi_radius_global_transcriptome_weight: 1.0
+  multi_radius_transcriptome_tolerance:
+  - 0.04
+  - 0.08
+  - 0.06
+  - 0.04
+  multi_radius_transcriptome_tolerance_soft_beta: 256.0
+  multi_radius_transcriptome_tolerance_warmup_epochs: 12000
+  multi_radius_loss_radius_scale: 512
+  multi_radius_soft_beta: 256.0
+  multi_radius_eps: 1.0e-06
+  multi_radius_include_self: true
+  neigh_cov_radius: 0.03
+  neigh_cov_soft_beta: 256.0
+  neigh_cov_eps: 1.0e-06
+  neigh_cov_include_self: true
+  neigh_cov_transcriptome_weight: 1.0
+  neigh_cov_covariance_weight: 16.0
+  neigh_cov_trace_weight: 16.0
+  neigh_cov_det_weight: 64.0
+model:
+  n_layers: 8
+  diffusion_noise_schedule: cosine
+  diffusion_steps: 1024
+  nu:
+    p: 2
+  hidden_mlp_dims:
+    X: 256
+    'y': 256
+    pos: 64
+  hidden_dims:
+    dx: 64
+    dy: 1
+    num_heads: 16
+    dim_ffX: 256
+    dim_ffy: 256
+    dd: 64
+    output_features_to_pos_dims: 4
+distribute:
+  gpus_per_node: 1
+dataset:
+  dataset_name: MERFISH_small_cortex
+  gene_columns_start: 0
+  gene_columns_end: 254
+  train_data_path: /data-master/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_train.csv
+  test_data_path: /data-master/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv
+  validation_data_path: ''
+  maximum_graph_size:
+    train: null
+    test: null
+    validation: null

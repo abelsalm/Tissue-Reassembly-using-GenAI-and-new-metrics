@@ -44,9 +44,13 @@ def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor
     sample_interval = 1  # Sample interval for the diffusion process
 
     # Iteratively sample z_s from z_t for each diffusion step
+    batch_size = batch.node_features.size(0)
     for s_int in reversed(range(0, self.max_diffusion_steps, sample_interval)):
         s_array = torch.full(
-            (1, 1), s_int, dtype=torch.long, device=batch.node_features.device
+            (batch_size, 1),
+            s_int,
+            dtype=torch.long,
+            device=batch.node_features.device,
         )
         z_s = sample_zs_from_zt(self, z_t, s_array)
         z_t = z_s
