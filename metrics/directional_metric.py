@@ -333,7 +333,7 @@ class DirectionalMetricLoss(nn.Module):
         pass
 
     def log_epoch_metrics(self) -> Dict[str, float]:
-        to_log = {a
+        to_log = {
             "train_epoch/directional_metric": float(self._last_loss),
             "train_epoch/directional_coherence": float(self._last_coherence),
             "train_epoch/directional_pairwise": float(self._last_pairwise),
