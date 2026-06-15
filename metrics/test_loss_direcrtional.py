@@ -1,16 +1,19 @@
 """Evaluate and visualize DirectionalMetricLoss on LiVAE comparison CSV slices.
 
-Loads the same input format as ``LiVAE_tests/arrow_plot/build_plot_with_pred.py``
-(``not_normalized_test_results.csv``: gene columns, ``coord_X``/``coord_Y``,
-``coord_X_test``/``coord_Y_test``, ``cell_section``, ``cell_class``).
+Loads slice CSVs (gene columns, GT/pred coordinates, ``cell_section``,
+``cell_class``). For each slice:
 
-For each slice the script:
-  1. Builds batched tensors on GPU/CPU.
-  2. Times the broadcast directional-metric forward pass.
-  3. Optionally renders PCA / coherence arrow panels.
-  4. Writes a summary PNG (loss + timing per slice) and per-slice arrow PNGs.
+  1. Builds tensors and runs ``DirectionalMetricLoss`` (``n_target`` subsample).
+  2. Visualizes **only** the loss subsample: PCA-1 unit vectors and
+     coherence mean vectors from ``directional_metric.py`` (not the full-slice
+     viz in ``build_plot_with_pred.py``).
+  3. Writes a summary PNG and per-slice arrow PNGs.
 
 Usage::
+
+    # GPU timing (request a GPU in Slurm):
+    srun --gres=gpu:1 --mem=32G python metrics/test_loss_direcrtional.py \\
+        --gpu --csv /path/to/test_results.csv
 
     python metrics/test_loss_direcrtional.py \\
         --csv /path/to/not_normalized_test_results.csv \\
@@ -37,7 +40,7 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_LIVAE_ROOT = Path("/home/asalmona/Documents/Ricci/code/LiVAE_tests")
+DEFAULT_LIVAE_ROOT = Path("/data-master/code/Tissue-Reassembly-using-GenAI-and-new-metrics/results/")
 DEFAULT_CSV = DEFAULT_LIVAE_ROOT / "data_test_observations" / "not_normalized_test_results.csv"
 
 TRUE_X_COL = "coord_X"
@@ -46,7 +49,7 @@ PRED_X_COL = "coord_X_test"
 PRED_Y_COL = "coord_Y_test"
 SECTION_COL = "cell_section"
 
-N_TARGET = 128
+N_TARGET = 1000
 PCA_RADIUS = 0.16
 COHERENCE_RADIUS = 0.08
 SOFT_BETA = 256.0
@@ -72,7 +75,7 @@ def _setup_import_paths(livae_root: Path) -> None:
     for path in (REPO_ROOT, SCRIPT_DIR):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
-    arrow_plot_dir = livae_root / "arrow_plot"
+    arrow_plot_dir = livae_root
     if str(arrow_plot_dir) not in sys.path:
         sys.path.insert(0, str(arrow_plot_dir))
 
@@ -80,6 +83,31 @@ def _setup_import_paths(livae_root: Path) -> None:
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def resolve_device(device_str: str | None, *, use_gpu: bool) -> torch.device:
+    """Pick compute device; ``use_gpu=True`` requires CUDA."""
+    if device_str is not None:
+        return torch.device(device_str)
+
+    if use_gpu:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested (--gpu) but torch.cuda.is_available() is False. "
+                "Request a GPU in your job (e.g. srun --gres=gpu:1 ...) or pass --device cpu."
+            )
+        return torch.device("cuda:0")
+
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def describe_device(device: torch.device) -> str:
+    if device.type != "cuda":
+        return str(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(index)
+    mem_gb = props.total_memory / (1024 ** 3)
+    return f"cuda:{index} ({props.name}, {mem_gb:.1f} GiB)"
 
 
 def _timed_call(device: torch.device, fn, *args, **kwargs) -> tuple[object, float]:
@@ -177,90 +205,66 @@ def make_holders(
     return pred_holder, true_holder
 
 
-def compute_directional_viz_fields(
+def compute_loss_target_viz_fields(
     positions: torch.Tensor,
     features: torch.Tensor,
     mask: torch.Tensor,
+    target_idx: torch.Tensor,
+    target_valid: torch.Tensor,
     *,
     pca_radius: float,
     coherence_radius: float,
     soft_beta: float | None,
+    use_anisotropy_scaling: bool = False,
     eps: float = EPS,
 ) -> dict[str, np.ndarray]:
+    """Viz arrays for the exact ``n_target`` subsample used by the loss."""
     from directional_metric import (
         _gather_positions,
         _spatial_soft_weights,
-        _transcriptome_distance,
         compute_weighted_pca_directions,
     )
 
-    n_cells = positions.shape[1]
-    target_idx = torch.arange(n_cells, device=positions.device).unsqueeze(0)
-    target_valid = mask.clone()
-
-    unit_dirs, pca_valid = compute_weighted_pca_directions(
-        positions,
+    pca_vectors, pca_valid = compute_weighted_pca_directions(
+        positions[..., :2],
         features,
         mask,
         target_idx,
         target_valid,
         pca_radius,
         soft_beta=soft_beta,
+        use_anisotropy_scaling=use_anisotropy_scaling,
         eps=eps,
     )
 
-    target_pos = _gather_positions(positions, target_idx)
-    spatial_dists = torch.cdist(target_pos, positions, p=2)
-    spatial_w = _spatial_soft_weights(spatial_dists, pca_radius, soft_beta)
-    trans_dist = _transcriptome_distance(features, target_idx, eps=eps)
-    weights = spatial_w / (trans_dist + eps)
-    weights = weights * mask.to(weights.dtype).unsqueeze(1)
-    w_sum = weights.sum(dim=-1, keepdim=True).clamp_min(eps)
-
-    pos = positions.unsqueeze(1)
-    mu = (weights.unsqueeze(-1) * pos).sum(dim=2) / w_sum
-    dx = pos - mu.unsqueeze(2)
-    dx_x = dx[..., 0]
-    dx_y = dx[..., 1]
-    cxx = (weights * dx_x * dx_x).sum(dim=-1) / w_sum.squeeze(-1)
-    cyy = (weights * dx_y * dx_y).sum(dim=-1) / w_sum.squeeze(-1)
-    cxy = (weights * dx_x * dx_y).sum(dim=-1) / w_sum.squeeze(-1)
-    spread = (cxx + cyy).clamp_min(0.0)
-    disc = torch.sqrt(torch.clamp((cxx - cyy).pow(2) + 4.0 * cxy.pow(2), min=0.0))
-    lam1 = 0.5 * (spread + disc)
-    lam2 = 0.5 * (spread - disc)
-    anisotropy = ((lam1 - lam2) / (lam1 + lam2 + eps)).clamp(0.0, 1.0)
-
+    xy = positions[..., :2]
+    target_pos = _gather_positions(xy, target_idx)
     dists = torch.cdist(target_pos, target_pos, p=2)
     coh_w = _spatial_soft_weights(dists, coherence_radius, soft_beta)
     valid_pair = pca_valid.unsqueeze(2) & pca_valid.unsqueeze(1)
     coh_w = coh_w * valid_pair.to(coh_w.dtype)
     denom = coh_w.sum(dim=-1, keepdim=True).clamp_min(eps)
-    avg_vec = torch.matmul(coh_w, unit_dirs) / denom
-    coherence = avg_vec.norm(dim=-1).clamp(0.0, 1.0)
+    avg_vec = torch.matmul(coh_w, pca_vectors) / denom
+    coherence = avg_vec.norm(dim=-1)
+    if not use_anisotropy_scaling:
+        coherence = coherence.clamp(0.0, 1.0)
 
-    valid = pca_valid[0].detach().cpu().numpy()
+    valid = (pca_valid & target_valid)[0]
+    idx = target_idx[0][valid]
+
     return {
-        "x": positions[0, :, 0].detach().cpu().numpy(),
-        "y": positions[0, :, 1].detach().cpu().numpy(),
-        "pc1_x": unit_dirs[0, :, 0].detach().cpu().numpy(),
-        "pc1_y": unit_dirs[0, :, 1].detach().cpu().numpy(),
-        "anisotropy": anisotropy[0].detach().cpu().numpy(),
-        "avg_dir_x": avg_vec[0, :, 0].detach().cpu().numpy(),
-        "avg_dir_y": avg_vec[0, :, 1].detach().cpu().numpy(),
-        "coherence": coherence[0].detach().cpu().numpy(),
-        "valid": valid,
+        "cell_idx": idx.detach().cpu().numpy(),
+        "x": xy[0, idx, 0].detach().cpu().numpy(),
+        "y": xy[0, idx, 1].detach().cpu().numpy(),
+        "pc1_x": pca_vectors[0, valid, 0].detach().cpu().numpy(),
+        "pc1_y": pca_vectors[0, valid, 1].detach().cpu().numpy(),
+        "avg_dir_x": avg_vec[0, valid, 0].detach().cpu().numpy(),
+        "avg_dir_y": avg_vec[0, valid, 1].detach().cpu().numpy(),
+        "coherence": coherence[0, valid].detach().cpu().numpy(),
     }
 
 
-def _arrow_scale_for_mean_length(anisotropy: np.ndarray, target_mean_length: float) -> float:
-    mean_anisotropy = float(np.nanmean(anisotropy))
-    if mean_anisotropy <= 0.0 or not np.isfinite(mean_anisotropy):
-        return target_mean_length
-    return target_mean_length / mean_anisotropy
-
-
-def _arrow_scale_for_vector_length(
+def _arrow_scale_for_unit_vectors(
     vec_x: np.ndarray,
     vec_y: np.ndarray,
     target_mean_length: float,
@@ -272,15 +276,22 @@ def _arrow_scale_for_vector_length(
     return target_mean_length / mean_length
 
 
-def make_arrow_plot_df(plot_df: pd.DataFrame, fields: dict[str, np.ndarray]) -> pd.DataFrame:
-    out = plot_df.copy()
-    for key, values in fields.items():
-        out[key] = values
-    out = out.loc[fields["valid"]].copy()
-    out["plot_x"] = out["x"]
-    out["plot_y"] = out["y"]
-    out["_arrow_u"] = out["pc1_x"] * out["anisotropy"]
-    out["_arrow_v"] = out["pc1_y"] * out["anisotropy"]
+def make_loss_arrow_plot_df(
+    plot_df: pd.DataFrame,
+    fields: dict[str, np.ndarray],
+) -> pd.DataFrame:
+    """Build arrow dataframe for loss subsample cells only."""
+    cell_idx = fields["cell_idx"].astype(int)
+    out = plot_df.iloc[cell_idx].copy().reset_index(drop=True)
+    out["plot_x"] = fields["x"]
+    out["plot_y"] = fields["y"]
+    out["pc1_x"] = fields["pc1_x"]
+    out["pc1_y"] = fields["pc1_y"]
+    out["avg_dir_x"] = fields["avg_dir_x"]
+    out["avg_dir_y"] = fields["avg_dir_y"]
+    out["coherence"] = fields["coherence"]
+    out["_arrow_u"] = out["pc1_x"]
+    out["_arrow_v"] = out["pc1_y"]
     return out
 
 
@@ -323,6 +334,8 @@ def evaluate_slice(
     loss_fn,
     *,
     compute_viz: bool,
+    warmup_iters: int = 0,
+    use_anisotropy_scaling: bool = False,
 ) -> tuple[SliceResult, dict | None]:
     (
         _slice_df,
@@ -349,34 +362,50 @@ def evaluate_slice(
             log=False,
         )
 
+    for _ in range(max(int(warmup_iters), 0)):
+        _forward()
+    _sync_device(device)
+
     (loss, _), metric_seconds = _timed_call(device, _forward)
     loss_total = float(loss.detach().item())
     loss_coherence = float(loss_fn._last_coherence)
     loss_pairwise = float(loss_fn._last_pairwise)
 
-    viz_bundle = None
+    viz_out = None
     viz_seconds = 0.0
     if compute_viz:
+        from directional_metric import sample_target_indices
+
         def _viz():
-            true_fields = compute_directional_viz_fields(
+            torch.manual_seed(LOSS_SEED)
+            target_idx, target_valid = sample_target_indices(
+                node_mask, loss_fn.n_target,
+            )
+            true_fields = compute_loss_target_viz_fields(
                 true_positions,
                 node_features,
                 node_mask,
+                target_idx,
+                target_valid,
                 pca_radius=PCA_RADIUS,
                 coherence_radius=COHERENCE_RADIUS,
                 soft_beta=SOFT_BETA,
+                use_anisotropy_scaling=use_anisotropy_scaling,
             )
-            pred_fields = compute_directional_viz_fields(
+            pred_fields = compute_loss_target_viz_fields(
                 pred_positions,
                 node_features,
                 node_mask,
+                target_idx,
+                target_valid,
                 pca_radius=PCA_RADIUS,
                 coherence_radius=COHERENCE_RADIUS,
                 soft_beta=SOFT_BETA,
+                use_anisotropy_scaling=use_anisotropy_scaling,
             )
-            return true_plot_df, pred_plot_df, true_fields, pred_fields
+            return target_idx, true_fields, pred_fields
 
-        viz_bundle, viz_seconds = _timed_call(device, _viz)
+        viz_out, viz_seconds = _timed_call(device, _viz)
 
     result = SliceResult(
         slice_name=slice_name,
@@ -389,18 +418,18 @@ def evaluate_slice(
         viz_seconds=viz_seconds,
     )
 
-    if viz_bundle is None:
+    if viz_out is None:
         return result, None
 
-    true_plot_df, pred_plot_df, true_fields, pred_fields = viz_bundle
+    target_idx, true_fields, pred_fields = viz_out
+    n_viz = int(true_fields["x"].shape[0])
     return result, {
-        "true_plot_df": true_plot_df,
-        "pred_plot_df": pred_plot_df,
-        "true_arrow_df": make_arrow_plot_df(
+        "n_target_viz": n_viz,
+        "true_arrow_df": make_loss_arrow_plot_df(
             true_plot_df[[TRUE_X_COL, TRUE_Y_COL, "cell_class"]],
             true_fields,
         ),
-        "pred_arrow_df": make_arrow_plot_df(
+        "pred_arrow_df": make_loss_arrow_plot_df(
             pred_plot_df[[PRED_X_COL, PRED_Y_COL, "cell_class"]],
             pred_fields,
         ),
@@ -432,7 +461,7 @@ def save_summary_png(results: list[SliceResult], output_path: Path, device: torc
     ax.bar(df["slice_name"], df["metric_seconds"], color="tab:purple", alpha=0.85)
     ax.set_xticklabels(df["slice_name"], rotation=45, ha="right")
     ax.set_ylabel("Seconds")
-    ax.set_title("Broadcast directional-metric time per sample")
+    ax.set_title(f"Loss forward time ({device.type}) per slice")
 
     ax = axes[1, 0]
     ax.bar(df["slice_name"], df["n_cells"], color="tab:gray", alpha=0.85)
@@ -475,73 +504,72 @@ def save_slice_arrow_png(
     viz_data: dict,
     output_path: Path,
 ) -> None:
-    true_layout_df = viz_data["true_plot_df"]
-    pred_layout_df = viz_data["pred_plot_df"]
     true_arrow_df = viz_data["true_arrow_df"]
     pred_arrow_df = viz_data["pred_arrow_df"]
+    n_target_viz = viz_data["n_target_viz"]
 
     uniques = sorted(true_arrow_df["cell_class"].unique())
     palette_dict = dict(zip(uniques, sns.color_palette(cc.glasbey, n_colors=len(uniques))))
 
-    pca_arrow_scale = _arrow_scale_for_mean_length(
-        true_arrow_df["anisotropy"].to_numpy(),
+    pca_arrow_scale = _arrow_scale_for_unit_vectors(
+        true_arrow_df["pc1_x"].to_numpy(),
+        true_arrow_df["pc1_y"].to_numpy(),
         TARGET_MEAN_ARROW_LENGTH,
     )
-    dir_arrow_scale = _arrow_scale_for_vector_length(
+    dir_arrow_scale = _arrow_scale_for_unit_vectors(
         true_arrow_df["avg_dir_x"].to_numpy(),
         true_arrow_df["avg_dir_y"].to_numpy(),
         TARGET_MEAN_ARROW_LENGTH,
     )
 
-    xlim = (true_layout_df[TRUE_X_COL].min(), true_layout_df[TRUE_X_COL].max())
-    ylim = (true_layout_df[TRUE_Y_COL].min(), true_layout_df[TRUE_Y_COL].max())
+    xlim = (
+        min(true_arrow_df["plot_x"].min(), pred_arrow_df["plot_x"].min()),
+        max(true_arrow_df["plot_x"].max(), pred_arrow_df["plot_x"].max()),
+    )
+    ylim = (
+        min(true_arrow_df["plot_y"].min(), pred_arrow_df["plot_y"].min()),
+        max(true_arrow_df["plot_y"].max(), pred_arrow_df["plot_y"].max()),
+    )
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     panel_specs = [
-        (true_layout_df, true_arrow_df, "Ground truth", TRUE_X_COL, TRUE_Y_COL),
-        (pred_layout_df, pred_arrow_df, "Prediction", PRED_X_COL, PRED_Y_COL),
+        (true_arrow_df, "Ground truth", f"PCA-1 (r={PCA_RADIUS:.3g})"),
+        (true_arrow_df, "Ground truth", f"Coherence mean (r={COHERENCE_RADIUS:.3g})"),
+        (pred_arrow_df, "Prediction", f"PCA-1 (r={PCA_RADIUS:.3g})"),
+        (pred_arrow_df, "Prediction", f"Coherence mean (r={COHERENCE_RADIUS:.3g})"),
+    ]
+    arrow_specs = [
+        ("_arrow_u", "_arrow_v", pca_arrow_scale),
+        ("avg_dir_x", "avg_dir_y", dir_arrow_scale),
+        ("_arrow_u", "_arrow_v", pca_arrow_scale),
+        ("avg_dir_x", "avg_dir_y", dir_arrow_scale),
     ]
 
-    for row_idx, (layout_df, arrow_df, row_label, x_col, y_col) in enumerate(panel_specs):
-        ax_scatter, ax_pca, ax_coh = axes[row_idx]
-
-        for ax, title in (
-            (ax_scatter, f"{row_label} — tissue layout"),
-            (ax_pca, f"Per-cell PCA (r={PCA_RADIUS:.3g}) — {row_label.lower()}"),
-            (ax_coh, f"Neighborhood mean (r={COHERENCE_RADIUS:.3g}) — {row_label.lower()}"),
-        ):
-            ax.set_title(title, fontsize=13)
-            ax.set_xlabel(x_col)
-            ax.set_ylabel(y_col)
-            ax.set_xlim(xlim)
-            ax.set_ylim(ylim)
-            ax.set_aspect("equal", adjustable="box")
-
+    for ax, (arrow_df, row_label, panel_title), (u_col, v_col, scale) in zip(
+        axes.flat, panel_specs, arrow_specs,
+    ):
+        ax.set_title(f"{row_label} — {panel_title}", fontsize=13)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
         sns.scatterplot(
-            data=layout_df,
-            x=x_col,
-            y=y_col,
+            data=arrow_df,
+            x="plot_x",
+            y="plot_y",
             hue="cell_class",
-            s=8,
-            ax=ax_scatter,
+            s=12,
+            ax=ax,
             palette=palette_dict,
             legend=False,
         )
         draw_class_arrows(
-            ax_pca,
+            ax,
             arrow_df,
-            u_col="_arrow_u",
-            v_col="_arrow_v",
-            scale=pca_arrow_scale,
-            palette_dict=palette_dict,
-            uniques=uniques,
-        )
-        draw_class_arrows(
-            ax_coh,
-            arrow_df,
-            u_col="avg_dir_x",
-            v_col="avg_dir_y",
-            scale=dir_arrow_scale,
+            u_col=u_col,
+            v_col=v_col,
+            scale=scale,
             palette_dict=palette_dict,
             uniques=uniques,
         )
@@ -551,7 +579,11 @@ def save_slice_arrow_png(
         f"coherence={viz_data['loss_coherence']:.4f}, "
         f"pairwise={viz_data['loss_pairwise']:.4f}"
     )
-    fig.suptitle(f"{slice_name} — {loss_text}", fontsize=15, y=1.01)
+    fig.suptitle(
+        f"{slice_name} — loss subsample n={n_target_viz} — {loss_text}",
+        fontsize=14,
+        y=1.01,
+    )
 
     legend_elements = [
         plt.Line2D(
@@ -609,13 +641,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default=None,
-        help="torch device (default: cuda if available else cpu)",
+        help="Torch device string, e.g. cuda:0 or cpu (default: cuda:0 if available else cpu)",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Require CUDA (cuda:0). Exits with an error if no GPU is visible to PyTorch.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Loss forward passes before timing (default: 2 on GPU, 0 on CPU)",
     )
     parser.add_argument(
         "--n-target",
         type=int,
         default=N_TARGET,
-        help="Target cells subsampled per forward pass",
+        help="Target cells subsampled by DirectionalMetricLoss (loss + viz use the same subsample)",
+    )
+    parser.add_argument(
+        "--use-anisotropy-scaling",
+        action="store_true",
+        help=(
+            "Scale PCA vectors by lambda_1/lambda_2; coherence averaging uses "
+            "these scaled vectors (matches DirectionalMetricLoss flag)"
+        ),
     )
     return parser.parse_args()
 
@@ -629,10 +680,12 @@ def main() -> None:
     if not args.csv.exists():
         raise FileNotFoundError(f"Comparison CSV not found: {args.csv}")
 
-    if args.device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    device = resolve_device(args.device, use_gpu=args.gpu)
+    warmup_iters = (
+        args.warmup
+        if args.warmup is not None
+        else (2 if device.type == "cuda" else 0)
+    )
 
     slice_names = args.slices or list_slices(args.csv)
     if not slice_names:
@@ -648,10 +701,16 @@ def main() -> None:
         eps=EPS,
         coherence_weight=1.0,
         pairwise_weight=1.0,
+        use_anisotropy_scaling=args.use_anisotropy_scaling,
     ).to(device)
 
     print(f"CSV: {args.csv}")
-    print(f"Device: {device}")
+    print(f"Device: {describe_device(device)}")
+    print(f"Positions tensor device: {device} (checked per slice after load)")
+    print(f"Timing warmup iterations: {warmup_iters}")
+    print(f"Graph batch size: 1 slice per forward pass")
+    print(f"Loss + viz n_target: {args.n_target} (seed={LOSS_SEED})")
+    print(f"Anisotropy scaling (lambda_1/lambda_2): {args.use_anisotropy_scaling}")
     print(f"Slices to evaluate: {len(slice_names)}")
     print(f"Slices with arrow PNGs: {len(viz_slices)}")
 
@@ -666,16 +725,19 @@ def main() -> None:
             device,
             loss_fn,
             compute_viz=slice_name in viz_slices,
+            warmup_iters=warmup_iters,
+            use_anisotropy_scaling=args.use_anisotropy_scaling,
         )
         results.append(result)
 
         print(f"Cells: {result.n_cells:,} | Features: {result.n_features}")
+        print(f"Tensor device: {device}")
         print(
             f"DirectionalMetricLoss: {result.loss_total:.6f} "
             f"(coherence={result.loss_coherence:.6f}, "
             f"pairwise={result.loss_pairwise:.6f})"
         )
-        print(f"Broadcast metric time: {result.metric_seconds:.4f} s")
+        print(f"Loss forward time ({device.type}): {result.metric_seconds:.4f} s")
         if result.viz_seconds > 0.0:
             print(f"Viz field time: {result.viz_seconds:.4f} s")
 

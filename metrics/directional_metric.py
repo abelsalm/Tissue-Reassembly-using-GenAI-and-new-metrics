@@ -4,8 +4,10 @@ For each sample we randomly subsample ``n_target`` cells. For every target
 cell we build a soft spatial neighborhood (sigmoid on distance), gate it by
 the inverse transcriptome distance ``(1 - cos_sim) * RMSE`` to all cells,
 run a spatial weighted PCA, and take the PCA-1 direction modulo ``pi`` as a
-unit vector. A second (coherence) radius averages those unit vectors among
-target cells only; the mean-vector length is the coherence score.
+unit vector (or, when ``use_anisotropy_scaling`` is enabled, a vector whose
+length is the anisotropy ratio ``lambda_1 / lambda_2``). A second
+(coherence) radius averages those direction vectors among target cells only;
+the mean-vector length is the coherence score.
 
 The training loss matches predicted vs. ground-truth coherence per target
 cell and the pairwise modulo-``pi`` angle differences between target cells.
@@ -76,7 +78,11 @@ def sample_target_indices(
 
     scores = torch.rand(B, N, device=device)
     scores = scores.masked_fill(~valid, -1.0)
-    target_idx = scores.topk(n_target, dim=1).indices
+    k = min(int(n_target), int(N))
+    target_idx = scores.topk(k, dim=1).indices
+    if k < n_target:
+        pad = torch.zeros(B, n_target - k, device=device, dtype=target_idx.dtype)
+        target_idx = torch.cat([target_idx, pad], dim=1)
 
     slot = torch.arange(n_target, device=device).unsqueeze(0)
     target_valid = slot < n_sample.unsqueeze(1)
@@ -103,12 +109,19 @@ def compute_weighted_pca_directions(
     pca_radius: float,
     *,
     soft_beta: Optional[float] = None,
+    use_anisotropy_scaling: bool = False,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """PCA-1 unit directions (modulo ``pi``) for each target cell.
+    """PCA-1 direction vectors for each target cell.
+
+    When ``use_anisotropy_scaling`` is False (default), returns unit vectors
+    ``(cos theta, sin theta)`` (direction modulo ``pi``).
+
+    When True, each vector is scaled by the anisotropy ratio
+    ``lambda_1 / lambda_2`` (major / minor weighted eigenvalue).
 
     Returns:
-        unit_dirs: ``[B, T, 2]`` -- ``(cos theta, sin theta)``.
+        pca_vectors: ``[B, T, 2]``
         pca_valid: ``[B, T]`` bool -- ``True`` when the weighted neighborhood
             has enough mass to define a direction.
     """
@@ -136,24 +149,40 @@ def compute_weighted_pca_directions(
     theta = 0.5 * torch.atan2(2.0 * cxy, cxx - cyy)
     unit_dirs = torch.stack((torch.cos(theta), torch.sin(theta)), dim=-1)
 
-    spread = (cxx + cyy).clamp_min(0.0)
+    trace = (cxx + cyy).clamp_min(0.0)
+    det = (cxx * cyy - cxy * cxy).clamp_min(0.0)
+    half = trace * 0.5
+    disc = torch.sqrt((half * half - det).clamp_min(0.0))
+    lambda1 = half + disc
+    lambda2 = (half - disc).clamp_min(eps)
+    anisotropy = lambda1 / lambda2
+
+    if use_anisotropy_scaling:
+        pca_vectors = unit_dirs * anisotropy.unsqueeze(-1)
+    else:
+        pca_vectors = unit_dirs
+
+    spread = trace
     pca_valid = target_valid & (w_sum.squeeze(-1) > eps) & (spread > eps)
-    unit_dirs = unit_dirs * pca_valid.unsqueeze(-1).to(unit_dirs.dtype)
-    return unit_dirs, pca_valid
+    pca_vectors = pca_vectors * pca_valid.unsqueeze(-1).to(pca_vectors.dtype)
+    return pca_vectors, pca_valid
 
 
 def compute_coherence(
     target_positions: torch.Tensor,  # [B, T, 2]
-    unit_dirs: torch.Tensor,         # [B, T, 2]
+    direction_vectors: torch.Tensor,  # [B, T, 2]
     target_valid: torch.Tensor,      # [B, T]
     coherence_radius: float,
     *,
     soft_beta: Optional[float] = None,
+    clip_to_unit: bool = True,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Mean-vector length of neighboring target directions.
+    """Mean-vector length of neighboring target direction vectors.
 
-    Returns ``[B, T]`` coherence in ``[0, 1]`` (clipped for stability).
+    With unit-length PCA vectors and ``clip_to_unit=True``, coherence is in
+    ``[0, 1]``. With anisotropy-scaled vectors, magnitudes are unbounded and
+    ``clip_to_unit`` should be set to False.
     """
     dists = torch.cdist(target_positions, target_positions, p=2)
     coh_w = _spatial_soft_weights(dists, coherence_radius, soft_beta)
@@ -162,15 +191,26 @@ def compute_coherence(
     coh_w = coh_w * valid_pair.to(coh_w.dtype)
 
     denom = coh_w.sum(dim=-1, keepdim=True).clamp_min(eps)
-    avg_vec = torch.matmul(coh_w, unit_dirs) / denom
-    coherence = avg_vec.norm(dim=-1).clamp(0.0, 1.0)
+    avg_vec = torch.matmul(coh_w, direction_vectors) / denom
+    coherence = avg_vec.norm(dim=-1)
+    if clip_to_unit:
+        coherence = coherence.clamp(0.0, 1.0)
     return coherence * target_valid.to(coherence.dtype)
 
 
-def pairwise_mod_pi_angles(unit_dirs: torch.Tensor) -> torch.Tensor:
-    """Pairwise undirected angles in ``[0, pi/2]``, shape ``[B, T, T]``."""
-    dot = torch.matmul(unit_dirs, unit_dirs.transpose(-1, -2))
-    cos_angle = dot.abs().clamp(0.0, 1.0)
+def pairwise_mod_pi_angles(
+    direction_vectors: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Pairwise undirected angles in ``[0, pi/2]``, shape ``[B, T, T]``.
+
+    Uses normalized directions so vector length (e.g. anisotropy scaling)
+    does not affect the angle.
+    """
+    dot = torch.matmul(direction_vectors, direction_vectors.transpose(-1, -2))
+    norms = direction_vectors.norm(dim=-1).clamp_min(eps)
+    denom = norms.unsqueeze(-1) * norms.unsqueeze(-2)
+    cos_angle = (dot / denom).abs().clamp(0.0, 1.0)
     return torch.acos(cos_angle)
 
 
@@ -184,6 +224,7 @@ def compute_directional_features(
     coherence_radius: float,
     *,
     soft_beta: Optional[float] = None,
+    use_anisotropy_scaling: bool = False,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full directional pipeline for one side (pred or GT).
@@ -194,16 +235,22 @@ def compute_directional_features(
         feature_valid: ``[B, T]`` bool mask for targets with valid PCA
     """
     xy = positions[..., :2]
-    unit_dirs, pca_valid = compute_weighted_pca_directions(
+    pca_vectors, pca_valid = compute_weighted_pca_directions(
         xy, features, mask, target_idx, target_valid,
-        pca_radius, soft_beta=soft_beta, eps=eps,
+        pca_radius,
+        soft_beta=soft_beta,
+        use_anisotropy_scaling=use_anisotropy_scaling,
+        eps=eps,
     )
     target_pos = _gather_positions(xy, target_idx)
     coherence = compute_coherence(
-        target_pos, unit_dirs, pca_valid,
-        coherence_radius, soft_beta=soft_beta, eps=eps,
+        target_pos, pca_vectors, pca_valid,
+        coherence_radius,
+        soft_beta=soft_beta,
+        clip_to_unit=not use_anisotropy_scaling,
+        eps=eps,
     )
-    pair_angles = pairwise_mod_pi_angles(unit_dirs)
+    pair_angles = pairwise_mod_pi_angles(pca_vectors, eps=eps)
     return coherence, pair_angles, pca_valid
 
 
@@ -236,6 +283,7 @@ class DirectionalMetricLoss(nn.Module):
         coherence_weight: float = 1.0,
         pairwise_weight: float = 1.0,
         min_valid_targets: int = 2,
+        use_anisotropy_scaling: bool = False,
     ) -> None:
         super().__init__()
         self.n_target = int(n_target)
@@ -246,6 +294,7 @@ class DirectionalMetricLoss(nn.Module):
         self.coherence_weight = float(coherence_weight)
         self.pairwise_weight = float(pairwise_weight)
         self.min_valid_targets = int(min_valid_targets)
+        self.use_anisotropy_scaling = bool(use_anisotropy_scaling)
         self._last_loss: float = -1.0
         self._last_coherence: float = -1.0
         self._last_pairwise: float = -1.0
@@ -291,13 +340,17 @@ class DirectionalMetricLoss(nn.Module):
             gt_coh, gt_pairs, gt_valid = compute_directional_features(
                 true_xy, node_features, node_mask, target_idx, target_valid,
                 self.pca_radius, self.coherence_radius,
-                soft_beta=self.soft_beta, eps=self.eps,
+                soft_beta=self.soft_beta,
+                use_anisotropy_scaling=self.use_anisotropy_scaling,
+                eps=self.eps,
             )
 
         pred_coh, pred_pairs, pred_valid = compute_directional_features(
             pred_xy, node_features, node_mask, target_idx, target_valid,
             self.pca_radius, self.coherence_radius,
-            soft_beta=self.soft_beta, eps=self.eps,
+            soft_beta=self.soft_beta,
+            use_anisotropy_scaling=self.use_anisotropy_scaling,
+            eps=self.eps,
         )
 
         valid = gt_valid & pred_valid & target_valid
