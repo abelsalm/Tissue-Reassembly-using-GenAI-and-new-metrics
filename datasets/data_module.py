@@ -138,6 +138,8 @@ class Dataset(InMemoryDataset):
         self._data.node_features = clean_node_features
         self._data.cell_class = clean_cell_class
         self._data.cell_ID = cell_ID
+        # Canonical unwarped coordinates; kept in sync with rechunk permutations.
+        self._positions_unwarped = clean_positions.clone()
 
         num_cell_to_region_mapping_dict = self._create_region_mapping_dict()
         self.statistics = Statistics(
@@ -203,6 +205,31 @@ class Dataset(InMemoryDataset):
         self._data.node_features = self._data.node_features[perm_t]
         self._data.cell_class    = self._data.cell_class[perm_t]
         self._data.cell_ID       = self._data.cell_ID[perm_t]
+        self._positions_unwarped = self._positions_unwarped[perm_t]
+
+    def apply_epoch_warp(
+        self,
+        seed: int,
+        *,
+        enabled: bool,
+        max_displacement: float = 0.01,
+        max_angle_span: float = 3.141592653589793 / 2.0,
+        grid_size: int = 8,
+    ) -> None:
+        """Apply (or disable) the global smooth warp for this epoch."""
+        from utils.data.warp_augment import apply_warp_field, sample_smooth_warp_field
+
+        if not enabled:
+            self._data.positions = self._positions_unwarped.clone()
+            return
+
+        field = sample_smooth_warp_field(
+            seed,
+            grid_size=int(grid_size),
+            max_displacement=float(max_displacement),
+            max_angle_span=float(max_angle_span),
+        )
+        self._data.positions = apply_warp_field(self._positions_unwarped, field)
 
     def _generate_slice_indices(self):
         # IMPORTANT: slice boundaries must be computed on the cleaned rows,

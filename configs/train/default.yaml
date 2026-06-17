@@ -1,12 +1,18 @@
 n_epochs: 3200 # Number of epochs
 batch_size: 1 # Batch size for training
 lr: 1e-3 # Learning rate
+lr_warmup_epochs: 200 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)
+# --- Global smooth position warp (training augmentation) ------------
+position_warp_augment: True # If True, apply one smooth warp field per epoch to all train cells.
+position_warp_max_displacement: 0.05 # Max |displacement| in normalised coord units.
+position_warp_max_angle_span: 1.5707963267948966 # Max direction variation (rad) over the domain; pi/2.
+position_warp_grid_size: 8 # Control-grid resolution for the smooth warp field.
 debug_print_shuffle_every_n_epochs: 10 # Print a shuffle canary every N epochs (0 = disabled)
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
-loss_type: "neighborhood_multi_radius" # "combined", "position_mse", "neighborhood_rmse", "neighborhood_multi_radius" or "neighborhood_transcriptome_cov"
+loss_type: "neighborhood_multi_radius_slide" # "combined", "position_mse", "neighborhood_rmse", "neighborhood_multi_radius", "neighborhood_multi_radius_slide" or "neighborhood_transcriptome_cov"
 mse_weight: 1.0
 # --- CH-AUC parameters --------------------------------------------
 ch_final_weight: 0.01
@@ -70,6 +76,31 @@ multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is th
 multi_radius_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (no gradient through positions; diagnostic only).
 multi_radius_eps: 1.0e-6 # Numerical floor for sqrt + log + weight normalisation.
 multi_radius_include_self: True # Include cell i itself in its own neighborhood when averaging / counting.
+# --- Slide point-cloud metric (CH AUC + global PCA) ----------------
+# Only consumed when ``loss_type: "neighborhood_multi_radius_slide"``.
+# Combines ``MultiRadiusNeighborhoodLoss`` with a whole-slide metric that
+# treats all masked cells as one point cloud (ignores cell types).
+#   L = slide_neighborhood_weight * L_neighborhood
+#     + slide_ch_auc_weight        * L_ch_auc
+#     + slide_pca_anisotropy_weight   * |aniso_pred - aniso_gt|
+#     + slide_pca_omnivariance_weight * |omni_pred  - omni_gt|
+#     + slide_pca_linearity_weight    * |lin_pred   - lin_gt|
+slide_neighborhood_weight: 1.0 # Top-level weight on the multi-radius neighborhood sub-loss.
+slide_ch_auc_weight: 0.1 # Weight of the CH energy-curve AUC term.
+slide_pca_anisotropy_weight: 0.1 # Weight of the PCA anisotropy RMSE term.
+slide_pca_omnivariance_weight: 0.1 # Weight of the PCA omnivariance RMSE term.
+slide_pca_linearity_weight: 0.1 # Weight of the PCA linearity RMSE term.
+slide_ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01] # Radii for CH AUC integration (defaults to ch_radii if omitted).
+slide_ch_grid_resolution: 512 # CH landscape grid resolution for the slide metric.
+slide_ch_kappa: 0.5 # CH kappa for the slide metric.
+slide_ch_soft_max_beta: 32.0 # Soft-max beta for landscape combination.
+slide_ch_support_factor: 8 # Bump support factor for landscape construction.
+slide_ch_landscape_chunk_size: 128 # Chunk size for landscape construction.
+slide_ch_square_bbox: True # Use a square bounding box for the CH grid.
+slide_ch_margin: 0.01 # Margin around the point cloud for the CH grid.
+slide_ch_eps: 1.0e-6 # Numerical floor for CH AUC normalisation.
+slide_min_cells: 10 # Minimum masked cells required to compute slide metrics.
+slide_ch_cache_gt: True # Cache GT CH AUC per sample (cleared each epoch); skips GT landscape rebuild every step.
 # --- Neighborhood transcriptome + weighted-covariance combined loss ----
 # Only consumed when ``loss_type: "neighborhood_transcriptome_cov"``.
 # Single radius, shared by both sub-losses. Combines the per-cell

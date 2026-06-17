@@ -367,7 +367,7 @@ def build_continuous_landscape_from_points(
             # Only supported patch entries contribute; unsupported entries
             # have value 0 and therefore add nothing to the sparse-like sum.
             values = torch.exp(beta * bump) * (bump > 0).to(dtype)
-            acc = acc.scatter_add(0, flat_idx.reshape(-1), values.reshape(-1))
+            acc.scatter_add_(0, flat_idx.reshape(-1), values.reshape(-1))
         soft_max_bump = torch.log(acc.reshape(ny, nx)) / beta         # ~ max_i bumps_i
         phi = -1.0 + 2.0 * soft_max_bump
     elif combine == "hard_max":
@@ -376,7 +376,7 @@ def build_continuous_landscape_from_points(
         best = torch.zeros(ny * nx, device=device, dtype=dtype)       # max bump so far; 0 == no point
         for start in range(0, pts.shape[0], chunk):
             flat_idx, bump = local_patch_values(pts[start:start + chunk])
-            best = best.scatter_reduce(
+            best.scatter_reduce_(
                 0,
                 flat_idx.reshape(-1),
                 bump.reshape(-1),
@@ -391,6 +391,137 @@ def build_continuous_landscape_from_points(
     # Clip to [-1, 1] in case numerical slop pushes past the bounds.
     phi = phi.clamp(-1.0, 1.0)
     return phi
+
+
+def build_continuous_landscapes_multi_radius(
+    positions: torch.Tensor,                 # [N, 2]
+    valid_mask: torch.Tensor,                # [N] bool
+    grid_x: torch.Tensor,                    # [nx]
+    grid_y: torch.Tensor,                    # [ny]
+    radii: Sequence[float],
+    *,
+    bump_fn: BumpFn = sigmoid_bump,
+    bump_kwargs: Optional[Dict] = None,
+    combine: Literal["soft_max", "hard_max"] = "soft_max",
+    soft_max_beta: float = 16.0,
+    support_factor: float = 10.0,
+    chunk: int = 256,
+) -> torch.Tensor:
+    """Build CH landscapes for all ``radii`` in one pass over cell chunks.
+
+    Returns ``phi`` of shape ``[R, ny, nx]``. Distances from each cell to
+    its local grid patch are computed **once** per chunk and reused for
+    every radius; bump parameters and support masks are broadcast over the
+    radius axis. Energy integration can then call
+    :func:`cahn_hilliard_energy` once on the stacked field.
+    """
+    device = positions.device
+    dtype = positions.dtype
+    nx = grid_x.shape[0]
+    ny = grid_y.shape[0]
+    radii_f = [float(r) for r in radii]
+    n_radii = len(radii_f)
+    if n_radii < 1:
+        raise ValueError("Need at least one radius.")
+
+    if valid_mask.sum() == 0:
+        return torch.full((n_radii, ny, nx), -1.0, device=device, dtype=dtype)
+
+    pts = positions[valid_mask]
+    bump_kwargs = dict(bump_kwargs or {})
+    chunk = max(1, int(chunk))
+
+    # Size local patches for the largest support so every radius fits.
+    max_radius = max(radii_f)
+    support_max = float(support_factor) * max_radius
+    dx_grid = abs(float((grid_x[1] - grid_x[0]).detach().item())) if nx > 1 else 1.0
+    dy_grid = abs(float((grid_y[1] - grid_y[0]).detach().item())) if ny > 1 else 1.0
+    half_x = min(nx - 1, max(0, math.ceil(support_max / max(dx_grid, 1e-12)) + 1))
+    half_y = min(ny - 1, max(0, math.ceil(support_max / max(dy_grid, 1e-12)) + 1))
+    offset_x = torch.arange(-half_x, half_x + 1, device=device)
+    offset_y = torch.arange(-half_y, half_y + 1, device=device)
+
+    radii_t = torch.tensor(radii_f, device=device, dtype=dtype)
+    supports = float(support_factor) * radii_t
+    grid_size = ny * nx
+
+    def local_patch_bumps(pts_chunk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        centers_x = torch.round(
+            (pts_chunk[:, 0].detach() - grid_x[0]) / max(dx_grid, 1e-12)
+        ).long().clamp(0, nx - 1)
+        centers_y = torch.round(
+            (pts_chunk[:, 1].detach() - grid_y[0]) / max(dy_grid, 1e-12)
+        ).long().clamp(0, ny - 1)
+
+        x_idx = centers_x[:, None, None] + offset_x[None, None, :]
+        y_idx = centers_y[:, None, None] + offset_y[None, :, None]
+        valid = (x_idx >= 0) & (x_idx < nx) & (y_idx >= 0) & (y_idx < ny)
+        x_idx = x_idx.clamp(0, nx - 1)
+        y_idx = y_idx.clamp(0, ny - 1)
+
+        gx = grid_x[x_idx]
+        gy = grid_y[y_idx]
+        dx = gx - pts_chunk[:, 0, None, None]
+        dy = gy - pts_chunk[:, 1, None, None]
+        r = torch.sqrt(dx * dx + dy * dy)
+
+        # Broadcast distances over radii; bump params vary per radius.
+        r_exp = r.unsqueeze(1)
+        rad = radii_t.view(1, n_radii, 1, 1)
+        decay = 4.0 / rad
+        shift = 128.0 * rad
+        if bump_fn is sigmoid_bump and not bump_kwargs:
+            bump = torch.sigmoid(-(decay * (r_exp - rad) - shift))
+        else:
+            bumps = []
+            for rad_k in radii_f:
+                bump_k = bump_fn(
+                    r,
+                    rad_k,
+                    decay_rate=4.0 / rad_k,
+                    shift=128.0 * rad_k,
+                    **bump_kwargs,
+                )
+                bumps.append(bump_k)
+            bump = torch.stack(bumps, dim=1)
+        support_mask = valid.unsqueeze(1) & (r_exp <= supports.view(1, n_radii, 1, 1))
+        bump = bump * support_mask.to(dtype)
+
+        flat_idx = y_idx * nx + x_idx
+        return flat_idx, bump
+
+    if combine == "soft_max":
+        beta = float(soft_max_beta)
+        acc = torch.ones(n_radii, grid_size, device=device, dtype=dtype)
+        for start in range(0, pts.shape[0], chunk):
+            flat_idx, bump = local_patch_bumps(pts[start:start + chunk])
+            values = torch.exp(beta * bump) * (bump > 0).to(dtype)
+            # flat_idx: [m, py, px]; bump: [m, R, py, px] -> scatter into [R, G].
+            idx = flat_idx.unsqueeze(1).expand(-1, n_radii, -1, -1)
+            idx = idx.permute(1, 0, 2, 3).reshape(n_radii, -1)
+            values = values.permute(1, 0, 2, 3).reshape(n_radii, -1)
+            acc.scatter_add_(1, idx, values)
+        soft_max_bump = torch.log(acc.reshape(n_radii, ny, nx)) / beta
+        phi = -1.0 + 2.0 * soft_max_bump
+    elif combine == "hard_max":
+        best = torch.zeros(n_radii, grid_size, device=device, dtype=dtype)
+        for start in range(0, pts.shape[0], chunk):
+            flat_idx, bump = local_patch_bumps(pts[start:start + chunk])
+            idx = flat_idx.unsqueeze(1).expand(-1, n_radii, -1, -1)
+            idx = idx.permute(1, 0, 2, 3).reshape(n_radii, -1)
+            bump_flat = bump.permute(1, 0, 2, 3).reshape(n_radii, -1)
+            best.scatter_reduce_(
+                1,
+                idx,
+                bump_flat,
+                reduce="amax",
+                include_self=True,
+            )
+        phi = -1.0 + 2.0 * best.reshape(n_radii, ny, nx)
+    else:
+        raise ValueError(f"unknown combine='{combine}'")
+
+    return phi.clamp(-1.0, 1.0)
 
 
 # ---------- Cahn-Hilliard energy (mirror ContinuousLandscape2D energy) -----
@@ -463,6 +594,41 @@ def cahn_hilliard_energy(
     """
     density = cahn_hilliard_energy_density(phi, dx, dy, kappa=kappa)
     return density.sum(dim=(-2, -1)) * dx * dy
+
+
+def compute_ch_energy_curve_from_points(
+    positions: torch.Tensor,                 # [N, >=2]
+    valid_mask: torch.Tensor,                # [N] bool
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+    dx: float,
+    dy: float,
+    radii: Sequence[float],
+    *,
+    kappa: float = 1.0,
+    bump_fn: BumpFn = sigmoid_bump,
+    bump_kwargs: Optional[Dict] = None,
+    combine: Literal["soft_max", "hard_max"] = "soft_max",
+    soft_max_beta: float = 16.0,
+    support_factor: float = 10.0,
+    chunk: int = 256,
+) -> torch.Tensor:
+    """Return CH energies ``E(r)`` as a ``[len(radii)]`` tensor."""
+    positions_xy = positions[..., :2]
+    phi = build_continuous_landscapes_multi_radius(
+        positions_xy,
+        valid_mask,
+        grid_x,
+        grid_y,
+        radii,
+        bump_fn=bump_fn,
+        bump_kwargs=bump_kwargs,
+        combine=combine,
+        soft_max_beta=soft_max_beta,
+        support_factor=support_factor,
+        chunk=chunk,
+    )
+    return cahn_hilliard_energy(phi, dx, dy, kappa)
 
 
 # ---------------------------------------------------------------------------
@@ -710,23 +876,26 @@ class CahnHilliardEnergyCurveLoss(nn.Module):
 
             e_gt_curve = []
             e_pred_curve = []
-            for r in self.radii:
-                # The GT curve is a constant target for this batch. Avoid
-                # building an autograd graph for it; only the predicted
-                # landscape must carry gradients back to pred positions.
-                with torch.no_grad():
-                    phi_gt = self._landscape(true_xy, type_mask, grid_x, grid_y, r)
-                    e_gt_curve.append(cahn_hilliard_energy(phi_gt, dx, dy, self.kappa))
-                phi_pred = self._landscape(pred_xy, type_mask, grid_x, grid_y, r)
-                e_pred_curve.append(cahn_hilliard_energy(phi_pred, dx, dy, self.kappa))
+            ch_kwargs = dict(
+                kappa=self.kappa,
+                bump_fn=self.bump_fn,
+                bump_kwargs=self.bump_kwargs,
+                combine=self.combine,
+                soft_max_beta=self.soft_max_beta,
+                support_factor=self.support_factor,
+                chunk=self.landscape_chunk_size,
+            )
+            with torch.no_grad():
+                e_gt_t = compute_ch_energy_curve_from_points(
+                    true_xy, type_mask, grid_x, grid_y, dx, dy, self.radii,
+                    **ch_kwargs,
+                )
+            e_pred_t = compute_ch_energy_curve_from_points(
+                pred_xy, type_mask, grid_x, grid_y, dx, dy, self.radii,
+                **ch_kwargs,
+            )
 
-            # Stack into [len(radii)] vectors and compare *vector-wise*
-            # (no trapezoidal integration / AUC). The exponential
-            # normalisation is applied per radius and then averaged --
-            # equivalent to ``_normalized_exp_diff(e_pred_t, e_gt_t).mean()``
-            # but spelt out to make the per-radius nature explicit.
-            e_gt_t = torch.stack(e_gt_curve)
-            e_pred_t = torch.stack(e_pred_curve)
+            # Compare energy vectors *vector-wise* (no trapezoidal AUC).
             per_radius_loss = self._normalized_exp_diff(e_pred_t, e_gt_t)
             total = total + per_radius_loss.mean()
             n_types += 1
@@ -3350,6 +3519,414 @@ class NeighborhoodTranscriptomeAndCovarianceLoss(nn.Module):
         # Lightning too.
         to_log.update(self.transcriptome.log_epoch_metrics())
         to_log.update(self.covariance.log_epoch_metrics())
+        if wandb.run:
+            wandb.log(to_log, commit=False)
+        return to_log
+
+
+# ---------------------------------------------------------------------------
+# Slide point-cloud metric: CH energy-curve AUC + global PCA shape stats
+# ---------------------------------------------------------------------------
+#
+# Treats every cell on a slice as one point cloud (ignores ``cell_class``).
+#
+#   1. Cahn-Hilliard: build ``E(r)`` over ``radii`` for GT and pred, integrate
+#      with trapezoids, compare AUCs with the exponential normalisation used
+#      in the CH-AUC notebooks.
+#   2. PCA: unweighted 2D PCA on all masked cells; RMSE between pred and GT
+#      for anisotropy, omnivariance, and linearity.
+# ---------------------------------------------------------------------------
+
+
+class SlidePointCloudMetricLoss(nn.Module):
+    """Whole-slide point-cloud loss: CH AUC + PCA shape descriptors.
+
+    Four weighted sub-terms (any weight ``0`` skips that branch)::
+
+        L = ch_auc_weight        * L_ch_auc
+          + anisotropy_weight    * |aniso_pred - aniso_gt|
+          + omnivariance_weight  * |omni_pred  - omni_gt|
+          + linearity_weight     * |lin_pred   - lin_gt|
+    """
+
+    def __init__(
+        self,
+        ch_auc_weight: float = 1.0,
+        anisotropy_weight: float = 1.0,
+        omnivariance_weight: float = 1.0,
+        linearity_weight: float = 1.0,
+        radii: Sequence[float] = (0.005, 0.01, 0.02, 0.04, 0.08),
+        grid_resolution: int = 64,
+        kappa: float = 1.0,
+        bump_fn: BumpFn = sigmoid_bump,
+        bump_kwargs: Optional[Dict] = None,
+        combine: Literal["soft_max", "hard_max"] = "soft_max",
+        soft_max_beta: float = 16.0,
+        support_factor: float = 10.0,
+        landscape_chunk_size: int = 128,
+        square_bbox: bool = True,
+        margin: float = 0.05,
+        eps: float = 1e-6,
+        min_cells: int = 10,
+        cache_gt: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(radii) < 2:
+            raise ValueError("Need at least two radii for CH AUC integration.")
+        self.ch_auc_weight = float(ch_auc_weight)
+        self.anisotropy_weight = float(anisotropy_weight)
+        self.omnivariance_weight = float(omnivariance_weight)
+        self.linearity_weight = float(linearity_weight)
+        self.radii = tuple(float(r) for r in sorted(radii))
+        self.grid_resolution = int(grid_resolution)
+        self.kappa = float(kappa)
+        self.bump_fn = bump_fn
+        self.bump_kwargs = dict(bump_kwargs or {})
+        self.combine = combine
+        self.soft_max_beta = float(soft_max_beta)
+        self.support_factor = float(support_factor)
+        self.landscape_chunk_size = int(landscape_chunk_size)
+        self.square_bbox = bool(square_bbox)
+        self.margin = float(margin)
+        self.eps = float(eps)
+        self.min_cells = int(min_cells)
+        self.cache_gt = bool(cache_gt)
+        self._gt_cache: Dict = {}
+        self._last_loss: float = -1.0
+        self._last_ch_auc: float = -1.0
+        self._last_anisotropy: float = -1.0
+        self._last_omnivariance: float = -1.0
+        self._last_linearity: float = -1.0
+
+    def clear_gt_cache(self) -> None:
+        """Drop cached GT CH curves (e.g. after rechunk / re-shuffle)."""
+        self._gt_cache.clear()
+
+    def _ch_curve_kwargs(self) -> Dict:
+        return dict(
+            kappa=self.kappa,
+            bump_fn=self.bump_fn,
+            bump_kwargs=self.bump_kwargs,
+            combine=self.combine,
+            soft_max_beta=self.soft_max_beta,
+            support_factor=self.support_factor,
+            chunk=self.landscape_chunk_size,
+        )
+
+    def _gt_cache_key(
+        self, cell_id: Optional[torch.Tensor]
+    ) -> Optional[Tuple[str, bytes]]:
+        if not self.cache_gt or cell_id is None:
+            return None
+        return (
+            "cid",
+            cell_id.detach().to(torch.int64).cpu().contiguous().numpy().tobytes(),
+        )
+
+    def _normalized_exp_diff(
+        self, pred_val: torch.Tensor, gt_val: torch.Tensor
+    ) -> torch.Tensor:
+        rel = (pred_val - gt_val).abs() / (gt_val.detach().abs() + self.eps)
+        return 1.0 - torch.exp(-rel)
+
+    def _ch_auc_term(
+        self,
+        pred_xy: torch.Tensor,
+        true_xy: torch.Tensor,
+        mask_b: torch.Tensor,
+        cell_id: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        n_cells = int(mask_b.sum().item())
+        if n_cells < self.min_cells:
+            return pred_xy.sum() * 0.0
+
+        pts_true = true_xy[mask_b]
+        pts_pred = pred_xy[mask_b]
+        cache_key = self._gt_cache_key(cell_id)
+        cached = self._gt_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None and cell_id is not None:
+            cached_cid = cached.get("cell_id")
+            if cached_cid is None or cached_cid.shape != cell_id.shape \
+                    or not torch.equal(cached_cid, cell_id.detach()):
+                cached = None
+
+        if cached is None:
+            if self.cache_gt:
+                grid_x, grid_y, dx, dy = shared_square_grid(
+                    pts_true,
+                    pts_true,
+                    grid_resolution=self.grid_resolution,
+                    margin=self.margin,
+                    square=self.square_bbox,
+                )
+            else:
+                grid_x, grid_y, dx, dy = shared_square_grid(
+                    pts_true,
+                    pts_pred,
+                    grid_resolution=self.grid_resolution,
+                    margin=self.margin,
+                    square=self.square_bbox,
+                )
+            with torch.no_grad():
+                e_gt_curve = compute_ch_energy_curve_from_points(
+                    true_xy,
+                    mask_b,
+                    grid_x,
+                    grid_y,
+                    dx,
+                    dy,
+                    self.radii,
+                    **self._ch_curve_kwargs(),
+                )
+            radii_t = torch.tensor(
+                self.radii, device=pred_xy.device, dtype=pred_xy.dtype
+            )
+            auc_gt = torch.trapezoid(e_gt_curve, radii_t)
+            if cache_key is not None:
+                self._gt_cache[cache_key] = {
+                    "cell_id": cell_id.detach() if cell_id is not None else None,
+                    "grid_x": grid_x,
+                    "grid_y": grid_y,
+                    "dx": dx,
+                    "dy": dy,
+                    "auc_gt": auc_gt,
+                }
+        else:
+            grid_x = cached["grid_x"]
+            grid_y = cached["grid_y"]
+            dx = cached["dx"]
+            dy = cached["dy"]
+            auc_gt = cached["auc_gt"]
+
+        e_pred_curve = compute_ch_energy_curve_from_points(
+            pred_xy,
+            mask_b,
+            grid_x,
+            grid_y,
+            dx,
+            dy,
+            self.radii,
+            **self._ch_curve_kwargs(),
+        )
+        radii_t = torch.tensor(
+            self.radii, device=pred_xy.device, dtype=pred_xy.dtype
+        )
+        auc_pred = torch.trapezoid(e_pred_curve, radii_t)
+        return self._normalized_exp_diff(auc_pred, auc_gt)
+
+    def _sample_loss(
+        self,
+        pred_pos: torch.Tensor,
+        true_pos: torch.Tensor,
+        mask: torch.Tensor,
+        cell_id: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        zero = pred_pos.sum() * 0.0
+        mask_b = mask.bool() if mask.dtype != torch.bool else mask
+        pred_xy = pred_pos[..., :2]
+        true_xy = true_pos[..., :2]
+
+        if self.ch_auc_weight != 0.0:
+            ch_term = self._ch_auc_term(pred_xy, true_xy, mask_b, cell_id=cell_id)
+        else:
+            ch_term = zero
+
+        from metrics.cell_types_metrics import compute_slide_pointcloud_pca_descriptors
+
+        gt_pca = compute_slide_pointcloud_pca_descriptors(
+            true_pos, mask, min_cells=self.min_cells, eps=self.eps
+        )
+        pred_pca = compute_slide_pointcloud_pca_descriptors(
+            pred_pos, mask, min_cells=self.min_cells, eps=self.eps
+        )
+
+        if gt_pca is None or pred_pca is None:
+            aniso_term = zero
+            omni_term = zero
+            lin_term = zero
+        else:
+            gt_aniso, gt_omni, gt_lin = gt_pca
+            pred_aniso, pred_omni, pred_lin = pred_pca
+            aniso_term = (pred_aniso - gt_aniso.detach()).abs()
+            omni_term = (pred_omni - gt_omni.detach()).abs()
+            lin_term = (pred_lin - gt_lin.detach()).abs()
+
+        total = (
+            self.ch_auc_weight * ch_term
+            + self.anisotropy_weight * aniso_term
+            + self.omnivariance_weight * omni_term
+            + self.linearity_weight * lin_term
+        )
+        return total, ch_term, aniso_term, omni_term, lin_term
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        train_stage: bool = True,
+        log: bool = True,
+        batch_idx: Optional[int] = None,
+        **_unused: object,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        pred_positions = masked_pred.positions
+        true_positions = masked_true.positions
+        node_mask = masked_true.node_mask
+        cell_id = masked_true.cell_ID
+
+        losses = []
+        ch_terms, aniso_terms, omni_terms, lin_terms = [], [], [], []
+        for b in range(pred_positions.shape[0]):
+            cid_b = cell_id[b] if cell_id is not None else None
+            total, ch_t, an_t, om_t, li_t = self._sample_loss(
+                pred_positions[b],
+                true_positions[b],
+                node_mask[b],
+                cell_id=cid_b,
+            )
+            losses.append(total)
+            ch_terms.append(ch_t)
+            aniso_terms.append(an_t)
+            omni_terms.append(om_t)
+            lin_terms.append(li_t)
+
+        if not losses:
+            zero = pred_positions.sum() * 0.0
+            return zero, None
+
+        loss = torch.stack(losses).mean()
+        if train_stage:
+            self._last_loss = float(loss.detach().item())
+            self._last_ch_auc = float(torch.stack(ch_terms).mean().detach().item())
+            self._last_anisotropy = float(
+                torch.stack(aniso_terms).mean().detach().item()
+            )
+            self._last_omnivariance = float(
+                torch.stack(omni_terms).mean().detach().item()
+            )
+            self._last_linearity = float(
+                torch.stack(lin_terms).mean().detach().item()
+            )
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            prefix = "train_loss" if train_stage else "val_loss"
+            to_log = {
+                f"{prefix}/slide_pointcloud": float(loss.detach().item()),
+                f"{prefix}/slide_pointcloud_ch_auc": self._last_ch_auc,
+                f"{prefix}/slide_pointcloud_anisotropy": self._last_anisotropy,
+                f"{prefix}/slide_pointcloud_omnivariance": self._last_omnivariance,
+                f"{prefix}/slide_pointcloud_linearity": self._last_linearity,
+            }
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss, to_log
+
+    def reset(self) -> None:
+        self.clear_gt_cache()
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        return {
+            "train_epoch/slide_pointcloud": float(self._last_loss),
+            "train_epoch/slide_pointcloud_ch_auc": float(self._last_ch_auc),
+            "train_epoch/slide_pointcloud_anisotropy": float(self._last_anisotropy),
+            "train_epoch/slide_pointcloud_omnivariance": float(self._last_omnivariance),
+            "train_epoch/slide_pointcloud_linearity": float(self._last_linearity),
+        }
+
+
+class MultiRadiusSlideCombinedLoss(nn.Module):
+    """``MultiRadiusNeighborhoodLoss`` + ``SlidePointCloudMetricLoss``.
+
+    ``L = neighborhood_weight * L_neighborhood + L_slide`` where ``L_slide``
+    is the internally weighted sum of the four slide sub-terms.
+    """
+
+    def __init__(
+        self,
+        neighborhood: MultiRadiusNeighborhoodLoss,
+        slide: SlidePointCloudMetricLoss,
+        neighborhood_weight: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.neighborhood = neighborhood
+        self.slide = slide
+        self.neighborhood_weight = float(neighborhood_weight)
+        self._last_loss: float = -1.0
+        self._last_neighborhood: float = -1.0
+        self._last_slide: float = -1.0
+
+    def set_current_epoch(self, epoch: int) -> None:
+        if hasattr(self.neighborhood, "set_current_epoch"):
+            self.neighborhood.set_current_epoch(epoch)
+
+    def forward(
+        self,
+        masked_pred: DataHolder,
+        masked_true: DataHolder,
+        train_stage: bool = True,
+        log: bool = True,
+        batch_idx: Optional[int] = None,
+        **_unused: object,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+        n_loss, n_log = self.neighborhood(
+            masked_pred, masked_true, train_stage=train_stage, log=False
+        )
+        s_loss, s_log = self.slide(
+            masked_pred,
+            masked_true,
+            train_stage=train_stage,
+            log=False,
+            batch_idx=batch_idx,
+        )
+        loss = self.neighborhood_weight * n_loss + s_loss
+
+        if train_stage:
+            self._last_loss = float(loss.detach().item())
+            self._last_neighborhood = float(n_loss.detach().item())
+            self._last_slide = float(s_loss.detach().item())
+
+        to_log: Optional[Dict[str, float]] = None
+        if log:
+            prefix = "train_loss" if train_stage else "val_loss"
+            to_log = {
+                f"{prefix}/neighborhood_multi_radius_slide": float(
+                    loss.detach().item()
+                ),
+                f"{prefix}/neighborhood_multi_radius_slide_neighborhood": float(
+                    n_loss.detach().item()
+                ),
+                f"{prefix}/neighborhood_multi_radius_slide_slide": float(
+                    s_loss.detach().item()
+                ),
+            }
+            if n_log:
+                to_log.update(n_log)
+            if s_log:
+                to_log.update(s_log)
+            if wandb.run:
+                wandb.log(to_log, commit=True)
+        return loss, to_log
+
+    def reset(self) -> None:
+        self.neighborhood.reset()
+        self.slide.reset()
+
+    def clear_gt_cache(self) -> None:
+        if hasattr(self.slide, "clear_gt_cache"):
+            self.slide.clear_gt_cache()
+
+    def log_epoch_metrics(self) -> Dict[str, float]:
+        to_log = {
+            "train_epoch/neighborhood_multi_radius_slide": float(self._last_loss),
+            "train_epoch/neighborhood_multi_radius_slide_neighborhood": float(
+                self._last_neighborhood
+            ),
+            "train_epoch/neighborhood_multi_radius_slide_slide": float(
+                self._last_slide
+            ),
+        }
+        to_log.update(self.neighborhood.log_epoch_metrics())
+        to_log.update(self.slide.log_epoch_metrics())
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log

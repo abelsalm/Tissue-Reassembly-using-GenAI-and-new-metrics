@@ -73,6 +73,13 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
             masked_true=batched_data,
             log=i % self.log_every_steps == 0,
         )
+    elif self.train_loss.__class__.__name__ == "MultiRadiusSlideCombinedLoss":
+        loss, tl_log_dict = self.train_loss(
+            masked_pred=pred,
+            masked_true=batched_data,
+            log=i % self.log_every_steps == 0,
+            batch_idx=i,
+        )
     else:
         loss, tl_log_dict = self.train_loss(
             masked_pred=pred,
@@ -122,6 +129,9 @@ def on_train_epoch_end_func(self) -> None:
         or cm.get("train_epoch/neighborhood_multi_radius")
         or cm.get("train_epoch/neighborhood_multi_radius_epoch")
         or cm.get("train_loss/neighborhood_multi_radius")
+        or cm.get("train_epoch/neighborhood_multi_radius_slide")
+        or cm.get("train_epoch/neighborhood_multi_radius_slide_epoch")
+        or cm.get("train_loss/neighborhood_multi_radius_slide")
         or cm.get("train_epoch/neighborhood_transcriptome_cov")
         or cm.get("train_epoch/neighborhood_transcriptome_cov_epoch")
         or cm.get("train_loss/neighborhood_transcriptome_cov")
@@ -167,12 +177,32 @@ def on_train_epoch_start_func(self) -> None:
     # Re-randomise chunk boundaries every N epochs to prevent the model from
     # overfitting to fixed local cell neighbourhoods.
     rechunk_every = getattr(self.cfg.train, "rechunk_every_n_epochs", 0)
-    if rechunk_every > 0 and self.current_epoch % rechunk_every == 0:
-        datamodule = getattr(self.trainer, "datamodule", None)
-        if datamodule is not None and hasattr(datamodule, "train_dataset"):
-            datamodule.train_dataset.rechunk(seed=self.current_epoch)
+    datamodule = getattr(self.trainer, "datamodule", None)
+    if datamodule is not None and hasattr(datamodule, "train_dataset"):
+        train_ds = datamodule.train_dataset
+        if rechunk_every > 0 and self.current_epoch % rechunk_every == 0:
+            train_ds.rechunk(seed=self.current_epoch)
             if wandb.run:
                 wandb.log({"rechunk_epoch": self.current_epoch}, commit=False)
+
+        if getattr(self.cfg.train, "position_warp_augment", False):
+            train_ds.apply_epoch_warp(
+                seed=self.current_epoch,
+                enabled=True,
+                max_displacement=float(
+                    getattr(self.cfg.train, "position_warp_max_displacement", 0.01)
+                ),
+                max_angle_span=float(
+                    getattr(
+                        self.cfg.train,
+                        "position_warp_max_angle_span",
+                        3.141592653589793 / 2.0,
+                    )
+                ),
+                grid_size=int(getattr(self.cfg.train, "position_warp_grid_size", 8)),
+            )
+        elif hasattr(train_ds, "apply_epoch_warp"):
+            train_ds.apply_epoch_warp(seed=self.current_epoch, enabled=False)
 
     # Debug: print where a fixed cell_ID ended up after shuffling.
     dbg_every = getattr(self.cfg.train, "debug_print_shuffle_every_n_epochs", 0)

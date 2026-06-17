@@ -135,6 +135,39 @@ def pca_omnivariance(lambda1: torch.Tensor, lambda2: torch.Tensor, eps: float) -
     return torch.sqrt(lambda1 * lambda2 + eps)
 
 
+def pca_linearity(lambda1: torch.Tensor, lambda2: torch.Tensor, eps: float) -> torch.Tensor:
+    """Linearity index: ``(l1 - l2) / (l1 + eps)`` in ``[0, 1)`` when ``l1 >= l2``."""
+    return (lambda1 - lambda2) / (lambda1 + eps)
+
+
+def compute_slide_pointcloud_pca_descriptors(
+    positions: torch.Tensor,        # [N, >=2]
+    mask: torch.Tensor,             # [N]
+    *,
+    min_cells: int = 4,
+    eps: float = 1e-6,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Unweighted 2D PCA shape descriptors for one slide (all cells together).
+
+    Returns ``(anisotropy, omnivariance, linearity)`` scalars, or ``None`` if
+    too few valid cells.
+    """
+    mask_b = mask.bool() if mask.dtype != torch.bool else mask
+    if int(mask_b.sum().item()) < min_cells:
+        return None
+
+    pts = positions[..., :2][mask_b]
+    weights = torch.ones(pts.shape[0], device=pts.device, dtype=pts.dtype)
+    lam1, lam2, _ = _weighted_pca_eigensystem(pts, weights, eps=eps)
+    if (lam1 + lam2) <= eps:
+        return None
+
+    aniso = pca_anisotropy(lam1, lam2, eps)
+    omni = pca_omnivariance(lam1, lam2, eps)
+    linear = pca_linearity(lam1, lam2, eps)
+    return aniso, omni, linear
+
+
 def pairwise_mod_pi_angles(unit_dirs: torch.Tensor) -> torch.Tensor:
     """Pairwise undirected angles in ``[0, pi/2]``, shape ``[K, K]``."""
     dot = unit_dirs @ unit_dirs.transpose(-1, -2)

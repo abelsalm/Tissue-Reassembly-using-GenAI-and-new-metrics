@@ -5,7 +5,9 @@ from metrics.loss_function_plus import (
     CombinedLossFunction,
     NeighborhoodTranscriptomeRMSELoss,
     MultiRadiusNeighborhoodLoss,
+    MultiRadiusSlideCombinedLoss,
     NeighborhoodTranscriptomeAndCovarianceLoss,
+    SlidePointCloudMetricLoss,
 )
 from metrics.loss_function import LossFunction
 from models.model import Model
@@ -130,6 +132,81 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
                 include_self=getattr(cfg.train, "multi_radius_include_self", True),
             )
+        elif cfg.train.loss_type == "neighborhood_multi_radius_slide":
+            neighborhood = MultiRadiusNeighborhoodLoss(
+                radii=list(cfg.train.multi_radius_radii),
+                density_weight=getattr(cfg.train, "multi_radius_density_weight", 1.0),
+                global_transcriptome_weight=getattr(
+                    cfg.train, "multi_radius_global_transcriptome_weight", 0.0
+                ),
+                loss_radius_scale=getattr(
+                    cfg.train, "multi_radius_loss_radius_scale", 512.0
+                ),
+                transcriptome_tolerance=getattr(
+                    cfg.train, "multi_radius_transcriptome_tolerance", 0.05
+                ),
+                transcriptome_tolerance_gate_beta=getattr(
+                    cfg.train, "multi_radius_transcriptome_tolerance_soft_beta", 256.0
+                ),
+                transcriptome_tolerance_warmup_epochs=int(
+                    getattr(
+                        cfg.train,
+                        "multi_radius_transcriptome_tolerance_warmup_epochs",
+                        100,
+                    )
+                ),
+                soft_beta=getattr(cfg.train, "multi_radius_soft_beta", None),
+                eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
+                include_self=getattr(cfg.train, "multi_radius_include_self", True),
+            )
+            slide = SlidePointCloudMetricLoss(
+                ch_auc_weight=getattr(cfg.train, "slide_ch_auc_weight", 1.0),
+                anisotropy_weight=getattr(
+                    cfg.train, "slide_pca_anisotropy_weight", 1.0
+                ),
+                omnivariance_weight=getattr(
+                    cfg.train, "slide_pca_omnivariance_weight", 1.0
+                ),
+                linearity_weight=getattr(
+                    cfg.train, "slide_pca_linearity_weight", 1.0
+                ),
+                radii=list(
+                    getattr(
+                        cfg.train,
+                        "slide_ch_radii",
+                        cfg.train.ch_radii,
+                    )
+                ),
+                grid_resolution=getattr(
+                    cfg.train, "slide_ch_grid_resolution", cfg.train.ch_grid_resolution
+                ),
+                kappa=getattr(cfg.train, "slide_ch_kappa", cfg.train.ch_kappa),
+                soft_max_beta=getattr(
+                    cfg.train, "slide_ch_soft_max_beta", cfg.train.ch_soft_max_beta
+                ),
+                support_factor=getattr(
+                    cfg.train, "slide_ch_support_factor", cfg.train.ch_support_factor
+                ),
+                landscape_chunk_size=getattr(
+                    cfg.train,
+                    "slide_ch_landscape_chunk_size",
+                    getattr(cfg.train, "ch_landscape_chunk_size", 128),
+                ),
+                square_bbox=getattr(
+                    cfg.train, "slide_ch_square_bbox", cfg.train.ch_square_bbox
+                ),
+                margin=getattr(cfg.train, "slide_ch_margin", cfg.train.ch_margin),
+                eps=getattr(cfg.train, "slide_ch_eps", cfg.train.ch_eps),
+                min_cells=int(getattr(cfg.train, "slide_min_cells", 10)),
+                cache_gt=getattr(cfg.train, "slide_ch_cache_gt", True),
+            )
+            self.train_loss = MultiRadiusSlideCombinedLoss(
+                neighborhood=neighborhood,
+                slide=slide,
+                neighborhood_weight=getattr(
+                    cfg.train, "slide_neighborhood_weight", 1.0
+                ),
+            )
         elif cfg.train.loss_type == "neighborhood_transcriptome_cov":
             # Combined single-radius loss: per-cell transcriptome RMSE
             # **plus** per-cell-per-gene weighted-spatial-covariance loss
@@ -210,10 +287,36 @@ class FullDenoisingDiffusion(pl.LightningModule):
         return self.cfg.train.batch_size
 
     def configure_optimizers(self):
+        base_lr = float(self.cfg.train.lr)
+        n_warmup = int(getattr(self.cfg.train, "lr_warmup_epochs", 0))
+        start_lr = base_lr / n_warmup if n_warmup > 0 else base_lr
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=self.cfg.train.lr,
+            lr=start_lr,
             amsgrad=True,
             weight_decay=self.cfg.train.weight_decay,
         )
-        return {"optimizer": optimizer}
+        if n_warmup <= 0:
+            return {"optimizer": optimizer}
+
+        def lr_lambda(epoch: int) -> float:
+            # Optimizer init lr = base_lr / n. Multiplier ramps 1 -> n over
+            # epochs 0 .. n-1 so training uses lr/n on epoch 0 and lr from
+            # epoch n onward.
+            if n_warmup <= 1:
+                return float(n_warmup)
+            if epoch >= n_warmup - 1:
+                return float(n_warmup)
+            return 1.0 + (float(epoch) / float(n_warmup - 1)) * (
+                float(n_warmup) - 1.0
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
