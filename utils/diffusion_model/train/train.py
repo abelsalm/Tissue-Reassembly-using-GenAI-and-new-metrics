@@ -1,32 +1,8 @@
-from math import ceil
-
 import torch
 import wandb
 
 from utils.data.dataholder import DataHolder
 from utils.data.misc import to_batch
-
-
-def _compute_ch_weight(cfg, current_epoch: int) -> float:
-    """Step the CH loss weight from zero to its final value after warmup."""
-    total_epochs = int(cfg.train.n_epochs)
-    warmup_epochs = int(total_epochs * float(cfg.train.ch_warmup_fraction))
-    post_ramp_epochs = int(total_epochs * float(cfg.train.ch_ramp_fraction)) + warmup_epochs
-    final_weight = float(cfg.train.ch_final_weight)
-    ramp_every = max(1, int(cfg.train.ch_ramp_every_n_epochs))
-
-    if current_epoch < warmup_epochs or final_weight == 0.0:
-        return 0.0
-    elif current_epoch > post_ramp_epochs:
-        return final_weight
-
-    ramp_epochs = max(1, post_ramp_epochs - warmup_epochs)
-    ramp_steps = max(1, ceil(ramp_epochs / ramp_every))
-    current_step = min(
-        ((current_epoch - warmup_epochs) // ramp_every) + 1,
-        ramp_steps,
-    )
-    return final_weight * current_step / ramp_steps
 
 
 def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
@@ -56,24 +32,10 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
 
     pred = self.forward(z_t)
 
-    # Compute the training loss. ``batch_idx=i`` lets the (optional)
-    # Voronoi GT-energy cache key its entries by (batch_idx, sample_idx)
-    # and skip recomputing the constant target-side fields every step.
-    # BUT BATCH_ID is here only for combined loss function
-    if self.train_loss.__class__.__name__ == "CombinedLossFunction":
-        loss, tl_log_dict = self.train_loss(
-            masked_pred=pred,
-            masked_true=batched_data,
-            log=i % self.log_every_steps == 0,
-            batch_idx=i,
-        )
-    elif self.train_loss.__class__.__name__ == "NeighborhoodTranscriptomeRMSELoss":
-        loss, tl_log_dict = self.train_loss(
-            masked_pred=pred,
-            masked_true=batched_data,
-            log=i % self.log_every_steps == 0,
-        )
-    elif self.train_loss.__class__.__name__ == "MultiRadiusSlideCombinedLoss":
+    # Compute the training loss. ``batch_idx=i`` lets the slide sub-loss
+    # cache its GT-side energies per (batch_idx, sample_idx) and skip
+    # recomputing the constant target-side fields every step.
+    if self.train_loss.__class__.__name__ == "MultiRadiusSlideCombinedLoss":
         loss, tl_log_dict = self.train_loss(
             masked_pred=pred,
             masked_true=batched_data,
@@ -86,7 +48,6 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
             masked_true=batched_data,
             log=i % self.log_every_steps == 0,
         )
-    loss = loss
 
     # Log the training loss and metrics if available
     if tl_log_dict is not None:
@@ -114,27 +75,15 @@ def on_train_epoch_end_func(self) -> None:
     cm = self.trainer.callback_metrics
     # Pick the first key Lightning actually produced for this run. The
     # epoch suffix is appended automatically when ``on_epoch=True`` is
-    # used in ``log_dict``. The order matters: position-MSE keys come
-    # first to preserve the previous behaviour for combined / MSE-only
-    # runs, then the neighborhood-RMSE keys for runs configured with
-    # ``loss_type: "neighborhood_rmse"``.
+    # used in ``log_dict``. Multi-radius-slide keys come first (the
+    # combined loss), then the plain multi-radius keys.
     epoch_loss = (
-        cm.get("train_epoch/position_mse")
-        or cm.get("train_epoch/position_mse_epoch")
-        or cm.get("train_loss/position_mse_epoch")
-        or cm.get("train_loss/position_mse")
-        or cm.get("train_epoch/neighborhood_transcriptome_rmse")
-        or cm.get("train_epoch/neighborhood_transcriptome_rmse_epoch")
-        or cm.get("train_loss/neighborhood_transcriptome_rmse")
+        cm.get("train_epoch/neighborhood_multi_radius_slide")
+        or cm.get("train_epoch/neighborhood_multi_radius_slide_epoch")
+        or cm.get("train_loss/neighborhood_multi_radius_slide")
         or cm.get("train_epoch/neighborhood_multi_radius")
         or cm.get("train_epoch/neighborhood_multi_radius_epoch")
         or cm.get("train_loss/neighborhood_multi_radius")
-        or cm.get("train_epoch/neighborhood_multi_radius_slide")
-        or cm.get("train_epoch/neighborhood_multi_radius_slide_epoch")
-        or cm.get("train_loss/neighborhood_multi_radius_slide")
-        or cm.get("train_epoch/neighborhood_transcriptome_cov")
-        or cm.get("train_epoch/neighborhood_transcriptome_cov_epoch")
-        or cm.get("train_loss/neighborhood_transcriptome_cov")
     )
     if epoch_loss is not None:
         try:
@@ -153,26 +102,14 @@ def on_train_epoch_start_func(self) -> None:
     - None
     """
 
-    ch_weight = None
-    if hasattr(self.train_loss, "ch_weight"):
-        ch_weight = _compute_ch_weight(self.cfg, self.current_epoch)
-        self.train_loss.ch_weight = ch_weight
-        if self.cfg.train.voronoi_weight == -1:
-            self.train_loss.voronoi_weight = ch_weight*self.cfg.train.voronoi_multiplier
-
-    # Tell the loss which epoch we're on (used to gate periodic viz
-    # logging, e.g. CH and Voronoi landscapes -> WandB). Defensive
-    # ``hasattr`` so swapping in a plain ``LossFunction`` keeps working.
+    # Tell the loss which epoch we're on (used e.g. for the transcriptome
+    # tolerance-band warmup). Defensive ``hasattr`` so swapping in a plain
+    # ``LossFunction`` keeps working.
     if hasattr(self.train_loss, "set_current_epoch"):
         self.train_loss.set_current_epoch(self.current_epoch)
 
     # Reset training loss and metrics for the new epoch
     self.train_loss.reset()
-
-    if ch_weight is not None:
-        self.log("train_loss/ch_weight", ch_weight, on_epoch=True, sync_dist=True)
-        if wandb.run:
-            wandb.log({"train_loss/ch_weight": ch_weight}, commit=False)
 
     # Re-randomise chunk boundaries every N epochs to prevent the model from
     # overfitting to fixed local cell neighbourhoods.

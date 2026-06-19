@@ -4,9 +4,10 @@ Loads slice CSVs (gene columns, GT/pred coordinates, ``cell_section``,
 ``cell_class``). For each slice:
 
   1. Builds tensors and runs ``DirectionalMetricLoss`` (``n_target`` subsample).
-  2. Visualizes **only** the loss subsample: PCA-1 unit vectors and
-     coherence mean vectors from ``directional_metric.py`` (not the full-slice
-     viz in ``build_plot_with_pred.py``).
+  2. Visualizes **only** the loss subsample: the first-radius local
+     orientation axes and the second-radius smoothed axes from
+     ``train_directional_metric.py`` (not the full-slice viz in
+     ``build_plot_with_pred.py``).
   3. Writes a summary PNG and per-slice arrow PNGs.
 
 Usage::
@@ -49,12 +50,13 @@ PRED_X_COL = "coord_X_test"
 PRED_Y_COL = "coord_Y_test"
 SECTION_COL = "cell_section"
 
-N_TARGET = 1000
-PCA_RADIUS = 0.16
-COHERENCE_RADIUS = 0.08
+N_TARGET = 2000
+NEIGHBOR_RADIUS = 0.16
+COHERENCE_RADIUS = 0.012
+TRANS_BETA = 2.0
 SOFT_BETA = 256.0
 EPS = 1e-6
-TARGET_MEAN_ARROW_LENGTH = 0.03
+TARGET_MEAN_ARROW_LENGTH = 0.05
 LOSS_SEED = 0
 DTYPE = torch.float32
 
@@ -65,7 +67,7 @@ class SliceResult:
     n_cells: int
     n_features: int
     loss_total: float
-    loss_coherence: float
+    loss_length: float
     loss_pairwise: float
     metric_seconds: float
     viz_seconds: float
@@ -205,6 +207,19 @@ def make_holders(
     return pred_holder, true_holder
 
 
+def _double_angle_to_spatial_axis(axis_double: torch.Tensor) -> torch.Tensor:
+    """Map double-angle vectors ``Z=(cos 2phi, sin 2phi)*R`` to spatial axes.
+
+    Returns a ``[..., 2]`` vector ``R * (cos phi, sin phi)`` whose direction is
+    the (mod-pi) axis ``phi = 0.5 * atan2(sin 2phi, cos 2phi)`` and whose length
+    is the orientation concentration ``R = ||Z||``. This is the representation
+    we draw as an arrow in real space.
+    """
+    length = axis_double.norm(dim=-1)
+    phi = 0.5 * torch.atan2(axis_double[..., 1], axis_double[..., 0])
+    return torch.stack((length * torch.cos(phi), length * torch.sin(phi)), dim=-1)
+
+
 def compute_loss_target_viz_fields(
     positions: torch.Tensor,
     features: torch.Tensor,
@@ -212,55 +227,63 @@ def compute_loss_target_viz_fields(
     target_idx: torch.Tensor,
     target_valid: torch.Tensor,
     *,
-    pca_radius: float,
+    neighbor_radius: float,
     coherence_radius: float,
+    trans_beta: float,
     soft_beta: float | None,
-    use_anisotropy_scaling: bool = False,
     eps: float = EPS,
 ) -> dict[str, np.ndarray]:
     """Viz arrays for the exact ``n_target`` subsample used by the loss."""
-    from directional_metric import (
+    from train_directional_metric import (
+        aggregate_axes_second_radius,
+        compute_orientation_axes,
         _gather_positions,
-        _spatial_soft_weights,
-        compute_weighted_pca_directions,
     )
 
-    pca_vectors, pca_valid = compute_weighted_pca_directions(
-        positions[..., :2],
+    xy = positions[..., :2]
+
+    # Stage 1: first-radius local orientation axis (double-angle resultant).
+    axis1_double, valid1 = compute_orientation_axes(
+        xy,
         features,
         mask,
         target_idx,
         target_valid,
-        pca_radius,
+        neighbor_radius,
+        trans_beta=trans_beta,
         soft_beta=soft_beta,
-        use_anisotropy_scaling=use_anisotropy_scaling,
         eps=eps,
     )
 
-    xy = positions[..., :2]
+    # Stage 2: second-radius smoothing among target cells.
     target_pos = _gather_positions(xy, target_idx)
-    dists = torch.cdist(target_pos, target_pos, p=2)
-    coh_w = _spatial_soft_weights(dists, coherence_radius, soft_beta)
-    valid_pair = pca_valid.unsqueeze(2) & pca_valid.unsqueeze(1)
-    coh_w = coh_w * valid_pair.to(coh_w.dtype)
-    denom = coh_w.sum(dim=-1, keepdim=True).clamp_min(eps)
-    avg_vec = torch.matmul(coh_w, pca_vectors) / denom
-    coherence = avg_vec.norm(dim=-1)
-    if not use_anisotropy_scaling:
-        coherence = coherence.clamp(0.0, 1.0)
+    axis2_double, valid2 = aggregate_axes_second_radius(
+        target_pos,
+        axis1_double,
+        valid1,
+        coherence_radius,
+        soft_beta=soft_beta,
+        eps=eps,
+    )
 
-    valid = (pca_valid & target_valid)[0]
+    # Convert both to spatial axis vectors for plotting; the per-cell length is
+    # the norm of the smoothed double-angle vector.
+    axis1_spatial = _double_angle_to_spatial_axis(axis1_double)
+    axis2_spatial = _double_angle_to_spatial_axis(axis2_double)
+    length = axis2_double.norm(dim=-1)
+
+    valid = valid2[0]
     idx = target_idx[0][valid]
 
     return {
         "cell_idx": idx.detach().cpu().numpy(),
         "x": xy[0, idx, 0].detach().cpu().numpy(),
         "y": xy[0, idx, 1].detach().cpu().numpy(),
-        "pc1_x": pca_vectors[0, valid, 0].detach().cpu().numpy(),
-        "pc1_y": pca_vectors[0, valid, 1].detach().cpu().numpy(),
-        "avg_dir_x": avg_vec[0, valid, 0].detach().cpu().numpy(),
-        "avg_dir_y": avg_vec[0, valid, 1].detach().cpu().numpy(),
-        "coherence": coherence[0, valid].detach().cpu().numpy(),
+        "pc1_x": axis1_spatial[0, valid, 0].detach().cpu().numpy(),
+        "pc1_y": axis1_spatial[0, valid, 1].detach().cpu().numpy(),
+        "avg_dir_x": axis2_spatial[0, valid, 0].detach().cpu().numpy(),
+        "avg_dir_y": axis2_spatial[0, valid, 1].detach().cpu().numpy(),
+        "coherence": length[0, valid].detach().cpu().numpy(),
     }
 
 
@@ -335,7 +358,6 @@ def evaluate_slice(
     *,
     compute_viz: bool,
     warmup_iters: int = 0,
-    use_anisotropy_scaling: bool = False,
 ) -> tuple[SliceResult, dict | None]:
     (
         _slice_df,
@@ -368,13 +390,13 @@ def evaluate_slice(
 
     (loss, _), metric_seconds = _timed_call(device, _forward)
     loss_total = float(loss.detach().item())
-    loss_coherence = float(loss_fn._last_coherence)
+    loss_length = float(loss_fn._last_length)
     loss_pairwise = float(loss_fn._last_pairwise)
 
     viz_out = None
     viz_seconds = 0.0
     if compute_viz:
-        from directional_metric import sample_target_indices
+        from train_directional_metric import sample_target_indices
 
         def _viz():
             torch.manual_seed(LOSS_SEED)
@@ -387,10 +409,10 @@ def evaluate_slice(
                 node_mask,
                 target_idx,
                 target_valid,
-                pca_radius=PCA_RADIUS,
+                neighbor_radius=NEIGHBOR_RADIUS,
                 coherence_radius=COHERENCE_RADIUS,
+                trans_beta=TRANS_BETA,
                 soft_beta=SOFT_BETA,
-                use_anisotropy_scaling=use_anisotropy_scaling,
             )
             pred_fields = compute_loss_target_viz_fields(
                 pred_positions,
@@ -398,10 +420,10 @@ def evaluate_slice(
                 node_mask,
                 target_idx,
                 target_valid,
-                pca_radius=PCA_RADIUS,
+                neighbor_radius=NEIGHBOR_RADIUS,
                 coherence_radius=COHERENCE_RADIUS,
+                trans_beta=TRANS_BETA,
                 soft_beta=SOFT_BETA,
-                use_anisotropy_scaling=use_anisotropy_scaling,
             )
             return target_idx, true_fields, pred_fields
 
@@ -412,7 +434,7 @@ def evaluate_slice(
         n_cells=true_positions.shape[1],
         n_features=len(feature_cols),
         loss_total=loss_total,
-        loss_coherence=loss_coherence,
+        loss_length=loss_length,
         loss_pairwise=loss_pairwise,
         metric_seconds=metric_seconds,
         viz_seconds=viz_seconds,
@@ -434,7 +456,7 @@ def evaluate_slice(
             pred_fields,
         ),
         "loss_total": loss_total,
-        "loss_coherence": loss_coherence,
+        "loss_length": loss_length,
         "loss_pairwise": loss_pairwise,
     }
 
@@ -449,7 +471,7 @@ def save_summary_png(results: list[SliceResult], output_path: Path, device: torc
     x = np.arange(len(df))
     width = 0.25
     ax.bar(x - width, df["loss_total"], width=width, label="total", color="tab:blue")
-    ax.bar(x, df["loss_coherence"], width=width, label="coherence", color="tab:orange")
+    ax.bar(x, df["loss_length"], width=width, label="length", color="tab:orange")
     ax.bar(x + width, df["loss_pairwise"], width=width, label="pairwise", color="tab:green")
     ax.set_xticks(x)
     ax.set_xticklabels(df["slice_name"], rotation=45, ha="right")
@@ -472,10 +494,10 @@ def save_summary_png(results: list[SliceResult], output_path: Path, device: torc
     ax = axes[1, 1]
     ax.axis("off")
     table_df = df[
-        ["slice_name", "n_cells", "loss_total", "loss_coherence", "loss_pairwise", "metric_seconds"]
+        ["slice_name", "n_cells", "loss_total", "loss_length", "loss_pairwise", "metric_seconds"]
     ].copy()
     table_df["metric_seconds"] = table_df["metric_seconds"].map(lambda v: f"{v:.4f}")
-    for col in ("loss_total", "loss_coherence", "loss_pairwise"):
+    for col in ("loss_total", "loss_length", "loss_pairwise"):
         table_df[col] = table_df[col].map(lambda v: f"{v:.6f}")
     table = ax.table(
         cellText=table_df.values,
@@ -511,12 +533,12 @@ def save_slice_arrow_png(
     uniques = sorted(true_arrow_df["cell_class"].unique())
     palette_dict = dict(zip(uniques, sns.color_palette(cc.glasbey, n_colors=len(uniques))))
 
-    pca_arrow_scale = _arrow_scale_for_unit_vectors(
+    axis1_arrow_scale = _arrow_scale_for_unit_vectors(
         true_arrow_df["pc1_x"].to_numpy(),
         true_arrow_df["pc1_y"].to_numpy(),
         TARGET_MEAN_ARROW_LENGTH,
     )
-    dir_arrow_scale = _arrow_scale_for_unit_vectors(
+    axis2_arrow_scale = _arrow_scale_for_unit_vectors(
         true_arrow_df["avg_dir_x"].to_numpy(),
         true_arrow_df["avg_dir_y"].to_numpy(),
         TARGET_MEAN_ARROW_LENGTH,
@@ -533,16 +555,16 @@ def save_slice_arrow_png(
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     panel_specs = [
-        (true_arrow_df, "Ground truth", f"PCA-1 (r={PCA_RADIUS:.3g})"),
-        (true_arrow_df, "Ground truth", f"Coherence mean (r={COHERENCE_RADIUS:.3g})"),
-        (pred_arrow_df, "Prediction", f"PCA-1 (r={PCA_RADIUS:.3g})"),
-        (pred_arrow_df, "Prediction", f"Coherence mean (r={COHERENCE_RADIUS:.3g})"),
+        (true_arrow_df, "Ground truth", f"Local axis (r={NEIGHBOR_RADIUS:.3g})"),
+        (true_arrow_df, "Ground truth", f"Smoothed axis (r={COHERENCE_RADIUS:.3g})"),
+        (pred_arrow_df, "Prediction", f"Local axis (r={NEIGHBOR_RADIUS:.3g})"),
+        (pred_arrow_df, "Prediction", f"Smoothed axis (r={COHERENCE_RADIUS:.3g})"),
     ]
     arrow_specs = [
-        ("_arrow_u", "_arrow_v", pca_arrow_scale),
-        ("avg_dir_x", "avg_dir_y", dir_arrow_scale),
-        ("_arrow_u", "_arrow_v", pca_arrow_scale),
-        ("avg_dir_x", "avg_dir_y", dir_arrow_scale),
+        ("_arrow_u", "_arrow_v", axis1_arrow_scale),
+        ("avg_dir_x", "avg_dir_y", axis2_arrow_scale),
+        ("_arrow_u", "_arrow_v", axis1_arrow_scale),
+        ("avg_dir_x", "avg_dir_y", axis2_arrow_scale),
     ]
 
     for ax, (arrow_df, row_label, panel_title), (u_col, v_col, scale) in zip(
@@ -559,7 +581,7 @@ def save_slice_arrow_png(
             x="plot_x",
             y="plot_y",
             hue="cell_class",
-            s=12,
+            s=6,
             ax=ax,
             palette=palette_dict,
             legend=False,
@@ -576,7 +598,7 @@ def save_slice_arrow_png(
 
     loss_text = (
         f"total={viz_data['loss_total']:.4f}, "
-        f"coherence={viz_data['loss_coherence']:.4f}, "
+        f"length={viz_data['loss_length']:.4f}, "
         f"pairwise={viz_data['loss_pairwise']:.4f}"
     )
     fig.suptitle(
@@ -660,14 +682,6 @@ def parse_args() -> argparse.Namespace:
         default=N_TARGET,
         help="Target cells subsampled by DirectionalMetricLoss (loss + viz use the same subsample)",
     )
-    parser.add_argument(
-        "--use-anisotropy-scaling",
-        action="store_true",
-        help=(
-            "Scale PCA vectors by lambda_1/lambda_2; coherence averaging uses "
-            "these scaled vectors (matches DirectionalMetricLoss flag)"
-        ),
-    )
     return parser.parse_args()
 
 
@@ -675,7 +689,7 @@ def main() -> None:
     args = parse_args()
     _setup_import_paths(args.livae_root)
 
-    from directional_metric import DirectionalMetricLoss
+    from train_directional_metric import DirectionalMetricLoss
 
     if not args.csv.exists():
         raise FileNotFoundError(f"Comparison CSV not found: {args.csv}")
@@ -695,13 +709,13 @@ def main() -> None:
 
     loss_fn = DirectionalMetricLoss(
         n_target=args.n_target,
-        pca_radius=PCA_RADIUS,
+        neighbor_radius=NEIGHBOR_RADIUS,
         coherence_radius=COHERENCE_RADIUS,
+        trans_beta=TRANS_BETA,
         soft_beta=SOFT_BETA,
         eps=EPS,
-        coherence_weight=1.0,
+        length_weight=1.0,
         pairwise_weight=1.0,
-        use_anisotropy_scaling=args.use_anisotropy_scaling,
     ).to(device)
 
     print(f"CSV: {args.csv}")
@@ -710,7 +724,7 @@ def main() -> None:
     print(f"Timing warmup iterations: {warmup_iters}")
     print(f"Graph batch size: 1 slice per forward pass")
     print(f"Loss + viz n_target: {args.n_target} (seed={LOSS_SEED})")
-    print(f"Anisotropy scaling (lambda_1/lambda_2): {args.use_anisotropy_scaling}")
+    print(f"Neighbor radius: {NEIGHBOR_RADIUS}  Coherence radius: {COHERENCE_RADIUS}  trans_beta: {TRANS_BETA}")
     print(f"Slices to evaluate: {len(slice_names)}")
     print(f"Slices with arrow PNGs: {len(viz_slices)}")
 
@@ -726,7 +740,6 @@ def main() -> None:
             loss_fn,
             compute_viz=slice_name in viz_slices,
             warmup_iters=warmup_iters,
-            use_anisotropy_scaling=args.use_anisotropy_scaling,
         )
         results.append(result)
 
@@ -734,7 +747,7 @@ def main() -> None:
         print(f"Tensor device: {device}")
         print(
             f"DirectionalMetricLoss: {result.loss_total:.6f} "
-            f"(coherence={result.loss_coherence:.6f}, "
+            f"(length={result.loss_length:.6f}, "
             f"pairwise={result.loss_pairwise:.6f})"
         )
         print(f"Loss forward time ({device.type}): {result.metric_seconds:.4f} s")

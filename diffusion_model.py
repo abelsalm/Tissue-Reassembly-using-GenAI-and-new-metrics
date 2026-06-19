@@ -2,11 +2,8 @@ import pytorch_lightning as pl
 import torch
 ## HERE ADD NEW LOSS
 from metrics.loss_function_plus import (
-    CombinedLossFunction,
-    NeighborhoodTranscriptomeRMSELoss,
     MultiRadiusNeighborhoodLoss,
     MultiRadiusSlideCombinedLoss,
-    NeighborhoodTranscriptomeAndCovarianceLoss,
     SlidePointCloudMetricLoss,
 )
 from metrics.loss_function import LossFunction
@@ -51,55 +48,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.dataset_infos = dataset_infos
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
-        if cfg.train.loss_type == "combined":
-            self.train_loss = CombinedLossFunction(
-                mse_weight=cfg.train.mse_weight,
-                ch_weight=0.0,
-                radii=list(cfg.train.ch_radii),
-                grid_resolution=cfg.train.ch_grid_resolution,
-                kappa=cfg.train.ch_kappa,
-                soft_max_beta=cfg.train.ch_soft_max_beta,
-                support_factor=cfg.train.ch_support_factor,
-                landscape_chunk_size=getattr(cfg.train, "ch_landscape_chunk_size", 128),
-                square_bbox=cfg.train.ch_square_bbox,
-                margin=cfg.train.ch_margin,
-                eps=cfg.train.ch_eps,
-                min_cells_per_type=cfg.train.ch_min_cells_per_type,
-                voronoi_weight=cfg.train.voronoi_weight,
-                voronoi_transition_width=cfg.train.voronoi_transition_width,
-                voronoi_grid_resolution=cfg.train.voronoi_grid_resolution,
-                voronoi_kappa=cfg.train.voronoi_kappa,
-                voronoi_soft_beta=cfg.train.voronoi_soft_beta,
-                voronoi_square_bbox=cfg.train.voronoi_square_bbox,
-                voronoi_margin=cfg.train.voronoi_margin,
-                voronoi_min_cells_per_type=cfg.train.voronoi_min_cells_per_type,
-                voronoi_chunk=cfg.train.voronoi_chunk,
-                voronoi_cache_gt=cfg.train.voronoi_cache_gt,
-                voronoi_cache_key_mode=getattr(
-                    cfg.train, "voronoi_cache_key_mode", "content"
-                ),
-                viz_every_n_epochs=getattr(cfg.train, "viz_every_n_epochs", 0),
-                ch_viz_num_figures=getattr(cfg.train, "ch_viz_num_figures", 1),
-                voronoi_viz_num_figures=getattr(
-                    cfg.train, "voronoi_viz_num_figures", 4
-                ),
-            )
-        elif cfg.train.loss_type == "position_mse":
-            self.train_loss = LossFunction()
-        elif cfg.train.loss_type == "neighborhood_rmse":
-            # Train only with the neighborhood-averaged transcriptome
-            # RMSE loss. ``soft_beta`` controls differentiability through
-            # the predicted positions: set it to ``null`` in YAML for a
-            # hard cutoff (metric / diagnostic mode -- gradient is zero
-            # almost everywhere) and to a positive float for a soft
-            # sigmoid membership (recommended for training).
-            self.train_loss = NeighborhoodTranscriptomeRMSELoss(
-                radius=cfg.train.neigh_radius,
-                soft_beta=getattr(cfg.train, "neigh_soft_beta", None),
-                eps=getattr(cfg.train, "neigh_eps", 1e-6),
-                include_self=getattr(cfg.train, "neigh_include_self", True),
-            )
-        elif cfg.train.loss_type == "neighborhood_multi_radius":
+        if cfg.train.loss_type == "neighborhood_multi_radius":
             # Multi-radius neighborhood loss combining (a) the
             # transcriptome RMSE evaluated at each radius in
             # ``multi_radius_radii`` and (b) the log-density difference at
@@ -170,33 +119,19 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 linearity_weight=getattr(
                     cfg.train, "slide_pca_linearity_weight", 1.0
                 ),
-                radii=list(
-                    getattr(
-                        cfg.train,
-                        "slide_ch_radii",
-                        cfg.train.ch_radii,
-                    )
+                radii=list(cfg.train.slide_ch_radii),
+                grid_resolution=int(
+                    getattr(cfg.train, "slide_ch_grid_resolution", 512)
                 ),
-                grid_resolution=getattr(
-                    cfg.train, "slide_ch_grid_resolution", cfg.train.ch_grid_resolution
-                ),
-                kappa=getattr(cfg.train, "slide_ch_kappa", cfg.train.ch_kappa),
-                soft_max_beta=getattr(
-                    cfg.train, "slide_ch_soft_max_beta", cfg.train.ch_soft_max_beta
-                ),
-                support_factor=getattr(
-                    cfg.train, "slide_ch_support_factor", cfg.train.ch_support_factor
-                ),
+                kappa=getattr(cfg.train, "slide_ch_kappa", 0.5),
+                soft_max_beta=getattr(cfg.train, "slide_ch_soft_max_beta", 32.0),
+                support_factor=getattr(cfg.train, "slide_ch_support_factor", 8),
                 landscape_chunk_size=getattr(
-                    cfg.train,
-                    "slide_ch_landscape_chunk_size",
-                    getattr(cfg.train, "ch_landscape_chunk_size", 128),
+                    cfg.train, "slide_ch_landscape_chunk_size", 128
                 ),
-                square_bbox=getattr(
-                    cfg.train, "slide_ch_square_bbox", cfg.train.ch_square_bbox
-                ),
-                margin=getattr(cfg.train, "slide_ch_margin", cfg.train.ch_margin),
-                eps=getattr(cfg.train, "slide_ch_eps", cfg.train.ch_eps),
+                square_bbox=getattr(cfg.train, "slide_ch_square_bbox", True),
+                margin=getattr(cfg.train, "slide_ch_margin", 0.01),
+                eps=getattr(cfg.train, "slide_ch_eps", 1e-6),
                 min_cells=int(getattr(cfg.train, "slide_min_cells", 10)),
                 cache_gt=getattr(cfg.train, "slide_ch_cache_gt", True),
             )
@@ -206,27 +141,6 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 neighborhood_weight=getattr(
                     cfg.train, "slide_neighborhood_weight", 1.0
                 ),
-            )
-        elif cfg.train.loss_type == "neighborhood_transcriptome_cov":
-            # Combined single-radius loss: per-cell transcriptome RMSE
-            # **plus** per-cell-per-gene weighted-spatial-covariance loss
-            # (trace + det of the 2x2 covariance of (x, y) positions,
-            # weights = exp(gene expression)). Both sub-losses share the
-            # same radius / softness. Two top-level weights control the
-            # transcriptome vs. covariance balance; two inner weights
-            # control the trace vs. det balance within the covariance
-            # term.
-            self.train_loss = NeighborhoodTranscriptomeAndCovarianceLoss(
-                radius=cfg.train.neigh_cov_radius,
-                soft_beta=getattr(cfg.train, "neigh_cov_soft_beta", None),
-                eps=getattr(cfg.train, "neigh_cov_eps", 1e-6),
-                include_self=getattr(cfg.train, "neigh_cov_include_self", True),
-                transcriptome_weight=getattr(
-                    cfg.train, "neigh_cov_transcriptome_weight", 1.0
-                ),
-                cov_weight=getattr(cfg.train, "neigh_cov_covariance_weight", 1.0),
-                trace_weight=getattr(cfg.train, "neigh_cov_trace_weight", 1.0),
-                det_weight=getattr(cfg.train, "neigh_cov_det_weight", 1.0),
             )
         else:
             raise ValueError(f"Unsupported train loss_type: {cfg.train.loss_type}")

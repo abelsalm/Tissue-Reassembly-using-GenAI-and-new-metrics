@@ -22,10 +22,9 @@ train: # !!!!
     n_epochs: 24000        # tiny number for a smoke-test; increase for real training
     batch_size: 1     # keep small on CPU
     lr: 5e-4
-    # ----- Train ONLY with the neighborhood-averaged transcriptome RMSE
-    # loss. The MSE / CH-curve / Voronoi components of CombinedLossFunction
-    # are not instantiated, so their knobs (mse_weight, ch_*, voronoi_*,
-    # viz_*) are silently unused for this run.
+    # ----- Loss: "neighborhood_multi_radius_slide" (multi-radius
+    # neighborhood loss + whole-slide point-cloud metric) or
+    # "neighborhood_multi_radius" (neighborhood loss only).
     loss_type: "neighborhood_multi_radius_slide"
 
 test:

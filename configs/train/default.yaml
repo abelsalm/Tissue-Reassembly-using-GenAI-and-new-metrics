@@ -12,49 +12,7 @@ position_warp_max_angle_span: 1.5707963267948966 # Max direction variation (rad)
 position_warp_grid_size: 8 # Control-grid resolution for the smooth warp field.
 debug_print_shuffle_every_n_epochs: 10 # Print a shuffle canary every N epochs (0 = disabled)
 debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
-loss_type: "neighborhood_multi_radius_slide" # "combined", "position_mse", "neighborhood_rmse", "neighborhood_multi_radius", "neighborhood_multi_radius_slide" or "neighborhood_transcriptome_cov"
-mse_weight: 1.0
-# --- CH-AUC parameters --------------------------------------------
-ch_final_weight: 0.01
-ch_warmup_fraction: 0.4
-ch_ramp_fraction: 0.3
-ch_ramp_every_n_epochs: 54
-ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01]
-ch_grid_resolution: 512
-ch_kappa: 0.5
-ch_soft_max_beta: 32.0
-ch_support_factor: 8
-ch_landscape_chunk_size: 128
-ch_square_bbox: True
-ch_margin: 0.01
-ch_eps: 1e-6
-ch_min_cells_per_type: 10
-# --- Voronoi phase-pair parameters --------------------------------
-voronoi_weight: -1 # -1 = use ch_weight, otherwise use the specified weight
-voronoi_multiplier: 4.0 # in case where voronoi wEIGHT IS -1, this is the multiplier for the ch_weight
-voronoi_transition_width: 0.005
-voronoi_grid_resolution: 512
-voronoi_kappa: 0.5
-voronoi_soft_beta: 1024.0
-voronoi_square_bbox: True 
-voronoi_margin: 0.01
-voronoi_min_cells_per_type: 10
-voronoi_chunk: 128
-voronoi_cache_gt: True # Cache GT-side Voronoi energies; skips recomputing the constant target side every step
-voronoi_cache_key_mode: "content" # "content" (shuffle-safe, keys by cell_ID hash) or "slot" (keys by (batch_idx, sample_idx); only correct when DataLoader shuffle=False AND no rechunking)
-# --- Visualization (CH and Voronoi sub-losses) --------------------
-viz_every_n_epochs: 200 # Push landscape + energy-density figures to wandb every N epochs (0 = disabled). Fires on batch_idx == 0 only.
-ch_viz_num_figures: 4 # Number of CH-AUC (sample, type, radius) panels per logging event
-voronoi_viz_num_figures: 4 # Number of Voronoi (sample, pair) panels per logging event
-# --- Neighborhood-transcriptome RMSE parameters -------------------
-# Only consumed when ``loss_type: "neighborhood_rmse"``. Compares the
-# predicted vs. GT neighborhood-averaged gene-expression profile per
-# cell and takes the RMSE over the feature dimension, then averages
-# over valid cells.
-neigh_radius: 0.04 # Neighborhood radius (in normalised position-coord units) used to average gene-expression profiles around each cell.
-neigh_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (gradient through positions is zero almost everywhere -- diagnostic only).
-neigh_eps: 1.0e-6 # Numerical floor used inside the sqrt and the weight normalisation.
-neigh_include_self: True # Include cell i itself in its own neighborhood when averaging.
+loss_type: "neighborhood_multi_radius_slide" # "neighborhood_multi_radius" or "neighborhood_multi_radius_slide"
 # --- Multi-radius neighborhood loss parameters --------------------
 # Only consumed when ``loss_type: "neighborhood_multi_radius"``. Compares
 # neighborhood-averaged transcriptomes, log cell densities, and (optionally)
@@ -90,7 +48,7 @@ slide_ch_auc_weight: 0.1 # Weight of the CH energy-curve AUC term.
 slide_pca_anisotropy_weight: 0.1 # Weight of the PCA anisotropy RMSE term.
 slide_pca_omnivariance_weight: 0.1 # Weight of the PCA omnivariance RMSE term.
 slide_pca_linearity_weight: 0.1 # Weight of the PCA linearity RMSE term.
-slide_ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01] # Radii for CH AUC integration (defaults to ch_radii if omitted).
+slide_ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01] # Radii for CH AUC integration.
 slide_ch_grid_resolution: 512 # CH landscape grid resolution for the slide metric.
 slide_ch_kappa: 0.5 # CH kappa for the slide metric.
 slide_ch_soft_max_beta: 32.0 # Soft-max beta for landscape combination.
@@ -101,20 +59,3 @@ slide_ch_margin: 0.01 # Margin around the point cloud for the CH grid.
 slide_ch_eps: 1.0e-6 # Numerical floor for CH AUC normalisation.
 slide_min_cells: 10 # Minimum masked cells required to compute slide metrics.
 slide_ch_cache_gt: True # Cache GT CH AUC per sample (cleared each epoch); skips GT landscape rebuild every step.
-# --- Neighborhood transcriptome + weighted-covariance combined loss ----
-# Only consumed when ``loss_type: "neighborhood_transcriptome_cov"``.
-# Single radius, shared by both sub-losses. Combines the per-cell
-# transcriptome-RMSE loss with a per-cell-per-gene weighted spatial
-# covariance loss (trace + det of the 2x2 covariance of (x, y) positions,
-# weighted by ``exp(gene_expression)``).
-#   L = neigh_cov_transcriptome_weight * L_transcriptome
-#     + neigh_cov_covariance_weight    * (neigh_cov_trace_weight * trace_rmse
-#                                         + neigh_cov_det_weight   * det_rmse)
-neigh_cov_radius: 0.03 # Shared neighborhood radius for both sub-losses.
-neigh_cov_soft_beta: 256.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (diagnostic only).
-neigh_cov_eps: 1.0e-6 # Numerical floor for sqrt + division.
-neigh_cov_include_self: True # Include cell i itself in its own neighborhood.
-neigh_cov_transcriptome_weight: 1.0 # Top-level weight of the transcriptome-RMSE sub-loss.
-neigh_cov_covariance_weight: 16.0 # Top-level weight of the covariance (trace+det) sub-loss.
-neigh_cov_trace_weight: 16.0 # Inner weight: trace-RMSE term inside the covariance sub-loss.
-neigh_cov_det_weight: 64.0 # Inner weight: det-RMSE  term inside the covariance sub-loss.
