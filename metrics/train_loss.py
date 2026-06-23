@@ -1,7 +1,7 @@
 ## Master combined training loss
 ##
 ## Imports all modular sub-losses and combines them based on hyperparameters.
-## Any sub-loss whose weight(s) are all zero is never instantiated or called.
+## Any sub-loss whose global weight is zero is never instantiated or called.
 
 from typing import Dict, Optional, Tuple
 
@@ -19,20 +19,18 @@ from metrics.train_directional_metric import DirectionalMetricLoss
 class CombinedTrainLoss(nn.Module):
     """Master loss: weighted sum of active sub-losses driven by config weights.
 
-    Sub-losses:
-        * **Neighborhood** (``neighborhood_weight``): multi-radius transcriptome
-          RMSE + log-density across spatial annuli (``MultiRadiusNeighborhoodLoss``).
-        * **CH AUC** (``ch_weight``): whole-slide Cahn-Hilliard energy-curve AUC
+    Global weights (all in ``cfg`` under ``train``):
+        * **transcriptome_multi_radius_weight** — multi-radius neighborhood
+          transcriptome RMSE + log-density (``MultiRadiusNeighborhoodLoss``).
+        * **ch_weight** — whole-slide Cahn-Hilliard energy-curve AUC
           (``SlideCHLoss``).
-        * **PCA** (``pca_anisotropy_weight`` / ``pca_omnivariance_weight`` /
-          ``pca_linearity_weight``): whole-slide eigenvalue shape descriptors
-          (``SlidePCALoss``).
-        * **Directional** (``directional_weight``): transcriptome-weighted local
-          orientation coherence via double-angle statistics (``DirectionalMetricLoss``).
+        * **pca_weight** — whole-slide PCA shape descriptors (``SlidePCALoss``).
+        * **directional_weight** — transcriptome-weighted local orientation
+          coherence (``DirectionalMetricLoss``).
 
-    Any sub-loss with all its weights equal to zero is never instantiated or
-    called, saving both memory and compute. Config keys accept both the new
-    names and the legacy ``slide_*`` prefixed names for backward compatibility.
+    A global weight of ``0`` disables that term entirely (no module init, no
+    forward compute). Legacy ``slide_*`` / ``neighborhood_weight`` keys are
+    still accepted as fallbacks.
     """
 
     def __init__(self, cfg) -> None:
@@ -44,13 +42,25 @@ class CombinedTrainLoss(nn.Module):
                 v = getattr(cfg, legacy, None)
             return v if v is not None else default
 
+        def _get_first(*keys: str, default=0.0):
+            for key in keys:
+                v = getattr(cfg, key, None)
+                if v is not None:
+                    return v
+            return default
+
         # ------------------------------------------------------------------ #
-        # Neighborhood sub-loss
+        # Transcriptome multi-radius neighborhood sub-loss
         # ------------------------------------------------------------------ #
-        self.neighborhood_weight = float(_get(
-            "neighborhood_weight", "slide_neighborhood_weight", 1.0
-        ))
-        if self.neighborhood_weight != 0.0:
+        self.transcriptome_multi_radius_weight = float(
+            _get_first(
+                "transcriptome_multi_radius_weight",
+                "neighborhood_weight",
+                "slide_neighborhood_weight",
+                default=1.0,
+            )
+        )
+        if self.transcriptome_multi_radius_weight != 0.0:
             self.neighborhood: Optional[MultiRadiusNeighborhoodLoss] = (
                 MultiRadiusNeighborhoodLoss(
                     radii=list(_get("multi_radius_radii", default=[0.02, 0.04, 0.08, 0.16])),
@@ -102,14 +112,18 @@ class CombinedTrainLoss(nn.Module):
         # ------------------------------------------------------------------ #
         # PCA sub-loss
         # ------------------------------------------------------------------ #
-        pca_aniso = float(_get("pca_anisotropy_weight", "slide_pca_anisotropy_weight", 0.0))
-        pca_omni = float(_get("pca_omnivariance_weight", "slide_pca_omnivariance_weight", 0.0))
-        pca_lin = float(_get("pca_linearity_weight", "slide_pca_linearity_weight", 0.0))
-        if pca_aniso != 0.0 or pca_omni != 0.0 or pca_lin != 0.0:
+        self.pca_weight = float(_get("pca_weight", default=0.0))
+        if self.pca_weight != 0.0:
             self.pca: Optional[SlidePCALoss] = SlidePCALoss(
-                anisotropy_weight=pca_aniso,
-                omnivariance_weight=pca_omni,
-                linearity_weight=pca_lin,
+                anisotropy_weight=float(
+                    _get("pca_anisotropy_weight", "slide_pca_anisotropy_weight", 1.0)
+                ),
+                omnivariance_weight=float(
+                    _get("pca_omnivariance_weight", "slide_pca_omnivariance_weight", 1.0)
+                ),
+                linearity_weight=float(
+                    _get("pca_linearity_weight", "slide_pca_linearity_weight", 1.0)
+                ),
                 min_cells=int(_get("pca_min_cells", "slide_min_cells", 10)),
                 eps=float(_get("pca_eps", "slide_ch_eps", 1e-6)),
             )
@@ -134,9 +148,9 @@ class CombinedTrainLoss(nn.Module):
         else:
             self.directional = None
 
-        # Shared caches for logging
+        # Shared caches for logging (raw unweighted sub-loss values)
         self._last_loss: float = -1.0
-        self._last_neighborhood: float = -1.0
+        self._last_transcriptome_multi_radius: float = -1.0
         self._last_ch: float = -1.0
         self._last_pca: float = -1.0
         self._last_directional: float = -1.0
@@ -163,22 +177,26 @@ class CombinedTrainLoss(nn.Module):
         **_unused: object,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
 
-        # We need a zero tensor to initialise the accumulator on the right
-        # device without any forward pass committed yet.
         device = masked_pred.positions.device
         dtype = masked_pred.positions.dtype
         loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
         to_log: Dict[str, float] = {}
+        prefix = "train_loss" if train_stage else "val_loss"
 
-        # ---- Neighborhood ----
-        if self.neighborhood is not None and self.neighborhood_weight != 0.0:
+        # ---- Transcriptome multi-radius ----
+        if self.neighborhood is not None and self.transcriptome_multi_radius_weight != 0.0:
             n_loss, n_log = self.neighborhood(
                 masked_pred, masked_true,
                 train_stage=train_stage,
                 log=log,
             )
-            loss = loss + self.neighborhood_weight * n_loss
-            self._last_neighborhood = float(n_loss.detach().item())
+            weighted = self.transcriptome_multi_radius_weight * n_loss
+            loss = loss + weighted
+            self._last_transcriptome_multi_radius = float(n_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/transcriptome_multi_radius_weighted"] = float(
+                    weighted.detach().item()
+                )
             if log and n_log:
                 to_log.update(n_log)
 
@@ -190,20 +208,26 @@ class CombinedTrainLoss(nn.Module):
                 log=log,
                 batch_idx=batch_idx,
             )
-            loss = loss + self.ch_weight * c_loss
+            weighted = self.ch_weight * c_loss
+            loss = loss + weighted
             self._last_ch = float(c_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/ch_auc_weighted"] = float(weighted.detach().item())
             if log and c_log:
                 to_log.update(c_log)
 
         # ---- PCA ----
-        if self.pca is not None:
+        if self.pca is not None and self.pca_weight != 0.0:
             p_loss, p_log = self.pca(
                 masked_pred, masked_true,
                 train_stage=train_stage,
                 log=log,
             )
-            loss = loss + p_loss
+            weighted = self.pca_weight * p_loss
+            loss = loss + weighted
             self._last_pca = float(p_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/pca_weighted"] = float(weighted.detach().item())
             if log and p_log:
                 to_log.update(p_log)
 
@@ -214,15 +238,19 @@ class CombinedTrainLoss(nn.Module):
                 train_stage=train_stage,
                 log=log,
             )
-            loss = loss + self.directional_weight * d_loss
+            weighted = self.directional_weight * d_loss
+            loss = loss + weighted
             self._last_directional = float(d_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/directional_weighted"] = float(
+                    weighted.detach().item()
+                )
             if log and d_log:
                 to_log.update(d_log)
 
         self._last_loss = float(loss.detach().item())
 
         if log:
-            prefix = "train_loss" if train_stage else "val_loss"
             to_log[f"{prefix}/combined"] = float(loss.detach().item())
             if wandb.run:
                 wandb.log(to_log, commit=True)
@@ -248,14 +276,25 @@ class CombinedTrainLoss(nn.Module):
         to_log: Dict[str, float] = {
             f"{epoch_prefix}/combined": float(self._last_loss),
         }
-        if self.neighborhood is not None and self.neighborhood_weight != 0.0:
-            to_log[f"{epoch_prefix}/neighborhood"] = float(self._last_neighborhood)
+        if self.neighborhood is not None and self.transcriptome_multi_radius_weight != 0.0:
+            to_log[f"{epoch_prefix}/transcriptome_multi_radius"] = float(
+                self._last_transcriptome_multi_radius
+            )
+            to_log[f"{epoch_prefix}/transcriptome_multi_radius_weighted"] = float(
+                self._last_transcriptome_multi_radius * self.transcriptome_multi_radius_weight
+            )
             to_log.update(self.neighborhood.log_epoch_metrics(train_stage=train_stage))
         if self.ch is not None and self.ch_weight != 0.0:
             to_log[f"{epoch_prefix}/ch_auc"] = float(self._last_ch)
+            to_log[f"{epoch_prefix}/ch_auc_weighted"] = float(
+                self._last_ch * self.ch_weight
+            )
             to_log.update(self.ch.log_epoch_metrics(train_stage=train_stage))
-        if self.pca is not None:
+        if self.pca is not None and self.pca_weight != 0.0:
             to_log[f"{epoch_prefix}/pca"] = float(self._last_pca)
+            to_log[f"{epoch_prefix}/pca_weighted"] = float(
+                self._last_pca * self.pca_weight
+            )
             to_log.update(self.pca.log_epoch_metrics(train_stage=train_stage))
         if (
             self.directional is not None
@@ -263,6 +302,9 @@ class CombinedTrainLoss(nn.Module):
             and hasattr(self.directional, "log_epoch_metrics")
         ):
             to_log[f"{epoch_prefix}/directional"] = float(self._last_directional)
+            to_log[f"{epoch_prefix}/directional_weighted"] = float(
+                self._last_directional * self.directional_weight
+            )
             to_log.update(
                 self.directional.log_epoch_metrics(train_stage=train_stage)
             )
