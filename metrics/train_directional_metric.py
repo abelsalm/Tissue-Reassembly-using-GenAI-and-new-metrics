@@ -402,10 +402,9 @@ class DirectionalMetricLoss(nn.Module):
         loss = self.length_weight * length_loss + self.pairwise_weight * pair_loss
 
         loss_val = float(loss.detach().item())
-        if train_stage:
-            self._last_loss = loss_val
-            self._last_length = float(length_loss.detach().item())
-            self._last_pairwise = float(pair_loss.detach().item())
+        self._last_loss = loss_val
+        self._last_length = float(length_loss.detach().item())
+        self._last_pairwise = float(pair_loss.detach().item())
 
         to_log: Optional[Dict[str, float]] = None
         if log:
@@ -422,11 +421,12 @@ class DirectionalMetricLoss(nn.Module):
     def reset(self) -> None:
         pass
 
-    def log_epoch_metrics(self) -> Dict[str, float]:
+    def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
+        epoch_prefix = "train_epoch" if train_stage else "val_epoch"
         to_log = {
-            "train_epoch/directional_metric": float(self._last_loss),
-            "train_epoch/directional_length": float(self._last_length),
-            "train_epoch/directional_pairwise": float(self._last_pairwise),
+            f"{epoch_prefix}/directional_metric": float(self._last_loss),
+            f"{epoch_prefix}/directional_length": float(self._last_length),
+            f"{epoch_prefix}/directional_pairwise": float(self._last_pairwise),
         }
         if wandb.run:
             wandb.log(to_log, commit=False)

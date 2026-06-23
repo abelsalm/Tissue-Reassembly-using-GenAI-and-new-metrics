@@ -1,91 +1,92 @@
 import torch
 import wandb
 
-from metrics.evaluation_statistics import compute_RSSD
 from utils.data.dataholder import DataHolder
 from utils.data.misc import to_batch
 
 
-def on_validation_epoch_start_func(self) -> None:
-    """
-    Callback function called at the start of each validation epoch.
+def _validation_batch_size(self) -> int:
+    return int(getattr(self.cfg.validation, "batch_size", self.BS))
 
-    Returns:
-    - None
-    """
-    self.val_loss.reset()
-    self.validation_step_outputs = []
-    self.absolute_rssds = []
+
+def on_validation_epoch_start_func(self) -> None:
+    """Reset validation losses and sync epoch-dependent loss state."""
+    if hasattr(self.train_loss, "set_current_epoch"):
+        self.train_loss.set_current_epoch(self.current_epoch)
+    self.train_loss.reset()
+    self.vanilla_val_loss.reset()
 
 
 def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
-    """
-    Validation step for a single batch.
+    """Validation step: combined training loss + vanilla position MSE on the side."""
+    self.model.eval()
+    batch_size = _validation_batch_size(self)
+    should_log = i % self.log_every_steps == 0
 
-    Parameters:
-    - data: Batch of input data.
-    - i: Index of the current batch.
-
-    Returns:
-    - torch.Tensor: Loss for the current batch.
-    """
-
-    self.model.eval()  # Set the model to evaluation mode
-
-    with torch.no_grad():  # Disable gradient computation
-        # Process data similarly to the training_step
+    with torch.no_grad():
         batched_data = to_batch(data)
         z_t = self.noise_model.apply_noise(batched_data, train_flag=False)
         pred = self.forward(z_t)
-        # Compute the loss for validation
-        vloss, _ = self.val_loss(
+
+        loss, val_log_dict = self.train_loss(
             masked_pred=pred,
             masked_true=batched_data,
             train_stage=False,
-            log=i % self.log_every_steps == 0,
+            log=should_log,
+            batch_idx=i,
         )
-        _, __doc__, absolute_rssd = compute_RSSD(batched_data, pred)
 
-    self.validation_step_outputs.append(vloss)
-    self.absolute_rssds.append(absolute_rssd)
+        _, vanilla_log_dict = self.vanilla_val_loss(
+            masked_pred=pred,
+            masked_true=batched_data,
+            train_stage=False,
+            log=should_log,
+        )
 
-    return vloss
+    if val_log_dict is not None:
+        self.log_dict(val_log_dict, batch_size=batch_size)
+
+    if vanilla_log_dict is not None:
+        self.log_dict(vanilla_log_dict, batch_size=batch_size)
+
+    val_epoch_log = self.train_loss.log_epoch_metrics(train_stage=False)
+    self.log_dict(val_epoch_log, batch_size=batch_size, on_step=False, on_epoch=True)
+
+    vanilla_epoch_log = self.vanilla_val_loss.log_epoch_metrics(train_stage=False)
+    self.log_dict(vanilla_epoch_log, batch_size=batch_size, on_step=False, on_epoch=True)
+
+    return loss
 
 
-def on_validation_epoch_end_func(self):
-    """
-    Callback function called at the end of each validation epoch.
-
-    Returns:
-    - None
-    """
-    # Gather all losses and calculate the mean
-    avg_val_loss = torch.stack(self.validation_step_outputs).mean()
-    self.absolute_rssds = [
-        torch.tensor(item, dtype=torch.float64).to(avg_val_loss.device)
-        for item in self.absolute_rssds
-    ]
-    absolute_rssds = torch.stack(self.absolute_rssds).mean()
-
-    # Use self.log to log the average validation loss
-    self.log(
-        "val_loss/position_mse",
-        avg_val_loss,
-        prog_bar=True,
-        on_epoch=True,
-        sync_dist=True,
+def on_validation_epoch_end_func(self) -> None:
+    """Print validation summary and push epoch aggregates to WandB."""
+    cm = self.trainer.callback_metrics
+    epoch_loss = (
+        cm.get("val_epoch/combined")
+        or cm.get("val_epoch/combined_epoch")
+        or cm.get("val_loss/combined")
+        or cm.get("val_loss/combined_epoch")
     )
-    self.log(
-        "val_loss/absolute_rssd",
-        absolute_rssds,
-        prog_bar=True,
-        on_epoch=True,
-        sync_dist=True,
-    )
+    if epoch_loss is not None:
+        try:
+            print(
+                f"[Val epoch {self.current_epoch}] Loss: {float(epoch_loss):.6f}",
+                flush=True,
+            )
+        except (TypeError, ValueError):
+            print(
+                f"[Val epoch {self.current_epoch}] Loss: {epoch_loss}",
+                flush=True,
+            )
 
-    self.validation_step_outputs.clear()
-
-    # Optionally, log to WandB or other loggers
     if wandb.run:
-        wandb.log({"val_loss/position_mse": avg_val_loss.item()})
-        wandb.log({"val_loss/absolute_rssd": absolute_rssds.item()})
+        wandb_log = {}
+        for key, value in cm.items():
+            key_str = str(key)
+            if key_str.startswith("val_loss/") or key_str.startswith("val_epoch/"):
+                try:
+                    wandb_log[key_str] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        if wandb_log:
+            wandb.log(wandb_log, commit=False)

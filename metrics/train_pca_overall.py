@@ -140,17 +140,16 @@ class SlidePCALoss(nn.Module):
             return zero, None
 
         loss = torch.stack(losses).mean()
-        if train_stage:
-            self._last_loss = float(loss.detach().item())
-            self._last_anisotropy = float(
-                torch.stack(aniso_terms).mean().detach().item()
-            )
-            self._last_omnivariance = float(
-                torch.stack(omni_terms).mean().detach().item()
-            )
-            self._last_linearity = float(
-                torch.stack(lin_terms).mean().detach().item()
-            )
+        self._last_loss = float(loss.detach().item())
+        self._last_anisotropy = float(
+            torch.stack(aniso_terms).mean().detach().item()
+        )
+        self._last_omnivariance = float(
+            torch.stack(omni_terms).mean().detach().item()
+        )
+        self._last_linearity = float(
+            torch.stack(lin_terms).mean().detach().item()
+        )
 
         to_log: Optional[Dict[str, float]] = None
         if log:
@@ -168,10 +167,11 @@ class SlidePCALoss(nn.Module):
     def reset(self) -> None:
         pass
 
-    def log_epoch_metrics(self) -> Dict[str, float]:
+    def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
+        epoch_prefix = "train_epoch" if train_stage else "val_epoch"
         return {
-            "train_epoch/slide_pca": float(self._last_loss),
-            "train_epoch/slide_pca_anisotropy": float(self._last_anisotropy),
-            "train_epoch/slide_pca_omnivariance": float(self._last_omnivariance),
-            "train_epoch/slide_pca_linearity": float(self._last_linearity),
+            f"{epoch_prefix}/slide_pca": float(self._last_loss),
+            f"{epoch_prefix}/slide_pca_anisotropy": float(self._last_anisotropy),
+            f"{epoch_prefix}/slide_pca_omnivariance": float(self._last_omnivariance),
+            f"{epoch_prefix}/slide_pca_linearity": float(self._last_linearity),
         }

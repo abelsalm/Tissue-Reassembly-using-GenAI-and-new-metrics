@@ -178,8 +178,7 @@ class CombinedTrainLoss(nn.Module):
                 log=log,
             )
             loss = loss + self.neighborhood_weight * n_loss
-            if train_stage:
-                self._last_neighborhood = float(n_loss.detach().item())
+            self._last_neighborhood = float(n_loss.detach().item())
             if log and n_log:
                 to_log.update(n_log)
 
@@ -192,8 +191,7 @@ class CombinedTrainLoss(nn.Module):
                 batch_idx=batch_idx,
             )
             loss = loss + self.ch_weight * c_loss
-            if train_stage:
-                self._last_ch = float(c_loss.detach().item())
+            self._last_ch = float(c_loss.detach().item())
             if log and c_log:
                 to_log.update(c_log)
 
@@ -205,8 +203,7 @@ class CombinedTrainLoss(nn.Module):
                 log=log,
             )
             loss = loss + p_loss
-            if train_stage:
-                self._last_pca = float(p_loss.detach().item())
+            self._last_pca = float(p_loss.detach().item())
             if log and p_log:
                 to_log.update(p_log)
 
@@ -218,13 +215,11 @@ class CombinedTrainLoss(nn.Module):
                 log=log,
             )
             loss = loss + self.directional_weight * d_loss
-            if train_stage:
-                self._last_directional = float(d_loss.detach().item())
+            self._last_directional = float(d_loss.detach().item())
             if log and d_log:
                 to_log.update(d_log)
 
-        if train_stage:
-            self._last_loss = float(loss.detach().item())
+        self._last_loss = float(loss.detach().item())
 
         if log:
             prefix = "train_loss" if train_stage else "val_loss"
@@ -248,18 +243,29 @@ class CombinedTrainLoss(nn.Module):
         if self.directional is not None and hasattr(self.directional, "reset"):
             self.directional.reset()
 
-    def log_epoch_metrics(self) -> Dict[str, float]:
+    def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
+        epoch_prefix = "train_epoch" if train_stage else "val_epoch"
         to_log: Dict[str, float] = {
-            "train_epoch/combined": float(self._last_loss),
+            f"{epoch_prefix}/combined": float(self._last_loss),
         }
-        if self.neighborhood is not None:
-            to_log.update(self.neighborhood.log_epoch_metrics())
-        if self.ch is not None:
-            to_log.update(self.ch.log_epoch_metrics())
+        if self.neighborhood is not None and self.neighborhood_weight != 0.0:
+            to_log[f"{epoch_prefix}/neighborhood"] = float(self._last_neighborhood)
+            to_log.update(self.neighborhood.log_epoch_metrics(train_stage=train_stage))
+        if self.ch is not None and self.ch_weight != 0.0:
+            to_log[f"{epoch_prefix}/ch_auc"] = float(self._last_ch)
+            to_log.update(self.ch.log_epoch_metrics(train_stage=train_stage))
         if self.pca is not None:
-            to_log.update(self.pca.log_epoch_metrics())
-        if self.directional is not None and hasattr(self.directional, "log_epoch_metrics"):
-            to_log.update(self.directional.log_epoch_metrics())
+            to_log[f"{epoch_prefix}/pca"] = float(self._last_pca)
+            to_log.update(self.pca.log_epoch_metrics(train_stage=train_stage))
+        if (
+            self.directional is not None
+            and self.directional_weight != 0.0
+            and hasattr(self.directional, "log_epoch_metrics")
+        ):
+            to_log[f"{epoch_prefix}/directional"] = float(self._last_directional)
+            to_log.update(
+                self.directional.log_epoch_metrics(train_stage=train_stage)
+            )
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log

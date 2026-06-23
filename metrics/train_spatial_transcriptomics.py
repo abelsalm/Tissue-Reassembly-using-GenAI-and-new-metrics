@@ -521,11 +521,10 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
 
         # Cache scalars for log_epoch_metrics (Lightning aggregates these
         # into a single per-epoch metric via on_epoch=True).
-        if train_stage:
-            self._last_transcriptome = float(transcriptome_term.detach().item())
-            self._last_density = float(density_term.detach().item())
-            self._last_global_transcriptome = float(global_term.detach().item())
-            self._last_loss = float(loss.detach().item())
+        self._last_transcriptome = float(transcriptome_term.detach().item())
+        self._last_density = float(density_term.detach().item())
+        self._last_global_transcriptome = float(global_term.detach().item())
+        self._last_loss = float(loss.detach().item())
 
         to_log: Optional[Dict[str, float]] = None
         if log:
@@ -569,8 +568,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         carried across the epoch boundary (overwritten by next forward)."""
         pass
 
-    def log_epoch_metrics(self) -> Dict[str, float]:
-        """Expose the last-step components under ``train_epoch/...`` keys.
+    def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
+        """Expose the last-step components under ``train_epoch/...`` or ``val_epoch/...`` keys.
 
         Per-step call from ``training_step_func`` + ``on_epoch=True`` in
         ``log_dict`` makes Lightning average each key over the epoch.
@@ -578,15 +577,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         global-transcriptome breakdown -- useful for monitoring which side
         dominates.
         """
+        epoch_prefix = "train_epoch" if train_stage else "val_epoch"
         to_log = {
-            "train_epoch/neighborhood_multi_radius": float(self._last_loss),
-            "train_epoch/neighborhood_multi_radius_transcriptome": float(
+            f"{epoch_prefix}/whole_neighborhood_multi_radius": float(self._last_loss),
+            f"{epoch_prefix}/neighborhood_multi_radius_avg": float(
                 self._last_transcriptome
             ),
-            "train_epoch/neighborhood_multi_radius_density": float(
-                self._last_density
-            ),
-            "train_epoch/neighborhood_multi_radius_global_transcriptome": float(
+            f"{epoch_prefix}/neighborhood_multi_radius_global": float(
                 self._last_global_transcriptome
             ),
         }

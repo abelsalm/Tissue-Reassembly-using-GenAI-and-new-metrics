@@ -1,7 +1,7 @@
 import pytorch_lightning as pl
 import torch
 from metrics.train_loss import CombinedTrainLoss
-from metrics.loss_function import LossFunction
+from metrics.test_vanilla_loss import LossFunction
 from models.model import Model
 from utils.data.dataholder import DataHolder
 from utils.data.misc import setup_wandb
@@ -44,7 +44,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
         self.train_loss = CombinedTrainLoss(cfg.train)
-        self.val_loss = LossFunction()
+        self.vanilla_val_loss = LossFunction()
 
         self.model = Model(
             input_dims=self.input_dims,
