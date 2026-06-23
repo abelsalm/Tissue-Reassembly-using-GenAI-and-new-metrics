@@ -1,11 +1,6 @@
 import pytorch_lightning as pl
 import torch
-## HERE ADD NEW LOSS
-from metrics.loss_function_plus import (
-    MultiRadiusNeighborhoodLoss,
-    MultiRadiusSlideCombinedLoss,
-    SlidePointCloudMetricLoss,
-)
+from metrics.train_loss import CombinedTrainLoss
 from metrics.loss_function import LossFunction
 from models.model import Model
 from utils.data.dataholder import DataHolder
@@ -48,102 +43,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.dataset_infos = dataset_infos
         self.input_dims = dataset_infos.input_dims
         self.output_dims = dataset_infos.output_dims
-        if cfg.train.loss_type == "neighborhood_multi_radius":
-            # Multi-radius neighborhood loss combining (a) the
-            # transcriptome RMSE evaluated at each radius in
-            # ``multi_radius_radii`` and (b) the log-density difference at
-            # each radius. ``density_weight`` rescales the density term
-            # relative to the transcriptome term; see
-            # ``MultiRadiusNeighborhoodLoss`` for the exact aggregation.
-            self.train_loss = MultiRadiusNeighborhoodLoss(
-                radii=list(cfg.train.multi_radius_radii),
-                density_weight=getattr(cfg.train, "multi_radius_density_weight", 1.0),
-                global_transcriptome_weight=getattr(
-                    cfg.train, "multi_radius_global_transcriptome_weight", 0.0
-                ),
-                loss_radius_scale=getattr(
-                    cfg.train, "multi_radius_loss_radius_scale", 512.0
-                ),
-                transcriptome_tolerance=getattr(
-                    cfg.train, "multi_radius_transcriptome_tolerance", 0.05
-                ),
-                transcriptome_tolerance_gate_beta=getattr(
-                    cfg.train, "multi_radius_transcriptome_tolerance_soft_beta", 256.0
-                ),
-                transcriptome_tolerance_warmup_epochs=int(
-                    getattr(
-                        cfg.train,
-                        "multi_radius_transcriptome_tolerance_warmup_epochs",
-                        100,
-                    )
-                ),
-                soft_beta=getattr(cfg.train, "multi_radius_soft_beta", None),
-                eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
-                include_self=getattr(cfg.train, "multi_radius_include_self", True),
-            )
-        elif cfg.train.loss_type == "neighborhood_multi_radius_slide":
-            neighborhood = MultiRadiusNeighborhoodLoss(
-                radii=list(cfg.train.multi_radius_radii),
-                density_weight=getattr(cfg.train, "multi_radius_density_weight", 1.0),
-                global_transcriptome_weight=getattr(
-                    cfg.train, "multi_radius_global_transcriptome_weight", 0.0
-                ),
-                loss_radius_scale=getattr(
-                    cfg.train, "multi_radius_loss_radius_scale", 512.0
-                ),
-                transcriptome_tolerance=getattr(
-                    cfg.train, "multi_radius_transcriptome_tolerance", 0.05
-                ),
-                transcriptome_tolerance_gate_beta=getattr(
-                    cfg.train, "multi_radius_transcriptome_tolerance_soft_beta", 256.0
-                ),
-                transcriptome_tolerance_warmup_epochs=int(
-                    getattr(
-                        cfg.train,
-                        "multi_radius_transcriptome_tolerance_warmup_epochs",
-                        100,
-                    )
-                ),
-                soft_beta=getattr(cfg.train, "multi_radius_soft_beta", None),
-                eps=getattr(cfg.train, "multi_radius_eps", 1e-6),
-                include_self=getattr(cfg.train, "multi_radius_include_self", True),
-            )
-            slide = SlidePointCloudMetricLoss(
-                ch_auc_weight=getattr(cfg.train, "slide_ch_auc_weight", 1.0),
-                anisotropy_weight=getattr(
-                    cfg.train, "slide_pca_anisotropy_weight", 1.0
-                ),
-                omnivariance_weight=getattr(
-                    cfg.train, "slide_pca_omnivariance_weight", 1.0
-                ),
-                linearity_weight=getattr(
-                    cfg.train, "slide_pca_linearity_weight", 1.0
-                ),
-                radii=list(cfg.train.slide_ch_radii),
-                grid_resolution=int(
-                    getattr(cfg.train, "slide_ch_grid_resolution", 512)
-                ),
-                kappa=getattr(cfg.train, "slide_ch_kappa", 0.5),
-                soft_max_beta=getattr(cfg.train, "slide_ch_soft_max_beta", 32.0),
-                support_factor=getattr(cfg.train, "slide_ch_support_factor", 8),
-                landscape_chunk_size=getattr(
-                    cfg.train, "slide_ch_landscape_chunk_size", 128
-                ),
-                square_bbox=getattr(cfg.train, "slide_ch_square_bbox", True),
-                margin=getattr(cfg.train, "slide_ch_margin", 0.01),
-                eps=getattr(cfg.train, "slide_ch_eps", 1e-6),
-                min_cells=int(getattr(cfg.train, "slide_min_cells", 10)),
-                cache_gt=getattr(cfg.train, "slide_ch_cache_gt", True),
-            )
-            self.train_loss = MultiRadiusSlideCombinedLoss(
-                neighborhood=neighborhood,
-                slide=slide,
-                neighborhood_weight=getattr(
-                    cfg.train, "slide_neighborhood_weight", 1.0
-                ),
-            )
-        else:
-            raise ValueError(f"Unsupported train loss_type: {cfg.train.loss_type}")
+        self.train_loss = CombinedTrainLoss(cfg.train)
         self.val_loss = LossFunction()
 
         self.model = Model(

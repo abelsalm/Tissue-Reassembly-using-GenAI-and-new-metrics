@@ -32,22 +32,12 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
 
     pred = self.forward(z_t)
 
-    # Compute the training loss. ``batch_idx=i`` lets the slide sub-loss
-    # cache its GT-side energies per (batch_idx, sample_idx) and skip
-    # recomputing the constant target-side fields every step.
-    if self.train_loss.__class__.__name__ == "MultiRadiusSlideCombinedLoss":
-        loss, tl_log_dict = self.train_loss(
-            masked_pred=pred,
-            masked_true=batched_data,
-            log=i % self.log_every_steps == 0,
-            batch_idx=i,
-        )
-    else:
-        loss, tl_log_dict = self.train_loss(
-            masked_pred=pred,
-            masked_true=batched_data,
-            log=i % self.log_every_steps == 0,
-        )
+    loss, tl_log_dict = self.train_loss(
+        masked_pred=pred,
+        masked_true=batched_data,
+        log=i % self.log_every_steps == 0,
+        batch_idx=i,
+    )
 
     # Log the training loss and metrics if available
     if tl_log_dict is not None:
@@ -78,12 +68,10 @@ def on_train_epoch_end_func(self) -> None:
     # used in ``log_dict``. Multi-radius-slide keys come first (the
     # combined loss), then the plain multi-radius keys.
     epoch_loss = (
-        cm.get("train_epoch/neighborhood_multi_radius_slide")
-        or cm.get("train_epoch/neighborhood_multi_radius_slide_epoch")
-        or cm.get("train_loss/neighborhood_multi_radius_slide")
+        cm.get("train_epoch/combined")
+        or cm.get("train_epoch/combined_epoch")
+        or cm.get("train_epoch/neighborhood_multi_radius_slide")
         or cm.get("train_epoch/neighborhood_multi_radius")
-        or cm.get("train_epoch/neighborhood_multi_radius_epoch")
-        or cm.get("train_loss/neighborhood_multi_radius")
     )
     if epoch_loss is not None:
         try:

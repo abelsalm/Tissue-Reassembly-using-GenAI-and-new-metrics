@@ -94,13 +94,16 @@ def build_continuous_landscapes_multi_radius(
     support_factor: float = 10.0,
     chunk: int = 256,
 ) -> torch.Tensor:
-    """Build CH landscapes for all ``radii`` in one pass over cell chunks.
+    """Build CH landscapes for all ``radii`` over cell chunks.
 
-    Returns ``phi`` of shape ``[R, ny, nx]``. Distances from each cell to
-    its local grid patch are computed **once** per chunk and reused for
-    every radius; bump parameters and support masks are broadcast over the
-    radius axis. Energy integration can then call
-    :func:`cahn_hilliard_energy` once on the stacked field.
+    Returns ``phi`` of shape ``[R, ny, nx]``. Each radius uses its **own**
+    local grid patch sized to that radius' support (``support_factor * r``).
+    This is numerically identical to using one shared max-radius patch and
+    masking each radius down to its support disk -- but it avoids evaluating
+    the bump / soft-max on grid cells that the smaller radii would discard
+    anyway, which is the bulk of the wasted work when the radii span a wide
+    range. Energy integration can then call :func:`cahn_hilliard_energy`
+    once on the stacked field.
     """
     device = positions.device
     dtype = positions.dtype
@@ -118,21 +121,22 @@ def build_continuous_landscapes_multi_radius(
     bump_kwargs = dict(bump_kwargs or {})
     chunk = max(1, int(chunk))
 
-    # Size local patches for the largest support so every radius fits.
-    max_radius = max(radii_f)
-    support_max = float(support_factor) * max_radius
     dx_grid = abs(float((grid_x[1] - grid_x[0]).detach().item())) if nx > 1 else 1.0
     dy_grid = abs(float((grid_y[1] - grid_y[0]).detach().item())) if ny > 1 else 1.0
-    half_x = min(nx - 1, max(0, math.ceil(support_max / max(dx_grid, 1e-12)) + 1))
-    half_y = min(ny - 1, max(0, math.ceil(support_max / max(dy_grid, 1e-12)) + 1))
-    offset_x = torch.arange(-half_x, half_x + 1, device=device)
-    offset_y = torch.arange(-half_y, half_y + 1, device=device)
-
-    radii_t = torch.tensor(radii_f, device=device, dtype=dtype)
-    supports = float(support_factor) * radii_t
     grid_size = ny * nx
+    beta = float(soft_max_beta)
+    use_fast_sigmoid = (bump_fn is sigmoid_bump) and not bump_kwargs
 
-    def local_patch_bumps(pts_chunk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def patch_bumps(
+        pts_chunk: torch.Tensor, rad_k: float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Flat grid indices + support-masked bump for one radius' patch."""
+        support_k = float(support_factor) * rad_k
+        half_x = min(nx - 1, max(0, math.ceil(support_k / max(dx_grid, 1e-12)) + 1))
+        half_y = min(ny - 1, max(0, math.ceil(support_k / max(dy_grid, 1e-12)) + 1))
+        offset_x = torch.arange(-half_x, half_x + 1, device=device)
+        offset_y = torch.arange(-half_y, half_y + 1, device=device)
+
         centers_x = torch.round(
             (pts_chunk[:, 0].detach() - grid_x[0]) / max(dx_grid, 1e-12)
         ).long().clamp(0, nx - 1)
@@ -152,62 +156,49 @@ def build_continuous_landscapes_multi_radius(
         dy = gy - pts_chunk[:, 1, None, None]
         r = torch.sqrt(dx * dx + dy * dy)
 
-        # Broadcast distances over radii; bump params vary per radius.
-        r_exp = r.unsqueeze(1)
-        rad = radii_t.view(1, n_radii, 1, 1)
-        decay = 4.0 / rad
-        shift = 128.0 * rad
-        if bump_fn is sigmoid_bump and not bump_kwargs:
-            bump = torch.sigmoid(-(decay * (r_exp - rad) - shift))
+        if use_fast_sigmoid:
+            bump = torch.sigmoid(-((4.0 / rad_k) * (r - rad_k) - 128.0 * rad_k))
         else:
-            bumps = []
-            for rad_k in radii_f:
-                bump_k = bump_fn(
-                    r,
-                    rad_k,
-                    decay_rate=4.0 / rad_k,
-                    shift=128.0 * rad_k,
-                    **bump_kwargs,
-                )
-                bumps.append(bump_k)
-            bump = torch.stack(bumps, dim=1)
-        support_mask = valid.unsqueeze(1) & (r_exp <= supports.view(1, n_radii, 1, 1))
+            bump = bump_fn(
+                r,
+                rad_k,
+                decay_rate=4.0 / rad_k,
+                shift=128.0 * rad_k,
+                **bump_kwargs,
+            )
+        support_mask = valid & (r <= support_k)
         bump = bump * support_mask.to(dtype)
 
         flat_idx = y_idx * nx + x_idx
         return flat_idx, bump
 
-    if combine == "soft_max":
-        beta = float(soft_max_beta)
-        acc = torch.ones(n_radii, grid_size, device=device, dtype=dtype)
-        for start in range(0, pts.shape[0], chunk):
-            flat_idx, bump = local_patch_bumps(pts[start:start + chunk])
-            values = torch.exp(beta * bump) * (bump > 0).to(dtype)
-            # flat_idx: [m, py, px]; bump: [m, R, py, px] -> scatter into [R, G].
-            idx = flat_idx.unsqueeze(1).expand(-1, n_radii, -1, -1)
-            idx = idx.permute(1, 0, 2, 3).reshape(n_radii, -1)
-            values = values.permute(1, 0, 2, 3).reshape(n_radii, -1)
-            acc.scatter_add_(1, idx, values)
-        soft_max_bump = torch.log(acc.reshape(n_radii, ny, nx)) / beta
-        phi = -1.0 + 2.0 * soft_max_bump
-    elif combine == "hard_max":
-        best = torch.zeros(n_radii, grid_size, device=device, dtype=dtype)
-        for start in range(0, pts.shape[0], chunk):
-            flat_idx, bump = local_patch_bumps(pts[start:start + chunk])
-            idx = flat_idx.unsqueeze(1).expand(-1, n_radii, -1, -1)
-            idx = idx.permute(1, 0, 2, 3).reshape(n_radii, -1)
-            bump_flat = bump.permute(1, 0, 2, 3).reshape(n_radii, -1)
-            best.scatter_reduce_(
-                1,
-                idx,
-                bump_flat,
-                reduce="amax",
-                include_self=True,
-            )
-        phi = -1.0 + 2.0 * best.reshape(n_radii, ny, nx)
-    else:
-        raise ValueError(f"unknown combine='{combine}'")
+    rows = []
+    for rad_k in radii_f:
+        if combine == "soft_max":
+            # Init accumulator at exp(beta * 0) = 1 so a grid cell with no
+            # contributing point degrades to soft-max value 0 -> phi = -1.
+            acc = torch.ones(grid_size, device=device, dtype=dtype)
+            for start in range(0, pts.shape[0], chunk):
+                flat_idx, bump = patch_bumps(pts[start:start + chunk], rad_k)
+                values = torch.exp(beta * bump) * (bump > 0).to(dtype)
+                acc.scatter_add_(0, flat_idx.reshape(-1), values.reshape(-1))
+            rows.append(torch.log(acc.reshape(ny, nx)) / beta)
+        elif combine == "hard_max":
+            best = torch.zeros(grid_size, device=device, dtype=dtype)
+            for start in range(0, pts.shape[0], chunk):
+                flat_idx, bump = patch_bumps(pts[start:start + chunk], rad_k)
+                best.scatter_reduce_(
+                    0,
+                    flat_idx.reshape(-1),
+                    bump.reshape(-1),
+                    reduce="amax",
+                    include_self=True,
+                )
+            rows.append(best.reshape(ny, nx))
+        else:
+            raise ValueError(f"unknown combine='{combine}'")
 
+    phi = -1.0 + 2.0 * torch.stack(rows, dim=0)
     return phi.clamp(-1.0, 1.0)
 
 
@@ -318,7 +309,7 @@ def compute_ch_energy_curve_from_points(
     return cahn_hilliard_energy(phi, dx, dy, kappa)
 
 
-def compute_neighborhood_avg_and_density_multi_radius(
+'''def compute_neighborhood_avg_and_density_multi_radius(
     positions: torch.Tensor,        # [B, N, D]
     features: torch.Tensor,         # [B, N, F]
     mask: torch.Tensor,             # [B, N] (bool / 0-1)
@@ -900,7 +891,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         }
         if wandb.run:
             wandb.log(to_log, commit=False)
-        return to_log
+        return to_log'''
 
 
 class SlidePointCloudMetricLoss(nn.Module):
@@ -1096,14 +1087,24 @@ class SlidePointCloudMetricLoss(nn.Module):
         else:
             ch_term = zero
 
-        from metrics.cell_types_metrics import compute_slide_pointcloud_pca_descriptors
+        # Skip the PCA branch entirely when none of its terms are weighted
+        # (avoids two whole-slide PCA passes per step, and the import, when
+        # the descriptors are unused).
+        pca_weight = (
+            self.anisotropy_weight + self.omnivariance_weight + self.linearity_weight
+        )
+        gt_pca = pred_pca = None
+        if pca_weight != 0.0:
+            from metrics.cell_types_metrics import (
+                compute_slide_pointcloud_pca_descriptors,
+            )
 
-        gt_pca = compute_slide_pointcloud_pca_descriptors(
-            true_pos, mask, min_cells=self.min_cells, eps=self.eps
-        )
-        pred_pca = compute_slide_pointcloud_pca_descriptors(
-            pred_pos, mask, min_cells=self.min_cells, eps=self.eps
-        )
+            gt_pca = compute_slide_pointcloud_pca_descriptors(
+                true_pos, mask, min_cells=self.min_cells, eps=self.eps
+            )
+            pred_pca = compute_slide_pointcloud_pca_descriptors(
+                pred_pos, mask, min_cells=self.min_cells, eps=self.eps
+            )
 
         if gt_pca is None or pred_pca is None:
             aniso_term = zero

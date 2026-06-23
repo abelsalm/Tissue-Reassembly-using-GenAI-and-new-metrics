@@ -1,3 +1,13 @@
+## Loss function for directional coherence of the spatial cells based on transcriptome distance and spatial direction
+
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import wandb
+
+from utils.data.dataholder import DataHolder
+
 """Directional coherence loss from transcriptome-weighted orientation averaging.
 
 For each sample we randomly subsample ``n_target`` cells. For every target
@@ -29,15 +39,6 @@ pairwise modulo-``pi`` axis-angle differences between target cells. Each
 pairwise term is weighted by the product of the two cells' ground-truth
 lengths.
 """
-
-from typing import Dict, Optional, Tuple
-
-import torch
-import torch.nn as nn
-import wandb
-
-from utils.data.dataholder import DataHolder
-
 
 def _spatial_soft_weights(
     dists: torch.Tensor,
