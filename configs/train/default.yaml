@@ -1,7 +1,13 @@
 n_epochs: 24000 # Number of epochs
 batch_size: 2 # Batch size for training
-lr: 8e-4 # Learning rate
+lr: 1e-3 # Learning rate (also default peak LR when lr_cosine_max is null).
 lr_warmup_epochs: 100 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
+# --- Cosine annealing with warm restarts (optional) -------------------------
+lr_cosine_warm_restarts: True # If True, use CosineAnnealingWarmRestarts (after warmup when lr_warmup_epochs > 0).
+lr_cosine_max: null # Peak LR eta_max per cycle; null = use ``lr``.
+lr_cosine_min: 1.0e-5 # Floor LR eta_min at the bottom of each cosine cycle.
+lr_cosine_period_epochs: 2000 # First cosine cycle length T_0 (epochs).
+lr_cosine_subsequent_cycle_mult: 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)

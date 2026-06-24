@@ -101,31 +101,78 @@ class FullDenoisingDiffusion(pl.LightningModule):
         return self.cfg.train.batch_size
 
     def configure_optimizers(self):
-        base_lr = float(self.cfg.train.lr)
-        n_warmup = int(getattr(self.cfg.train, "lr_warmup_epochs", 0))
-        start_lr = base_lr / n_warmup if n_warmup > 0 else base_lr
+        train = self.cfg.train
+        base_lr = float(train.lr)
+        n_warmup = int(getattr(train, "lr_warmup_epochs", 0))
+        use_cosine = bool(getattr(train, "lr_cosine_warm_restarts", False))
+
+        if use_cosine:
+            lr_max = float(getattr(train, "lr_cosine_max", None) or base_lr)
+            lr_min = float(getattr(train, "lr_cosine_min", 1e-6))
+            period = int(getattr(train, "lr_cosine_period_epochs", 50))
+            period_mult = int(
+                getattr(train, "lr_cosine_subsequent_cycle_mult", None)
+                or getattr(train, "lr_cosine_period_mult", 1)
+            )
+            if period < 1:
+                raise ValueError("lr_cosine_period_epochs must be >= 1.")
+            if period_mult < 1:
+                raise ValueError(
+                    "lr_cosine_subsequent_cycle_mult must be >= 1."
+                )
+            # LinearLR warmup scales from lr_max / n_warmup up to lr_max.
+            opt_lr = lr_max
+        else:
+            opt_lr = base_lr / n_warmup if n_warmup > 0 else base_lr
+
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=start_lr,
+            lr=opt_lr,
             amsgrad=True,
-            weight_decay=self.cfg.train.weight_decay,
+            weight_decay=train.weight_decay,
         )
-        if n_warmup <= 0:
+
+        if use_cosine:
+            cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer,
+                T_0=period,
+                T_mult=period_mult,
+                eta_min=lr_min,
+            )
+            if n_warmup > 0:
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=1.0 / float(n_warmup),
+                    end_factor=1.0,
+                    total_iters=n_warmup,
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[n_warmup],
+                )
+            else:
+                scheduler = cosine
+        elif n_warmup > 0:
+
+            def lr_lambda(epoch: int) -> float:
+                # Optimizer init lr = base_lr / n. Multiplier ramps 1 -> n over
+                # epochs 0 .. n-1 so training uses lr/n on epoch 0 and lr from
+                # epoch n onward.
+                if n_warmup <= 1:
+                    return float(n_warmup)
+                if epoch >= n_warmup - 1:
+                    return float(n_warmup)
+                return 1.0 + (float(epoch) / float(n_warmup - 1)) * (
+                    float(n_warmup) - 1.0
+                )
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lr_lambda
+            )
+        else:
             return {"optimizer": optimizer}
 
-        def lr_lambda(epoch: int) -> float:
-            # Optimizer init lr = base_lr / n. Multiplier ramps 1 -> n over
-            # epochs 0 .. n-1 so training uses lr/n on epoch 0 and lr from
-            # epoch n onward.
-            if n_warmup <= 1:
-                return float(n_warmup)
-            if epoch >= n_warmup - 1:
-                return float(n_warmup)
-            return 1.0 + (float(epoch) / float(n_warmup - 1)) * (
-                float(n_warmup) - 1.0
-            )
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
