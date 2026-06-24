@@ -79,6 +79,7 @@ class CombinedTrainLoss(nn.Module):
                     soft_beta=_get("multi_radius_soft_beta", default=None),
                     eps=float(_get("multi_radius_eps", default=1e-6)),
                     include_self=bool(_get("multi_radius_include_self", default=True)),
+                    cache_gt=bool(_get("neighborhood_cache_gt", default=True)),
                 )
             )
         else:
@@ -126,6 +127,7 @@ class CombinedTrainLoss(nn.Module):
                 ),
                 min_cells=int(_get("pca_min_cells", "slide_min_cells", 10)),
                 eps=float(_get("pca_eps", "slide_ch_eps", 1e-6)),
+                cache_gt=bool(_get("pca_cache_gt", default=False)),
             )
         else:
             self.pca = None
@@ -270,6 +272,7 @@ class CombinedTrainLoss(nn.Module):
             self.pca.reset()
         if self.directional is not None and hasattr(self.directional, "reset"):
             self.directional.reset()
+        self.clear_gt_cache()
 
     def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
         epoch_prefix = "train_epoch" if train_stage else "val_epoch"
@@ -313,6 +316,10 @@ class CombinedTrainLoss(nn.Module):
         return to_log
 
     def clear_gt_cache(self) -> None:
-        """Clear GT caches in sub-losses that cache them (e.g. CH AUC)."""
+        """Clear cached GT values in all sub-losses (e.g. after warp / rechunk)."""
+        if self.neighborhood is not None:
+            self.neighborhood.clear_gt_cache()
         if self.ch is not None:
             self.ch.clear_gt_cache()
+        if self.pca is not None:
+            self.pca.clear_gt_cache()

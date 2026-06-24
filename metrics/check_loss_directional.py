@@ -50,7 +50,7 @@ PRED_X_COL = "coord_X_test"
 PRED_Y_COL = "coord_Y_test"
 SECTION_COL = "cell_section"
 
-N_TARGET = 2048
+N_TARGET = 1024
 NEIGHBOR_RADIUS = 0.12
 COHERENCE_RADIUS = 0.1
 TRANS_BETA = 32.0

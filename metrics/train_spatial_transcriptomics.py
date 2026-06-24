@@ -8,6 +8,7 @@ import torch.nn as nn
 import wandb
 
 from utils.data.dataholder import DataHolder
+from metrics.gt_cache import cache_key_matches, gt_batch_cache_key
 
 
 def compute_neighborhood_avg_and_density_multi_radius(
@@ -307,6 +308,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         soft_beta: Optional[float] = None,
         eps: float = 1e-6,
         include_self: bool = True,
+        cache_gt: bool = False,
     ) -> None:
         super().__init__()
         if len(radii) < 1:
@@ -330,6 +332,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self.soft_beta = None if soft_beta is None else float(soft_beta)
         self.eps = float(eps)
         self.include_self = bool(include_self)
+        self.cache_gt = bool(cache_gt)
+        self._gt_cache: Dict = {}
         self.current_epoch: int = 0
         # Per-step caches surfaced through ``log_epoch_metrics``.
         self._last_loss: float = -1.0
@@ -387,6 +391,57 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
             return_neighborhood_sum=self.global_transcriptome_weight > 0.0,
         )
 
+    def clear_gt_cache(self) -> None:
+        self._gt_cache.clear()
+
+    def _get_cached_gt(
+        self,
+        masked_true: DataHolder,
+        device: torch.device,
+        dtype: torch.dtype,
+        use_global: bool,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        if not self.cache_gt:
+            return None
+        cache_key = gt_batch_cache_key(masked_true.cell_ID)
+        if cache_key is None:
+            return None
+        cached = self._gt_cache.get(cache_key)
+        if cached is None:
+            return None
+        if not cache_key_matches(masked_true.cell_ID, cached.get("cell_id")):
+            return None
+        gt_avg = cached["avg"].to(device=device, dtype=dtype)
+        gt_logd = cached["log_density"].to(device=device, dtype=dtype)
+        gt_sum = cached.get("neighborhood_sum")
+        if gt_sum is not None:
+            gt_sum = gt_sum.to(device=device, dtype=dtype)
+        elif use_global:
+            sum_w = torch.exp(gt_logd) - self.eps
+            gt_sum = gt_avg * sum_w.unsqueeze(-1).clamp_min(0.0)
+        return gt_avg, gt_logd, gt_sum
+
+    def _store_gt_cache(
+        self,
+        masked_true: DataHolder,
+        gt_avg: torch.Tensor,
+        gt_logd: torch.Tensor,
+        gt_sum: Optional[torch.Tensor],
+    ) -> None:
+        cache_key = gt_batch_cache_key(masked_true.cell_ID)
+        if cache_key is None:
+            return
+        entry = {
+            "cell_id": masked_true.cell_ID.detach()
+            if masked_true.cell_ID is not None
+            else None,
+            "avg": gt_avg.detach(),
+            "log_density": gt_logd.detach(),
+        }
+        if gt_sum is not None:
+            entry["neighborhood_sum"] = gt_sum.detach()
+        self._gt_cache[cache_key] = entry
+
     # ---------------- forward ----------------
 
     def forward(
@@ -406,11 +461,31 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         pred_xy = masked_pred.positions[..., :2]
         use_global = self.global_transcriptome_weight > 0.0
 
-        # ---- GT side: either reuse the cache or recompute under no_grad.
-        gt_provided = (
-            cached_gt_avg is not None and cached_gt_log_density is not None
+        cached_gt = self._get_cached_gt(
+            masked_true, node_features.device, node_features.dtype, use_global
         )
-        if not gt_provided:
+        if cached_gt is not None:
+            gt_avg, gt_logd, gt_sum = cached_gt
+        elif (
+            cached_gt_avg is not None and cached_gt_log_density is not None
+        ):
+            gt_avg = cached_gt_avg.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+            gt_logd = cached_gt_log_density.detach().to(
+                device=node_features.device, dtype=node_features.dtype
+            )
+            if use_global:
+                if cached_gt_neighborhood_sum is None:
+                    sum_w = torch.exp(gt_logd) - self.eps
+                    gt_sum = gt_avg * sum_w.unsqueeze(-1).clamp_min(0.0)
+                else:
+                    gt_sum = cached_gt_neighborhood_sum.detach().to(
+                        device=node_features.device, dtype=node_features.dtype
+                    )
+            else:
+                gt_sum = None
+        else:
             with torch.no_grad():
                 gt_avg, gt_logd, gt_sum = (
                     compute_neighborhood_avg_and_density_multi_radius(
@@ -422,24 +497,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
                         return_neighborhood_sum=use_global,
                     )
                 )
-        else:
-            gt_avg = cached_gt_avg.detach().to(
-                device=node_features.device, dtype=node_features.dtype
-            )
-            gt_logd = cached_gt_log_density.detach().to(
-                device=node_features.device, dtype=node_features.dtype
-            )
-            if use_global:
-                if cached_gt_neighborhood_sum is None:
-                    # Recover sum from avg and soft count: sum_f = avg * sum_w.
-                    sum_w = torch.exp(gt_logd) - self.eps
-                    gt_sum = gt_avg * sum_w.unsqueeze(-1).clamp_min(0.0)
-                else:
-                    gt_sum = cached_gt_neighborhood_sum.detach().to(
-                        device=node_features.device, dtype=node_features.dtype
-                    )
-            else:
-                gt_sum = None
+            if self.cache_gt:
+                self._store_gt_cache(masked_true, gt_avg, gt_logd, gt_sum)
 
         # ---- Pred side: features come from GT (we're learning positions,
         # not gene expressions), neighborhoods come from predicted xys.
@@ -564,9 +623,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         return loss, to_log
 
     def reset(self) -> None:
-        """No running state; the last-loss caches are intentionally
-        carried across the epoch boundary (overwritten by next forward)."""
-        pass
+        """Clear GT cache; last-loss scalars are overwritten on next forward."""
+        self.clear_gt_cache()
 
     def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
         """Expose the last-step components under ``train_epoch/...`` or ``val_epoch/...`` keys.

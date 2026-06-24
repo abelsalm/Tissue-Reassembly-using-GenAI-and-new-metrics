@@ -231,13 +231,27 @@ def pairwise_axis_angles(
 
     The angle between two double-angle unit vectors is ``2 * delta`` where
     ``delta`` is the axis (mod ``pi``) angle difference, so we halve the
-    arccos. Vector magnitudes are normalised out, so the per-cell length does
-    not affect the angle.
+    full angle. Vector magnitudes are normalised out, so the per-cell length
+    does not affect the angle.
+
+    Uses ``atan2`` instead of ``acos`` so gradients stay finite when axes are
+    nearly parallel (``dot ~= +/-1``). Zero-norm axes (degenerate targets) are
+    masked out so ``atan2(0, 0)`` never runs.
     """
-    norms = axis_double.norm(dim=-1, keepdim=True).clamp_min(eps)
-    hat = axis_double / norms                                      # [B, T, 2]
-    cos2diff = torch.matmul(hat, hat.transpose(-1, -2)).clamp(-1.0, 1.0)
-    return 0.5 * torch.acos(cos2diff)
+    raw_norms = axis_double.norm(dim=-1, keepdim=True)
+    valid = raw_norms.squeeze(-1) > eps
+    norms = raw_norms.clamp_min(eps)
+    hat = axis_double / norms
+    hat = hat * valid.unsqueeze(-1).to(hat.dtype)
+
+    dot = torch.matmul(hat, hat.transpose(-1, -2)).clamp(-1.0, 1.0)
+    x = hat[..., 0]
+    y = hat[..., 1]
+    cross = x.unsqueeze(2) * y.unsqueeze(1) - y.unsqueeze(2) * x.unsqueeze(1)
+    angles = 0.5 * torch.atan2(cross.abs(), dot.clamp_min(eps))
+
+    pair_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
+    return torch.where(pair_valid, angles, torch.zeros_like(angles))
 
 
 def compute_directional_features(

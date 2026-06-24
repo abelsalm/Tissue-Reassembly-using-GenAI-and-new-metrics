@@ -60,7 +60,11 @@ class PositionsMLP(nn.Module):
         new_norm = self.mlp(norm)  # bs, n, 1
         new_pos = pos * new_norm / (norm + self.eps)
 
-        new_pos = new_pos * node_mask.unsqueeze(-1)
+        # Zero padding with ``where`` (not ``* mask``) so NaNs on active nodes
+        # do not propagate to padding slots via ``nan * 0 == nan``.
+        new_pos = torch.where(
+            node_mask.unsqueeze(-1), new_pos, torch.zeros_like(new_pos)
+        )
         new_pos = remove_mean_with_mask(new_pos, node_mask)
         return new_pos
 

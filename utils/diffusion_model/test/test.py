@@ -7,8 +7,8 @@ import numpy as np
 import pandas as pd
 import wandb
 import torch
-from metrics.evaluation_plot import plot_scatter_visualization
-from metrics.evaluation_statistics import (
+from metrics.test_evaluation_plot import plot_scatter_visualization
+from metrics.test_evaluation_statistics import (
     compute_contact,
     compute_RSSD,
     align_point_clouds,

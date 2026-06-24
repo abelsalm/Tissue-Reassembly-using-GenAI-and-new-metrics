@@ -7,6 +7,7 @@ import torch.nn as nn
 import wandb
 
 from utils.data.dataholder import DataHolder
+from metrics.gt_cache import cache_key_matches, gt_batch_cache_key, gt_row_cache_key
 
 
 def compute_slide_pointcloud_pca_descriptors(
@@ -76,6 +77,7 @@ class SlidePCALoss(nn.Module):
         linearity_weight: float = 1.0,
         min_cells: int = 10,
         eps: float = 1e-6,
+        cache_gt: bool = False,
     ) -> None:
         super().__init__()
         self.anisotropy_weight = float(anisotropy_weight)
@@ -83,10 +85,39 @@ class SlidePCALoss(nn.Module):
         self.linearity_weight = float(linearity_weight)
         self.min_cells = int(min_cells)
         self.eps = float(eps)
+        self.cache_gt = bool(cache_gt)
+        self._gt_cache: Dict = {}
         self._last_loss: float = -1.0
         self._last_anisotropy: float = -1.0
         self._last_omnivariance: float = -1.0
         self._last_linearity: float = -1.0
+
+    def clear_gt_cache(self) -> None:
+        self._gt_cache.clear()
+
+    def _cached_gt_descriptors(
+        self,
+        cell_id: Optional[torch.Tensor],
+        batch_idx: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self.cache_gt:
+            return None
+        cache_key = gt_row_cache_key(cell_id, batch_idx)
+        if cache_key is None:
+            return None
+        cached = self._gt_cache.get(cache_key)
+        if cached is None:
+            return None
+        cid_row = cell_id[batch_idx] if cell_id is not None and cell_id.dim() >= 2 else cell_id
+        if not cache_key_matches(cid_row, cached.get("cell_id")):
+            return None
+        return (
+            cached["anisotropy"].to(device=device, dtype=dtype),
+            cached["omnivariance"].to(device=device, dtype=dtype),
+            cached["linearity"].to(device=device, dtype=dtype),
+        )
 
     def forward(
         self,
@@ -105,10 +136,29 @@ class SlidePCALoss(nn.Module):
             mask_b = node_mask[b]
             zero = pred_positions[b].sum() * 0.0
 
-            gt_pca = compute_slide_pointcloud_pca_descriptors(
-                true_positions[b], mask_b,
-                min_cells=self.min_cells, eps=self.eps,
+            gt_pca = self._cached_gt_descriptors(
+                masked_true.cell_ID, b, pred_positions.device, pred_positions.dtype
             )
+            if gt_pca is None:
+                gt_pca = compute_slide_pointcloud_pca_descriptors(
+                    true_positions[b], mask_b,
+                    min_cells=self.min_cells, eps=self.eps,
+                )
+                if self.cache_gt and gt_pca is not None:
+                    cache_key = gt_row_cache_key(masked_true.cell_ID, b)
+                    if cache_key is not None:
+                        cid_row = (
+                            masked_true.cell_ID[b].detach()
+                            if masked_true.cell_ID is not None
+                            else None
+                        )
+                        gt_aniso, gt_omni, gt_lin = gt_pca
+                        self._gt_cache[cache_key] = {
+                            "cell_id": cid_row,
+                            "anisotropy": gt_aniso.detach(),
+                            "omnivariance": gt_omni.detach(),
+                            "linearity": gt_lin.detach(),
+                        }
             pred_pca = compute_slide_pointcloud_pca_descriptors(
                 pred_positions[b], mask_b,
                 min_cells=self.min_cells, eps=self.eps,
@@ -165,7 +215,7 @@ class SlidePCALoss(nn.Module):
         return loss, to_log
 
     def reset(self) -> None:
-        pass
+        self.clear_gt_cache()
 
     def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
         epoch_prefix = "train_epoch" if train_stage else "val_epoch"

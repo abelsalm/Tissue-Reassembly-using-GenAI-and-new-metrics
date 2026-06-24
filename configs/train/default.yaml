@@ -52,12 +52,18 @@ ch_grid_resolution: 512 # CH landscape grid resolution.
 ch_kappa: 0.5 # CH kappa.
 ch_soft_max_beta: 32.0 # Soft-max beta for landscape combination.
 ch_support_factor: 8 # Bump support factor.
-ch_landscape_chunk_size: 128 # Chunk size for landscape construction.
+ch_landscape_chunk_size: 2048 # Chunk size for landscape construction.
 ch_square_bbox: True # Use a square bounding box for the CH grid.
 ch_margin: 0.01 # Margin around the point cloud for the CH grid.
 ch_eps: 1.0e-6 # Numerical floor for CH AUC normalisation.
 ch_min_cells: 10 # Minimum masked cells required to compute CH / PCA metrics.
-ch_cache_gt: True # Cache GT CH AUC per sample (cleared each epoch).
+
+ch_cache_gt: True # Cache GT CH AUC (+ shared grid) per slide; cleared each epoch.
+# --- GT caching (lazy: first visit per slide/epoch, then reuse) ---------------
+# Invalidate automatically at epoch start (after optional position warp).
+neighborhood_cache_gt: True # Cache GT neighborhood avg / log-density / sums (~40%% faster).
+pca_cache_gt: True # Cache 3 GT PCA scalars per slide (cheap to recompute; enable if desired).
+# NO CACHING GT FOR DIRECTIONAL SINCE SUBSAMPLING
 # --- PCA parameters (only used when pca_weight > 0) ----
 pca_min_cells: 10 # Minimum masked cells required to compute PCA descriptors.
 pca_eps: 1.0e-6 # Numerical floor for PCA eigenvalue descriptors.

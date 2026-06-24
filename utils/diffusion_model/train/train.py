@@ -129,6 +129,10 @@ def on_train_epoch_start_func(self) -> None:
         elif hasattr(train_ds, "apply_epoch_warp"):
             train_ds.apply_epoch_warp(seed=self.current_epoch, enabled=False)
 
+    # Drop GT caches after warp/rechunk so losses recompute from updated GT coords.
+    if hasattr(self.train_loss, "clear_gt_cache"):
+        self.train_loss.clear_gt_cache()
+
     # Debug: print where a fixed cell_ID ended up after shuffling.
     dbg_every = getattr(self.cfg.train, "debug_print_shuffle_every_n_epochs", 0)
     if dbg_every > 0 and self.current_epoch % dbg_every == 0:

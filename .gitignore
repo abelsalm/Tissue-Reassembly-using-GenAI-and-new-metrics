@@ -29,3 +29,8 @@ results/*
 results/*/*
 ./results
 ./results/*
+
+lightning_logs
+lightning_logs/*
+./lightning_logs
+./lightning_logs/*
