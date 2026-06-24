@@ -1,8 +1,8 @@
 if_validate: True # If True, enable validation
 batch_size: 4 # Batch size for validation
 save_model_every_n_epochs: 1000 # For the case that if_validate is false. The frequency of saving model. 0 to disable.
-check_val_every_n_epochs: 12 # The frequency of running model validation. 0 to disable.
+check_val_every_n_epochs: 64 # The frequency of running model validation. 0 to disable.
 check_val_monitor: "val_epoch/combined" # The metric to monitor for model validation.
 save_top_k_models: 8 # The number of top models to save. 0 to disable.
 early_stopping: False # Enable early stopping
-early_stopping_patience: 128 # The number of epochs with no improvement after which training will be stopped.64
+early_stopping_patience: 2048 # The number of epochs with no improvement after which training will be stopped.64

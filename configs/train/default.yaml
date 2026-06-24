@@ -1,7 +1,7 @@
 n_epochs: 24000 # Number of epochs
 batch_size: 2 # Batch size for training
 lr: 8e-4 # Learning rate
-lr_warmup_epochs: 200 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
+lr_warmup_epochs: 100 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)
@@ -18,9 +18,9 @@ debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 #     + pca_weight                        * L_pca
 #     + directional_weight                * L_directional
 transcriptome_multi_radius_weight: 1.0 # Multi-radius neighborhood transcriptome loss.
-ch_weight: 0.1 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
-pca_weight: 0.1 # Whole-slide PCA shape-descriptor loss.
-directional_weight: 0.1 # Transcriptome-weighted local orientation coherence loss.
+ch_weight: 0 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
+pca_weight: 0 # Whole-slide PCA shape-descriptor loss.
+directional_weight: 0.05 # Transcriptome-weighted local orientation coherence loss.
 # --- Multi-radius neighborhood loss parameters (transcriptome_multi_radius_weight > 0) ----
 # Compares
 # neighborhood-averaged transcriptomes, log cell densities, and (optionally)
@@ -47,7 +47,7 @@ pca_anisotropy_weight: 1.0 # Relative weight of anisotropy term inside L_pca.
 pca_omnivariance_weight: 1.0 # Relative weight of omnivariance term inside L_pca.
 pca_linearity_weight: 1.0 # Relative weight of linearity term inside L_pca.
 # --- Cahn-Hilliard AUC parameters (only used when ch_weight > 0) ----
-ch_radii: [0.001, 0.0022857143, 0.0035714286, 0.0048571429, 0.0061428571, 0.0074285714, 0.0087142857, 0.01] # Radii for CH AUC integration.
+ch_radii: [0.002, 0.008, 0.016, 0.064, 0.128] # Radii for CH AUC integration.
 ch_grid_resolution: 512 # CH landscape grid resolution.
 ch_kappa: 0.5 # CH kappa.
 ch_soft_max_beta: 32.0 # Soft-max beta for landscape combination.
@@ -68,11 +68,11 @@ pca_cache_gt: True # Cache 3 GT PCA scalars per slide (cheap to recompute; enabl
 pca_min_cells: 10 # Minimum masked cells required to compute PCA descriptors.
 pca_eps: 1.0e-6 # Numerical floor for PCA eigenvalue descriptors.
 # --- Directional loss parameters (only used when directional_weight > 0) ----
-directional_n_target: 2000 # Number of target cells to subsample per batch item.
+directional_n_target: 1024 # Number of target cells to subsample per batch item.
 directional_neighbor_radius: 0.12 # Spatial radius for first-pass axis computation.
 directional_coherence_radius: 0.12 # Spatial radius for second-pass axis smoothing.
 directional_trans_beta: 32.0 # Transcriptomic decay rate (exp(-beta * d_trans)).
 directional_soft_beta: 256.0 # Sigmoid sharpness for soft spatial membership.
-directional_length_weight: 256.0 # Weight on per-cell axis-length matching.
-directional_pairwise_weight: 1.0 # Weight on pairwise axis-angle matching.
+directional_length_weight: 1.0 # Weight on per-cell axis-length matching.
+directional_pairwise_weight: 10e-2 # Weight on pairwise axis-angle matching.
 directional_min_valid_targets: 2 # Minimum valid targets before loss is skipped.
