@@ -1,11 +1,11 @@
-n_epochs: 24000 # Number of epochs
+n_epochs: 10000 # Number of epochs
 batch_size: 2 # Batch size for training
 lr: 1e-3 # Learning rate (also default peak LR when lr_cosine_max is null).
-lr_warmup_epochs: 100 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
+lr_warmup_epochs: 200 # Linear LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
 # --- Cosine annealing with warm restarts (optional) -------------------------
 lr_cosine_warm_restarts: True # If True, use CosineAnnealingWarmRestarts (after warmup when lr_warmup_epochs > 0).
 lr_cosine_max: null # Peak LR eta_max per cycle; null = use ``lr``.
-lr_cosine_min: 1.0e-5 # Floor LR eta_min at the bottom of each cosine cycle.
+lr_cosine_min: 1.0e-4 # Floor LR eta_min at the bottom of each cosine cycle.
 lr_cosine_period_epochs: 2000 # First cosine cycle length T_0 (epochs).
 lr_cosine_subsequent_cycle_mult: 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
@@ -23,10 +23,11 @@ debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 #     + ch_weight                         * L_ch_auc
 #     + pca_weight                        * L_pca
 #     + directional_weight                * L_directional
+other_trigger: 3500 # CH, PCA, and directional losses are forced to 0 until this epoch (0 = active from epoch 0).
 transcriptome_multi_radius_weight: 1.0 # Multi-radius neighborhood transcriptome loss.
 ch_weight: 0 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
 pca_weight: 0 # Whole-slide PCA shape-descriptor loss.
-directional_weight: 0.05 # Transcriptome-weighted local orientation coherence loss.
+directional_weight: 0.1 # Transcriptome-weighted local orientation coherence loss.
 # --- Multi-radius neighborhood loss parameters (transcriptome_multi_radius_weight > 0) ----
 # Compares
 # neighborhood-averaged transcriptomes, log cell densities, and (optionally)
@@ -75,10 +76,14 @@ pca_min_cells: 10 # Minimum masked cells required to compute PCA descriptors.
 pca_eps: 1.0e-6 # Numerical floor for PCA eigenvalue descriptors.
 # --- Directional loss parameters (only used when directional_weight > 0) ----
 directional_n_target: 1024 # Number of target cells to subsample per batch item.
-directional_neighbor_radius: 0.12 # Spatial radius for first-pass axis computation.
-directional_coherence_radius: 0.12 # Spatial radius for second-pass axis smoothing.
+directional_neighbor_radius: 0.16 # Spatial radius for first-pass axis computation.
+directional_coherence_radius: 0.08 # Spatial radius for second-pass axis smoothing.
 directional_trans_beta: 32.0 # Transcriptomic decay rate (exp(-beta * d_trans)).
 directional_soft_beta: 256.0 # Sigmoid sharpness for soft spatial membership.
-directional_length_weight: 1.0 # Weight on per-cell axis-length matching.
+directional_length_weight: 10.0 # Weight on per-cell axis-length matching.
 directional_pairwise_weight: 10e-2 # Weight on pairwise axis-angle matching.
 directional_min_valid_targets: 2 # Minimum valid targets before loss is skipped.
+directional_density_length_gate: False # If True, shorten pre-smoothing axis length for less-crowded-than-average neighborhoods (density-length gate).
+directional_density_length_beta: 8.0 # Sigmoid sharpness for the density-length gate (higher = sharper transition around the mean count).
+directional_density_radius_gate: False # If True, resize the first-radius neighborhood per cell (smaller radius for isolated cells; density-radius gate).
+directional_density_radius_beta: 32.0 # Sigmoid sharpness for the density-radius gate (higher = sharper transition around the mean count).

@@ -34,6 +34,22 @@ A second radius (``coherence_radius``) smooths these axes among target cells
 ``R`` -- dominate). The final per-cell *length* is the norm of the smoothed
 double-angle vector, and the per-cell *axis* is its (half-angle) argument.
 
+Optionally (``density_length_gate``) the first-radius axis length is rescaled
+*before* the second-radius smoothing using the local cell density: for each
+target we compute its soft-neighborhood cell count ``c_i``, the slice-wide
+mean count ``mu``, and a gate ``s_i = sigmoid(beta * (c_i - mu) / mu)`` that
+shrinks the axis in less-crowded-than-average neighborhoods. ``beta``
+(``density_length_beta``) controls how sharp the transition around the mean
+is.
+
+A second optional mode (``density_radius_gate``) uses the *same* density
+factor ``s_i`` not to rescale the length but to *resize the first-radius
+neighborhood*: we measure ``c_i`` and ``mu`` with the default radius, discard
+that neighborhood, set ``r_i = neighbor_radius * s_i`` (denser-than-average
+cells keep the default radius, isolated cells get a smaller one) and recompute
+stage 1 from scratch with these per-target radii. The smoothing radius stays
+scalar for everyone. ``density_radius_beta`` is the knob.
+
 The training loss matches predicted vs. ground-truth per-cell length and the
 pairwise modulo-``pi`` axis-angle differences between target cells. Each
 pairwise term is weighted by the product of the two cells' ground-truth
@@ -49,6 +65,106 @@ def _spatial_soft_weights(
     if soft_beta is None:
         return (dists <= float(radius)).to(dists.dtype)
     return torch.sigmoid(float(soft_beta) * (float(radius) - dists))
+
+
+def _spatial_soft_weights_per_target(
+    dists: torch.Tensor,           # [B, T, N]
+    radii: torch.Tensor,           # [B, T]
+    soft_beta: Optional[float],
+) -> torch.Tensor:
+    """Sigmoid (or hard) spatial membership with a per-target radius.
+
+    ``radii[b, i]`` is the membership radius for target ``i``; it is broadcast
+    against ``dists[b, i, j]`` so each target gets its own neighborhood size.
+    """
+    r = radii.to(dists.dtype).unsqueeze(-1)                          # [B, T, 1]
+    if soft_beta is None:
+        return (dists <= r).to(dists.dtype)
+    return torch.sigmoid(float(soft_beta) * (r - dists))
+
+
+def _neighborhood_counts(
+    positions_xy: torch.Tensor,   # [B, N, 2]
+    target_pos: torch.Tensor,     # [B, T, 2]
+    mask: torch.Tensor,           # [B, N]
+    target_idx: torch.Tensor,     # [B, T]
+    neighbor_radius: float,
+    soft_beta: Optional[float],
+    *,
+    include_self: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Soft neighborhood cell count per target, shape ``[B, T]``.
+
+    Sum of the spatial soft memberships (sigmoid inside ``neighbor_radius``)
+    over all valid cells, with the target itself optionally excluded. This is
+    a continuous proxy of "how crowded the local neighborhood is".
+    """
+    delta = positions_xy.unsqueeze(1) - target_pos.unsqueeze(2)     # [B, T, N, 2]
+    dists = torch.sqrt((delta * delta).sum(dim=-1).clamp_min(eps))  # [B, T, N]
+    w = _spatial_soft_weights(dists, neighbor_radius, soft_beta)
+    w = w * mask.to(w.dtype).unsqueeze(1)
+    if not include_self:
+        B, T, N = w.shape
+        self_oh = torch.zeros(B, T, N, device=w.device, dtype=w.dtype)
+        self_oh.scatter_(2, target_idx.unsqueeze(-1), 1.0)
+        w = w * (1.0 - self_oh)
+    return w.sum(dim=-1)                                            # [B, T]
+
+
+def _density_length_scale(
+    counts: torch.Tensor,           # [B, T] soft neighborhood counts
+    valid: torch.Tensor,            # [B, T] bool
+    *,
+    beta: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-target multiplicative scale ``s_i in (0, 1]`` for the first-radius axis length.
+
+    Computes the slice-wide mean neighborhood count ``mu`` (over valid targets,
+    per batch row), then for each target
+
+        s_i = sigmoid(beta * ((counts_i - mu) / mu))
+
+    so that ``s_i -> 1`` for denser-than-average neighborhoods and ``s_i -> 0``
+    for sparser-than-average ones. Multiplying the pre-smoothing axis length
+    by ``s_i`` therefore *shortens* the axis in less-crowded neighborhoods
+    before the second-radius smoothing runs, with ``beta`` controlling how
+    sharp the transition is.
+    """
+    counts_f = counts.to(torch.float32)
+    mu = _masked_mean(counts_f, valid, eps=eps)            # scalar mean over all valid targets
+    ratio = (counts_f - mu) / mu.clamp_min(eps)
+    scale = torch.sigmoid(float(beta) * ratio)             # [B, T] in (0, 1)
+    return scale
+
+
+def _density_radius_scale(
+    counts: torch.Tensor,           # [B, T] soft neighborhood counts
+    valid: torch.Tensor,            # [B, T] bool
+    base_radius: float,
+    *,
+    beta: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Per-target neighborhood radius for the density-radius gate.
+
+    Same density factor as :func:`_density_length_scale`,
+
+        s_i = sigmoid(beta * ((counts_i - mu) / mu))   in (0, 1),
+
+    but used to *resize the first-radius neighborhood* instead of rescaling the
+    axis length:
+
+        r_i = base_radius * s_i.
+
+    Denser-than-average cells (``counts_i > mu``) keep ``r_i -> base_radius``
+    (the default radius); more isolated cells (``counts_i < mu``) get a smaller
+    ``r_i -> 0``. The stage-1 soft membership is then recomputed with these
+    per-target radii. The smoothing radius stays scalar for everyone.
+    """
+    scale = _density_length_scale(counts, valid, beta=beta, eps=eps)
+    return float(base_radius) * scale
 
 
 def _transcriptome_distance(
@@ -128,6 +244,7 @@ def compute_orientation_axes(
     *,
     trans_beta: float = 1.0,
     soft_beta: Optional[float] = None,
+    per_target_radius: Optional[torch.Tensor] = None,  # [B, T] overrides neighbor_radius
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """First-radius local orientation axis per target cell (double-angle).
@@ -149,6 +266,9 @@ def compute_orientation_axes(
     ``(cos phi_i, sin phi_i)`` re-scaled by ``R_i`` and re-encoded in
     double-angle space -- so we return ``Z_i`` directly for the second stage.
 
+    If ``per_target_radius`` is given (shape ``[B, T]``), it overrides
+    ``neighbor_radius`` so each target uses its own membership radius.
+
     Returns:
         axis_double: ``[B, T, 2]`` -- the double-angle resultant ``Z_i``.
         valid: ``[B, T]`` bool -- targets with non-degenerate neighborhoods.
@@ -167,7 +287,10 @@ def compute_orientation_axes(
     z = torch.stack((cos2, sin2), dim=-1)                          # [B, T, N, 2]
 
     # Weights: spatial membership * transcriptome proximity * padding mask.
-    spatial_w = _spatial_soft_weights(dist, neighbor_radius, soft_beta)
+    if per_target_radius is None:
+        spatial_w = _spatial_soft_weights(dist, neighbor_radius, soft_beta)
+    else:
+        spatial_w = _spatial_soft_weights_per_target(dist, per_target_radius, soft_beta)
     trans_dist = _transcriptome_distance(features, target_idx, eps=eps)
     trans_w = torch.exp(-float(trans_beta) * trans_dist)
     weights = spatial_w * trans_w * mask.to(spatial_w.dtype).unsqueeze(1)
@@ -265,9 +388,29 @@ def compute_directional_features(
     *,
     trans_beta: float = 1.0,
     soft_beta: Optional[float] = None,
+    density_length_gate: bool = False,
+    density_length_beta: float = 4.0,
+    density_radius_gate: bool = False,
+    density_radius_beta: float = 4.0,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full directional pipeline for one side (pred or GT).
+
+    Two optional density-aware modes (mutually exclusive in practice):
+
+    * ``density_length_gate`` -- after stage 1, compute each target's
+      soft-neighborhood cell count, the slice-wide mean count, and a sigmoid
+      scale ``s_i = sigmoid(beta * (c_i - mu) / mu)`` that *shortens the
+      first-radius axis length* for less-crowded-than-average neighborhoods,
+      before the second-radius smoothing. ``density_length_beta`` is the knob.
+
+    * ``density_radius_gate`` -- compute the same density factor ``s_i`` but
+      use it to *resize the first-radius neighborhood* instead: discard the
+      initial soft neighborhood, set ``r_i = neighbor_radius * s_i`` (so
+      denser-than-average cells keep the default radius and isolated cells get
+      a smaller one), then recompute stage 1 from scratch with these
+      per-target radii. The smoothing radius (``coherence_radius``) stays
+      scalar for everyone. ``density_radius_beta`` is the knob.
 
     Returns:
         lengths: ``[B, T]`` -- final per-cell axis length (orientation
@@ -276,14 +419,48 @@ def compute_directional_features(
         valid: ``[B, T]`` bool mask for targets with a valid axis.
     """
     xy = positions[..., :2]
-    axis1, valid1 = compute_orientation_axes(
-        xy, features, mask, target_idx, target_valid,
-        neighbor_radius,
-        trans_beta=trans_beta,
-        soft_beta=soft_beta,
-        eps=eps,
-    )
     target_pos = _gather_positions(xy, target_idx)
+
+    if density_radius_gate:
+        # Measure density with the default radius, then rebuild a per-target
+        # radius r_i = neighbor_radius * sigmoid(beta * (c_i - mu) / mu).
+        counts = _neighborhood_counts(
+            xy, target_pos, mask, target_idx,
+            neighbor_radius, soft_beta,
+            include_self=False, eps=eps,
+        )
+        # Use target_valid as the validity mask for the mean (degenerate slots
+        # have count 0 and would otherwise drag mu down).
+        per_target_r = _density_radius_scale(
+            counts, target_valid, base_radius=neighbor_radius,
+            beta=density_radius_beta, eps=eps,
+        )
+        axis1, valid1 = compute_orientation_axes(
+            xy, features, mask, target_idx, target_valid,
+            neighbor_radius,
+            trans_beta=trans_beta,
+            soft_beta=soft_beta,
+            per_target_radius=per_target_r,
+            eps=eps,
+        )
+    else:
+        axis1, valid1 = compute_orientation_axes(
+            xy, features, mask, target_idx, target_valid,
+            neighbor_radius,
+            trans_beta=trans_beta,
+            soft_beta=soft_beta,
+            eps=eps,
+        )
+
+    if density_length_gate:
+        counts = _neighborhood_counts(
+            xy, target_pos, mask, target_idx,
+            neighbor_radius, soft_beta,
+            include_self=False, eps=eps,
+        )
+        scale = _density_length_scale(counts, valid1, beta=density_length_beta, eps=eps)
+        axis1 = axis1 * scale.unsqueeze(-1).to(axis1.dtype)
+
     axis2, valid2 = aggregate_axes_second_radius(
         target_pos, axis1, valid1,
         coherence_radius,
@@ -326,6 +503,10 @@ class DirectionalMetricLoss(nn.Module):
         length_weight: float = 1.0,
         pairwise_weight: float = 1.0,
         min_valid_targets: int = 2,
+        density_length_gate: bool = False,
+        density_length_beta: float = 4.0,
+        density_radius_gate: bool = False,
+        density_radius_beta: float = 4.0,
     ) -> None:
         super().__init__()
         self.n_target = int(n_target)
@@ -337,6 +518,10 @@ class DirectionalMetricLoss(nn.Module):
         self.length_weight = float(length_weight)
         self.pairwise_weight = float(pairwise_weight)
         self.min_valid_targets = int(min_valid_targets)
+        self.density_length_gate = bool(density_length_gate)
+        self.density_length_beta = float(density_length_beta)
+        self.density_radius_gate = bool(density_radius_gate)
+        self.density_radius_beta = float(density_radius_beta)
         self._last_loss: float = -1.0
         self._last_length: float = -1.0
         self._last_pairwise: float = -1.0
@@ -393,6 +578,10 @@ class DirectionalMetricLoss(nn.Module):
                 self.neighbor_radius, self.coherence_radius,
                 trans_beta=self.trans_beta,
                 soft_beta=self.soft_beta,
+                density_length_gate=self.density_length_gate,
+                density_length_beta=self.density_length_beta,
+                density_radius_gate=self.density_radius_gate,
+                density_radius_beta=self.density_radius_beta,
                 eps=self.eps,
             )
 
@@ -401,6 +590,10 @@ class DirectionalMetricLoss(nn.Module):
             self.neighbor_radius, self.coherence_radius,
             trans_beta=self.trans_beta,
             soft_beta=self.soft_beta,
+            density_length_gate=self.density_length_gate,
+            density_length_beta=self.density_length_beta,
+            density_radius_gate=self.density_radius_gate,
+            density_radius_beta=self.density_radius_beta,
             eps=self.eps,
         )
 

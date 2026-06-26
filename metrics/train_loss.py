@@ -28,6 +28,10 @@ class CombinedTrainLoss(nn.Module):
         * **directional_weight** — transcriptome-weighted local orientation
           coherence (``DirectionalMetricLoss``).
 
+    **other_trigger** — CH, PCA, and directional terms are forced to zero
+    (no forward compute) until ``current_epoch >= other_trigger``; configured
+    weights apply only from that epoch onward. ``0`` = active from epoch 0.
+
     A global weight of ``0`` disables that term entirely (no module init, no
     forward compute). Legacy ``slide_*`` / ``neighborhood_weight`` keys are
     still accepted as fallbacks.
@@ -146,9 +150,16 @@ class CombinedTrainLoss(nn.Module):
                 length_weight=float(_get("directional_length_weight", default=1.0)),
                 pairwise_weight=float(_get("directional_pairwise_weight", default=1.0)),
                 min_valid_targets=int(_get("directional_min_valid_targets", default=2)),
+                density_length_gate=bool(_get("directional_density_length_gate", default=False)),
+                density_length_beta=float(_get("directional_density_length_beta", default=4.0)),
+                density_radius_gate=bool(_get("directional_density_radius_gate", default=False)),
+                density_radius_beta=float(_get("directional_density_radius_beta", default=4.0)),
             )
         else:
             self.directional = None
+
+        self.other_trigger = int(_get("other_trigger", default=0))
+        self._current_epoch = 0
 
         # Shared caches for logging (raw unweighted sub-loss values)
         self._last_loss: float = -1.0
@@ -161,7 +172,11 @@ class CombinedTrainLoss(nn.Module):
     # Epoch tracking (forwarded to neighborhood for tolerance warmup)
     # ------------------------------------------------------------------ #
 
+    def _other_losses_active(self) -> bool:
+        return self._current_epoch >= self.other_trigger
+
     def set_current_epoch(self, epoch: int) -> None:
+        self._current_epoch = int(epoch)
         if self.neighborhood is not None and hasattr(self.neighborhood, "set_current_epoch"):
             self.neighborhood.set_current_epoch(epoch)
 
@@ -203,7 +218,7 @@ class CombinedTrainLoss(nn.Module):
                 to_log.update(n_log)
 
         # ---- CH AUC ----
-        if self.ch is not None and self.ch_weight != 0.0:
+        if self.ch is not None and self.ch_weight != 0.0 and self._other_losses_active():
             c_loss, c_log = self.ch(
                 masked_pred, masked_true,
                 train_stage=train_stage,
@@ -219,7 +234,7 @@ class CombinedTrainLoss(nn.Module):
                 to_log.update(c_log)
 
         # ---- PCA ----
-        if self.pca is not None and self.pca_weight != 0.0:
+        if self.pca is not None and self.pca_weight != 0.0 and self._other_losses_active():
             p_loss, p_log = self.pca(
                 masked_pred, masked_true,
                 train_stage=train_stage,
@@ -234,7 +249,11 @@ class CombinedTrainLoss(nn.Module):
                 to_log.update(p_log)
 
         # ---- Directional ----
-        if self.directional is not None and self.directional_weight != 0.0:
+        if (
+            self.directional is not None
+            and self.directional_weight != 0.0
+            and self._other_losses_active()
+        ):
             d_loss, d_log = self.directional(
                 masked_pred, masked_true,
                 train_stage=train_stage,
@@ -288,29 +307,36 @@ class CombinedTrainLoss(nn.Module):
             )
             to_log.update(self.neighborhood.log_epoch_metrics(train_stage=train_stage))
         if self.ch is not None and self.ch_weight != 0.0:
-            to_log[f"{epoch_prefix}/ch_auc"] = float(self._last_ch)
-            to_log[f"{epoch_prefix}/ch_auc_weighted"] = float(
-                self._last_ch * self.ch_weight
-            )
-            to_log.update(self.ch.log_epoch_metrics(train_stage=train_stage))
+            if self._other_losses_active():
+                to_log[f"{epoch_prefix}/ch_auc"] = float(self._last_ch)
+                to_log[f"{epoch_prefix}/ch_auc_weighted"] = float(
+                    self._last_ch * self.ch_weight
+                )
+                to_log.update(self.ch.log_epoch_metrics(train_stage=train_stage))
+            else:
+                to_log[f"{epoch_prefix}/ch_auc_weighted"] = 0.0
         if self.pca is not None and self.pca_weight != 0.0:
-            to_log[f"{epoch_prefix}/pca"] = float(self._last_pca)
-            to_log[f"{epoch_prefix}/pca_weighted"] = float(
-                self._last_pca * self.pca_weight
-            )
-            to_log.update(self.pca.log_epoch_metrics(train_stage=train_stage))
-        if (
-            self.directional is not None
-            and self.directional_weight != 0.0
-            and hasattr(self.directional, "log_epoch_metrics")
-        ):
-            to_log[f"{epoch_prefix}/directional"] = float(self._last_directional)
-            to_log[f"{epoch_prefix}/directional_weighted"] = float(
-                self._last_directional * self.directional_weight
-            )
-            to_log.update(
-                self.directional.log_epoch_metrics(train_stage=train_stage)
-            )
+            if self._other_losses_active():
+                to_log[f"{epoch_prefix}/pca"] = float(self._last_pca)
+                to_log[f"{epoch_prefix}/pca_weighted"] = float(
+                    self._last_pca * self.pca_weight
+                )
+                to_log.update(self.pca.log_epoch_metrics(train_stage=train_stage))
+            else:
+                to_log[f"{epoch_prefix}/pca_weighted"] = 0.0
+        if self.directional is not None and self.directional_weight != 0.0:
+            if self._other_losses_active() and hasattr(
+                self.directional, "log_epoch_metrics"
+            ):
+                to_log[f"{epoch_prefix}/directional"] = float(self._last_directional)
+                to_log[f"{epoch_prefix}/directional_weighted"] = float(
+                    self._last_directional * self.directional_weight
+                )
+                to_log.update(
+                    self.directional.log_epoch_metrics(train_stage=train_stage)
+                )
+            else:
+                to_log[f"{epoch_prefix}/directional_weighted"] = 0.0
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log

@@ -51,12 +51,17 @@ PRED_Y_COL = "coord_Y_test"
 SECTION_COL = "cell_section"
 
 N_TARGET = 1024
-NEIGHBOR_RADIUS = 0.12
-COHERENCE_RADIUS = 0.1
+NEIGHBOR_RADIUS = 0.16
+COHERENCE_RADIUS = 0.08
 TRANS_BETA = 32.0
 SOFT_BETA = 256.0
 EPS = 1e-6
+DENSITY_LENGTH_GATE = True  # Shorten pre-smoothing axis length for less-crowded-than-average neighborhoods.
+DENSITY_LENGTH_BETA = 8.0    # Sigmoid sharpness for the density-length gate.
+DENSITY_RADIUS_GATE = True  # Resize the first-radius neighborhood per cell (smaller radius for isolated cells).
+DENSITY_RADIUS_BETA = 32.0    # Sigmoid sharpness for the density-radius gate.
 TARGET_MEAN_ARROW_LENGTH = 0.04
+TISSUE_SCATTER_SIZE = 6
 LOSS_SEED = 0
 DTYPE = torch.float32
 
@@ -231,6 +236,10 @@ def compute_loss_target_viz_fields(
     coherence_radius: float,
     trans_beta: float,
     soft_beta: float | None,
+    density_length_gate: bool = False,
+    density_length_beta: float = 4.0,
+    density_radius_gate: bool = False,
+    density_radius_beta: float = 4.0,
     eps: float = EPS,
 ) -> dict[str, np.ndarray]:
     """Viz arrays for the exact ``n_target`` subsample used by the loss."""
@@ -238,25 +247,62 @@ def compute_loss_target_viz_fields(
         aggregate_axes_second_radius,
         compute_orientation_axes,
         _gather_positions,
+        _neighborhood_counts,
+        _density_length_scale,
+        _density_radius_scale,
     )
 
     xy = positions[..., :2]
+    target_pos = _gather_positions(xy, target_idx)
 
     # Stage 1: first-radius local orientation axis (double-angle resultant).
-    axis1_double, valid1 = compute_orientation_axes(
-        xy,
-        features,
-        mask,
-        target_idx,
-        target_valid,
-        neighbor_radius,
-        trans_beta=trans_beta,
-        soft_beta=soft_beta,
-        eps=eps,
-    )
+    if density_radius_gate:
+        counts = _neighborhood_counts(
+            xy, target_pos, mask, target_idx,
+            neighbor_radius, soft_beta,
+            include_self=False, eps=eps,
+        )
+        per_target_r = _density_radius_scale(
+            counts, target_valid, base_radius=neighbor_radius,
+            beta=density_radius_beta, eps=eps,
+        )
+        axis1_double, valid1 = compute_orientation_axes(
+            xy,
+            features,
+            mask,
+            target_idx,
+            target_valid,
+            neighbor_radius,
+            trans_beta=trans_beta,
+            soft_beta=soft_beta,
+            per_target_radius=per_target_r,
+            eps=eps,
+        )
+    else:
+        axis1_double, valid1 = compute_orientation_axes(
+            xy,
+            features,
+            mask,
+            target_idx,
+            target_valid,
+            neighbor_radius,
+            trans_beta=trans_beta,
+            soft_beta=soft_beta,
+            eps=eps,
+        )
+
+    if density_length_gate:
+        counts = _neighborhood_counts(
+            xy, target_pos, mask, target_idx,
+            neighbor_radius, soft_beta,
+            include_self=False, eps=eps,
+        )
+        scale = _density_length_scale(
+            counts, valid1, beta=density_length_beta, eps=eps,
+        )
+        axis1_double = axis1_double * scale.unsqueeze(-1).to(axis1_double.dtype)
 
     # Stage 2: second-radius smoothing among target cells.
-    target_pos = _gather_positions(xy, target_idx)
     axis2_double, valid2 = aggregate_axes_second_radius(
         target_pos,
         axis1_double,
@@ -313,12 +359,215 @@ def make_loss_arrow_plot_df(
     out["avg_dir_x"] = fields["avg_dir_x"]
     out["avg_dir_y"] = fields["avg_dir_y"]
     out["coherence"] = fields["coherence"]
+    out["line_length"] = out["coherence"]
     out["_arrow_u"] = out["pc1_x"]
     out["_arrow_v"] = out["pc1_y"]
     return out
 
 
-def draw_class_arrows(
+def _axis_double_angle_components(
+    u: np.ndarray,
+    v: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unit double-angle direction and smoothed-axis length from spatial axes."""
+    length = np.hypot(u, v)
+    safe = np.maximum(length, EPS)
+    cos2 = (u * u - v * v) / (safe * safe)
+    sin2 = (2.0 * u * v) / (safe * safe)
+    return cos2, sin2, length
+
+
+def weighted_circular_resultant(
+    cos2: np.ndarray,
+    sin2: np.ndarray,
+    weights: np.ndarray,
+) -> float:
+    """Weighted mean resultant length in [0, 1] (1 = aligned, 0 = dispersed)."""
+    weight_sum = float(weights.sum())
+    if weight_sum <= EPS:
+        return 0.0
+    w = weights / weight_sum
+    return float(np.hypot(np.sum(w * cos2), np.sum(w * sin2)))
+
+
+def _set_ylim_from_values(ax: plt.Axes, values: np.ndarray, *, pad_fraction: float = 0.1) -> None:
+    """Set y limits from data range with a small margin (not forced to [0, 1])."""
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return
+    ymin = float(vals.min())
+    ymax = float(vals.max())
+    if ymax <= ymin:
+        pad = max(abs(ymax), 1e-6) * pad_fraction
+        ax.set_ylim(ymin - pad, ymax + pad)
+        return
+    pad = (ymax - ymin) * pad_fraction
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+
+def slice_axis_alignment(arrow_df: pd.DataFrame) -> float:
+    """Slice-level axis alignment from smoothed axes (coherence-weighted)."""
+    cos2, sin2, length = _axis_double_angle_components(
+        arrow_df["avg_dir_x"].to_numpy(dtype=np.float64),
+        arrow_df["avg_dir_y"].to_numpy(dtype=np.float64),
+    )
+    return weighted_circular_resultant(cos2, sin2, length)
+
+
+def collect_slice_analysis_records(
+    slice_name: str,
+    true_arrow_df: pd.DataFrame,
+    pred_arrow_df: pd.DataFrame,
+) -> tuple[list[dict], list[dict]]:
+    """Build per-cell and per-slice-per-cell-type analysis records for one slice."""
+    per_cell: list[dict] = []
+    per_slice: list[dict] = []
+
+    for source, arrow_df in (("gt", true_arrow_df), ("pred", pred_arrow_df)):
+        for cell_class, class_df in arrow_df.groupby("cell_class", sort=False):
+            per_slice.append({
+                "slice_name": slice_name,
+                "source": source,
+                "cell_class": str(cell_class),
+                "mean_line_length": float(class_df["line_length"].mean()),
+                "axis_alignment": slice_axis_alignment(class_df),
+                "n_cells": int(len(class_df)),
+            })
+            for row in class_df.itertuples(index=False):
+                per_cell.append({
+                    "slice_name": slice_name,
+                    "source": source,
+                    "cell_class": str(cell_class),
+                    "line_length": float(row.line_length),
+                })
+
+    return per_cell, per_slice
+
+
+def _grouped_gt_pred_bars(
+    ax: plt.Axes,
+    summary: pd.DataFrame,
+    *,
+    ylabel: str,
+    title: str,
+    error_col: str | None = None,
+) -> None:
+    """Grouped GT/pred bar chart indexed by cell type."""
+    for source in ("gt", "pred"):
+        if source not in summary.columns:
+            summary[source] = np.nan
+    summary = summary.sort_index()
+
+    x = np.arange(len(summary))
+    bar_width = 0.35
+    gt_vals = summary["gt"].to_numpy(dtype=np.float64)
+    pred_vals = summary["pred"].to_numpy(dtype=np.float64)
+    gt_err = (
+        summary[f"gt_{error_col}"].to_numpy(dtype=np.float64)
+        if error_col and f"gt_{error_col}" in summary.columns
+        else None
+    )
+    pred_err = (
+        summary[f"pred_{error_col}"].to_numpy(dtype=np.float64)
+        if error_col and f"pred_{error_col}" in summary.columns
+        else None
+    )
+
+    ax.bar(
+        x - bar_width / 2,
+        gt_vals,
+        width=bar_width,
+        yerr=gt_err,
+        capsize=4 if gt_err is not None else 0,
+        label="Ground truth",
+        color="tab:blue",
+        alpha=0.85,
+    )
+    ax.bar(
+        x + bar_width / 2,
+        pred_vals,
+        width=bar_width,
+        yerr=pred_err,
+        capsize=4 if pred_err is not None else 0,
+        label="Prediction",
+        color="tab:orange",
+        alpha=0.85,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(summary.index, rotation=45, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+
+    ymax_candidates = [gt_vals, pred_vals]
+    if gt_err is not None:
+        ymax_candidates.append(gt_vals + np.nan_to_num(gt_err))
+    if pred_err is not None:
+        ymax_candidates.append(pred_vals + np.nan_to_num(pred_err))
+    _set_ylim_from_values(ax, np.concatenate(ymax_candidates))
+
+
+def save_analysis_png(
+    per_cell_df: pd.DataFrame,
+    per_slice_df: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Dataset-level analysis: line length and axis alignment by cell type."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    length_by_class = (
+        per_cell_df.groupby(["cell_class", "source"], as_index=False)["line_length"]
+        .mean()
+        .pivot(index="cell_class", columns="source", values="line_length")
+    )
+    _grouped_gt_pred_bars(
+        axes[0],
+        length_by_class,
+        ylabel="Mean smoothed axis length",
+        title="Mean line length by cell type\n(averaged across all slices)",
+    )
+
+    align_stats = (
+        per_slice_df.groupby(["cell_class", "source"])["axis_alignment"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+    align_stats["sem"] = align_stats["std"] / np.sqrt(align_stats["count"].clip(lower=1))
+    align_mean = align_stats.pivot(index="cell_class", columns="source", values="mean")
+    align_sem = align_stats.pivot(index="cell_class", columns="source", values="sem")
+    align_summary = align_mean.copy()
+    for source in ("gt", "pred"):
+        sem_col = f"{source}_sem"
+        if source in align_sem.columns:
+            align_summary[sem_col] = align_sem[source]
+        else:
+            align_summary[sem_col] = np.nan
+    _grouped_gt_pred_bars(
+        axes[1],
+        align_summary,
+        ylabel="Axis alignment",
+        title=(
+            "Axis alignment by cell type\n"
+            "per-slice weighted circular resultant, mean ± SEM across slices"
+        ),
+        error_col="sem",
+    )
+
+    n_slices = per_slice_df["slice_name"].nunique()
+    fig.suptitle(
+        f"Directional analysis — {n_slices} slices — "
+        f"smoothed axis (r={COHERENCE_RADIUS:.3g})",
+        fontsize=14,
+        y=1.02,
+    )
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+
+
+def draw_class_axis_bars(
     ax: plt.Axes,
     plot_df: pd.DataFrame,
     *,
@@ -327,27 +576,55 @@ def draw_class_arrows(
     scale: float,
     palette_dict: dict[str, tuple],
     uniques: list[str],
+    linewidth: float = 1.2,
 ) -> None:
+    """Draw short axis line segments centered on each cell (no arrow heads)."""
+    from matplotlib.collections import LineCollection
+
     for cell_class in uniques:
         sub = plot_df[plot_df["cell_class"] == cell_class]
         if sub.empty:
             continue
-        ax.quiver(
-            sub["plot_x"],
-            sub["plot_y"],
-            sub[u_col].to_numpy() * scale,
-            sub[v_col].to_numpy() * scale,
-            color=palette_dict[cell_class],
-            angles="xy",
-            scale_units="xy",
-            scale=1,
-            width=0.002,
-            headwidth=2.8,
-            headlength=4.2,
-            headaxislength=3.4,
-            minshaft=2.0,
-            zorder=2,
+        u = sub[u_col].to_numpy(dtype=np.float64) * scale
+        v = sub[v_col].to_numpy(dtype=np.float64) * scale
+        x = sub["plot_x"].to_numpy(dtype=np.float64)
+        y = sub["plot_y"].to_numpy(dtype=np.float64)
+        segments = np.stack(
+            [
+                np.stack([x - 0.5 * u, y - 0.5 * v], axis=-1),
+                np.stack([x + 0.5 * u, y + 0.5 * v], axis=-1),
+            ],
+            axis=1,
         )
+        ax.add_collection(
+            LineCollection(
+                segments,
+                colors=palette_dict[cell_class],
+                linewidths=linewidth,
+                zorder=2,
+            )
+        )
+
+
+def draw_class_scatter(
+    ax: plt.Axes,
+    plot_df: pd.DataFrame,
+    *,
+    palette_dict: dict[str, tuple],
+    marker_size: float = TISSUE_SCATTER_SIZE,
+) -> None:
+    """Scatter plot of cell positions colored by class."""
+    sns.scatterplot(
+        data=plot_df,
+        x="plot_x",
+        y="plot_y",
+        hue="cell_class",
+        s=marker_size,
+        ax=ax,
+        palette=palette_dict,
+        legend=False,
+        linewidth=0,
+    )
 
 
 def evaluate_slice(
@@ -413,6 +690,10 @@ def evaluate_slice(
                 coherence_radius=COHERENCE_RADIUS,
                 trans_beta=TRANS_BETA,
                 soft_beta=SOFT_BETA,
+                density_length_gate=loss_fn.density_length_gate,
+                density_length_beta=loss_fn.density_length_beta,
+                density_radius_gate=loss_fn.density_radius_gate,
+                density_radius_beta=loss_fn.density_radius_beta,
             )
             pred_fields = compute_loss_target_viz_fields(
                 pred_positions,
@@ -424,6 +705,10 @@ def evaluate_slice(
                 coherence_radius=COHERENCE_RADIUS,
                 trans_beta=TRANS_BETA,
                 soft_beta=SOFT_BETA,
+                density_length_gate=loss_fn.density_length_gate,
+                density_length_beta=loss_fn.density_length_beta,
+                density_radius_gate=loss_fn.density_radius_gate,
+                density_radius_beta=loss_fn.density_radius_beta,
             )
             return target_idx, true_fields, pred_fields
 
@@ -447,6 +732,12 @@ def evaluate_slice(
     n_viz = int(true_fields["x"].shape[0])
     return result, {
         "n_target_viz": n_viz,
+        "true_tissue_df": true_plot_df[[TRUE_X_COL, TRUE_Y_COL, "cell_class"]].rename(
+            columns={TRUE_X_COL: "plot_x", TRUE_Y_COL: "plot_y"},
+        ),
+        "pred_tissue_df": pred_plot_df[[PRED_X_COL, PRED_Y_COL, "cell_class"]].rename(
+            columns={PRED_X_COL: "plot_x", PRED_Y_COL: "plot_y"},
+        ),
         "true_arrow_df": make_loss_arrow_plot_df(
             true_plot_df[[TRUE_X_COL, TRUE_Y_COL, "cell_class"]],
             true_fields,
@@ -525,12 +816,20 @@ def save_slice_arrow_png(
     slice_name: str,
     viz_data: dict,
     output_path: Path,
+    *,
+    left_panel_tissue_dots: bool = False,
 ) -> None:
     true_arrow_df = viz_data["true_arrow_df"]
     pred_arrow_df = viz_data["pred_arrow_df"]
+    true_tissue_df = viz_data["true_tissue_df"]
+    pred_tissue_df = viz_data["pred_tissue_df"]
     n_target_viz = viz_data["n_target_viz"]
 
-    uniques = sorted(true_arrow_df["cell_class"].unique())
+    class_source = pd.concat(
+        [true_tissue_df["cell_class"], pred_tissue_df["cell_class"]],
+        ignore_index=True,
+    ) if left_panel_tissue_dots else true_arrow_df["cell_class"]
+    uniques = sorted(class_source.unique())
     palette_dict = dict(zip(uniques, sns.color_palette(cc.glasbey, n_colors=len(uniques))))
 
     axis1_arrow_scale = _arrow_scale_for_unit_vectors(
@@ -545,56 +844,59 @@ def save_slice_arrow_png(
     )
 
     xlim = (
-        min(true_arrow_df["plot_x"].min(), pred_arrow_df["plot_x"].min()),
-        max(true_arrow_df["plot_x"].max(), pred_arrow_df["plot_x"].max()),
+        min(true_tissue_df["plot_x"].min(), pred_tissue_df["plot_x"].min()),
+        max(true_tissue_df["plot_x"].max(), pred_tissue_df["plot_x"].max()),
     )
     ylim = (
-        min(true_arrow_df["plot_y"].min(), pred_arrow_df["plot_y"].min()),
-        max(true_arrow_df["plot_y"].max(), pred_arrow_df["plot_y"].max()),
+        min(true_tissue_df["plot_y"].min(), pred_tissue_df["plot_y"].min()),
+        max(true_tissue_df["plot_y"].max(), pred_tissue_df["plot_y"].max()),
     )
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    panel_specs = [
-        (true_arrow_df, "Ground truth", f"Local axis (r={NEIGHBOR_RADIUS:.3g})"),
-        (true_arrow_df, "Ground truth", f"Smoothed axis (r={COHERENCE_RADIUS:.3g})"),
-        (pred_arrow_df, "Prediction", f"Local axis (r={NEIGHBOR_RADIUS:.3g})"),
-        (pred_arrow_df, "Prediction", f"Smoothed axis (r={COHERENCE_RADIUS:.3g})"),
-    ]
-    arrow_specs = [
-        ("_arrow_u", "_arrow_v", axis1_arrow_scale),
-        ("avg_dir_x", "avg_dir_y", axis2_arrow_scale),
-        ("_arrow_u", "_arrow_v", axis1_arrow_scale),
-        ("avg_dir_x", "avg_dir_y", axis2_arrow_scale),
+    row_specs = [
+        (true_tissue_df, true_arrow_df, "Ground truth"),
+        (pred_tissue_df, pred_arrow_df, "Prediction"),
     ]
 
-    for ax, (arrow_df, row_label, panel_title), (u_col, v_col, scale) in zip(
-        axes.flat, panel_specs, arrow_specs,
-    ):
-        ax.set_title(f"{row_label} — {panel_title}", fontsize=13)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-        ax.set_aspect("equal", adjustable="box")
-        sns.scatterplot(
-            data=arrow_df,
-            x="plot_x",
-            y="plot_y",
-            hue="cell_class",
-            s=6,
-            ax=ax,
-            palette=palette_dict,
-            legend=False,
-        )
-        draw_class_arrows(
-            ax,
-            arrow_df,
-            u_col=u_col,
-            v_col=v_col,
-            scale=scale,
-            palette_dict=palette_dict,
-            uniques=uniques,
-        )
+    for row_idx, (tissue_df, arrow_df, row_label) in enumerate(row_specs):
+        for col_idx, ax in enumerate(axes[row_idx]):
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_aspect("equal", adjustable="box")
+
+            if left_panel_tissue_dots and col_idx == 0:
+                ax.set_title(f"{row_label} — Tissue layout", fontsize=13)
+                draw_class_scatter(ax, tissue_df, palette_dict=palette_dict)
+            elif col_idx == 0:
+                ax.set_title(
+                    f"{row_label} — Local axis (r={NEIGHBOR_RADIUS:.3g})",
+                    fontsize=13,
+                )
+                draw_class_axis_bars(
+                    ax,
+                    arrow_df,
+                    u_col="_arrow_u",
+                    v_col="_arrow_v",
+                    scale=axis1_arrow_scale,
+                    palette_dict=palette_dict,
+                    uniques=uniques,
+                )
+            else:
+                ax.set_title(
+                    f"{row_label} — Smoothed axis (r={COHERENCE_RADIUS:.3g})",
+                    fontsize=13,
+                )
+                draw_class_axis_bars(
+                    ax,
+                    arrow_df,
+                    u_col="avg_dir_x",
+                    v_col="avg_dir_y",
+                    scale=axis2_arrow_scale,
+                    palette_dict=palette_dict,
+                    uniques=uniques,
+                )
 
     loss_text = (
         f"total={viz_data['loss_total']:.4f}, "
@@ -682,6 +984,22 @@ def parse_args() -> argparse.Namespace:
         default=N_TARGET,
         help="Target cells subsampled by DirectionalMetricLoss (loss + viz use the same subsample)",
     )
+    parser.add_argument(
+        "--viz-tissue-dots",
+        action="store_true",
+        help=(
+            "Replace left-column panels (local axis) with full-slice tissue dot plots; "
+            "right-column panels still show smoothed axis bars on the loss subsample"
+        ),
+    )
+    parser.add_argument(
+        "--analysis",
+        action="store_true",
+        help=(
+            "Compute viz fields on all evaluated slices and write dataset analysis PNG "
+            "(mean line length by cell type; slice axis alignment GT vs pred)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -716,6 +1034,10 @@ def main() -> None:
         eps=EPS,
         length_weight=1.0,
         pairwise_weight=1.0,
+        density_length_gate=DENSITY_LENGTH_GATE,
+        density_length_beta=DENSITY_LENGTH_BETA,
+        density_radius_gate=DENSITY_RADIUS_GATE,
+        density_radius_beta=DENSITY_RADIUS_BETA,
     ).to(device)
 
     print(f"CSV: {args.csv}")
@@ -725,20 +1047,33 @@ def main() -> None:
     print(f"Graph batch size: 1 slice per forward pass")
     print(f"Loss + viz n_target: {args.n_target} (seed={LOSS_SEED})")
     print(f"Neighbor radius: {NEIGHBOR_RADIUS}  Coherence radius: {COHERENCE_RADIUS}  trans_beta: {TRANS_BETA}")
+    print(
+        f"Density length gate: {DENSITY_LENGTH_GATE}  "
+        f"density_length_beta: {DENSITY_LENGTH_BETA}"
+    )
+    print(
+        f"Density radius gate: {DENSITY_RADIUS_GATE}  "
+        f"density_radius_beta: {DENSITY_RADIUS_BETA}"
+    )
     print(f"Slices to evaluate: {len(slice_names)}")
     print(f"Slices with arrow PNGs: {len(viz_slices)}")
+    print(f"Left panel tissue dots: {args.viz_tissue_dots}")
+    print(f"Dataset analysis: {args.analysis}")
 
     results: list[SliceResult] = []
+    analysis_cell_records: list[dict] = []
+    analysis_slice_records: list[dict] = []
     output_stem = args.output.with_suffix("")
 
     for slice_name in slice_names:
         print(f"\n=== {slice_name} ===")
+        need_viz = slice_name in viz_slices or args.analysis
         result, viz_data = evaluate_slice(
             args.csv,
             slice_name,
             device,
             loss_fn,
-            compute_viz=slice_name in viz_slices,
+            compute_viz=need_viz,
             warmup_iters=warmup_iters,
         )
         results.append(result)
@@ -754,9 +1089,23 @@ def main() -> None:
         if result.viz_seconds > 0.0:
             print(f"Viz field time: {result.viz_seconds:.4f} s")
 
-        if viz_data is not None:
+        if viz_data is not None and args.analysis:
+            cell_records, slice_records = collect_slice_analysis_records(
+                slice_name,
+                viz_data["true_arrow_df"],
+                viz_data["pred_arrow_df"],
+            )
+            analysis_cell_records.extend(cell_records)
+            analysis_slice_records.extend(slice_records)
+
+        if viz_data is not None and slice_name in viz_slices:
             arrow_path = Path(f"{output_stem}_{slice_name}_arrows.png")
-            save_slice_arrow_png(slice_name, viz_data, arrow_path)
+            save_slice_arrow_png(
+                slice_name,
+                viz_data,
+                arrow_path,
+                left_panel_tissue_dots=args.viz_tissue_dots,
+            )
             print(f"Saved arrows: {arrow_path}")
 
         del viz_data
@@ -764,6 +1113,16 @@ def main() -> None:
     summary_path = args.output
     save_summary_png(results, summary_path, device)
     print(f"\nSaved summary: {summary_path}")
+
+    if args.analysis:
+        if not analysis_cell_records:
+            print("Analysis requested but no viz data was collected.")
+        else:
+            per_cell_df = pd.DataFrame(analysis_cell_records)
+            per_slice_df = pd.DataFrame(analysis_slice_records)
+            analysis_path = Path(f"{output_stem}_analysis.png")
+            save_analysis_png(per_cell_df, per_slice_df, analysis_path)
+            print(f"Saved analysis: {analysis_path}")
 
 
 if __name__ == "__main__":
