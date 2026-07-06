@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from metrics.evaluation_statistics import align_point_clouds  # noqa: E402
+from metrics.test_evaluation_statistics import align_point_clouds  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,10 +204,6 @@ def build_section_batch(
     # is conditioned on).
     gt_positions = holder.positions.squeeze(0).cpu().numpy()
 
-    print(
-        f"[diffusion2spatial_probs] Selected section {section_str!r} "
-        f"with {n_cells} cells."
-    )
     return SliceBatch(
         holder=holder,
         cell_class_int=cc_int,

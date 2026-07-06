@@ -1,7 +1,7 @@
 # @package _global_
 general:
     name : 'MERFISH_small_transcripts'
-    mode : 'train_and_test' # 'test_only' # 
+    mode : 'test_only' # 'train_and_test' # 
 
 distribute:
     gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
@@ -19,13 +19,13 @@ dataset:
         validation: null
 
 train: # !!!!
-    n_epochs: 20000 # 24000        # tiny number for a smoke-test; increase for real training
+    n_epochs: 24000 # 24000        # tiny number for a smoke-test; increase for real training
     batch_size: 1     # keep small on CPU
     lr: 8e-4
 
 test:
     save_dir: '/data-master/code/outputs'
-    checkpoints_parent_dir: null #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
+    checkpoints_parent_dir: '/data-master/code/outputs/2026-07-02/10-21-27-MERFISH_small_transcripts/checkpoints/' #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
     checkpoints_name_list: all
 
 validation: # !!!!

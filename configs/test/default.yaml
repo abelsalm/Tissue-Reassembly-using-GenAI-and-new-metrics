@@ -1,17 +1,17 @@
-save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/multiple_tests" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/benchmark_test" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
-checkpoints_parent_dir: null # '/data-master/code/outputs/2026-06-04/23-30-17-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
-checkpoints_name_list:  null # ["epoch=14999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
-batch_size: 12 # Batch size for testing
+checkpoints_parent_dir: '/data-master/code/outputs/2026-07-02/10-21-27-MERFISH_small_transcripts/checkpoints/' # '/data-master/code/outputs/2026-06-04/23-30-17-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
+checkpoints_name_list:  'all' # ["epoch=14999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
+batch_size: 32 # Batch size for testing
 epoch_index: null
-checkpoint_path: "/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
+checkpoint_path: null #"/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
 # Statistical testing pipeline (metrics/testing_pipeline.py)
 pipeline:
-  num_samples: 16          # denoising runs per cell_section (different seeds)
+  num_samples: 64          # denoising runs per cell_section (different seeds)
   seed_start: 100             # seed for sample i is seed_start + i
-  device: auto                # auto | cpu | cuda
+  device: cuda                # auto | cpu | cuda
   min_cells_per_class: 10     # skip cell classes with fewer GT cells
   spatial_analysis:
     gaussian_sigma: 0.02
@@ -21,3 +21,51 @@ pipeline:
     epsilon: 1.0e-12
     overlay_gt_scatter_size: 6.0   # GT dot size on section density grid plots
     section_density_plot_cols: 4    # max columns in the per-section multi-class figure
+  wasserstein_analysis:            # precise per-cell-type distributional distances
+    kde_bandwidth: 0.02            # std of the isotropic Gaussian KDE kernel
+    grid_resolution: 64            # side length of the shared discretization grid
+                                   # (cost matrix is (res^2)x(res^2); keep modest)
+    grid_margin: 0.05              # padding around the combined bbox of GT + preds
+    sinkhorn_reg: 0.01             # entropic regularization (larger = smoother/biased)
+    sinkhorn_iters: 500            # max Sinkhorn iterations
+  ch_voronoi_analysis:             # Cahn-Hilliard / Voronoi phase-pair energy losses
+    cahn_hilliard:                 # per-cell-type CH energy-curve loss
+      radii: [0.005, 0.01, 0.02, 0.04, 0.08]   # bump-radius sweep for E(r)
+      grid_resolution: 64          # side length of the shared CH landscape grid
+      kappa: 1.0                   # CH gradient-energy coefficient
+      combine: soft_max            # soft_max (smooth) | hard_max (exact max)
+      soft_max_beta: 16.0          # soft-max temperature (larger -> sharper)
+      support_factor: 10.0         # per-point support cutoff in units of radius
+      chunk: 128                   # cells per landscape-building chunk
+      square_bbox: true            # use a square bbox so x/y share scale
+      margin: 0.05                 # fractional padding around the (square) bbox
+      eps: 1.0e-6                  # numerical floor for the relative loss
+      min_cells_per_type: 2        # skip cell types with fewer cells
+    voronoi:                       # per-cell-type-pair Voronoi CH energy loss
+      transition_width: 0.01       # width of the Voronoi frontier transition
+      grid_resolution: 64          # side length of the shared Voronoi landscape grid
+      kappa: 1.0                   # CH gradient-energy coefficient
+      soft_beta: null              # null = exact min; float = smooth soft-min
+      square_bbox: true            # use a square bbox so x/y share scale
+      margin: 0.05                 # fractional padding around the (square) bbox
+      eps: 1.0e-6                  # numerical floor for the relative loss
+      min_cells_per_type: 2        # skip cell types with fewer cells
+      chunk: 4096                  # grid-axis chunk for the distance computation
+  scalar_losses_analysis:          # single-value-per-sample losses (no cell-type split)
+    compute_position_mse: true     # vanilla position MSE (pairwise distance-matrix MSE)
+    compute_directional: true      # directional length + pairwise axis-angle losses
+    directional:                   # mirrors metrics/train_directional_metric.py defaults
+      n_target: 1024               # cells subsampled per sample for the axis pipeline
+      neighbor_radius: 0.16        # first-radius soft-neighborhood membership cutoff
+      coherence_radius: 0.08       # second-radius axis-smoothing cutoff
+      trans_beta: 32.0             # transcriptome-distance weighting sharpness
+      soft_beta: 256.0             # null = hard radius; float = sigmoid membership
+      length_weight: 1.0           # weight on the per-cell length term
+      pairwise_weight: 1.0         # weight on the pairwise axis-angle term
+      min_valid_targets: 2         # skip samples with fewer valid target cells
+      density_length_gate: true    # gate pre-smoothing axis length by local density
+      density_length_beta: 8.0     # sigmoid sharpness for the density-length gate
+      density_radius_gate: false   # resize first-radius neighborhood by density
+      density_radius_beta: 4.0     # sigmoid sharpness for the density-radius gate
+      eps: 1.0e-6
+      base_seed: 0                 # +sample_index -> deterministic target subsampling

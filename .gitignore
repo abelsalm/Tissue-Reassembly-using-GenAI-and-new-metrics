@@ -34,3 +34,7 @@ lightning_logs
 lightning_logs/*
 ./lightning_logs
 ./lightning_logs/*
+
+outputs
+outputs/*
+./outputs/*

@@ -7,7 +7,7 @@ lr_cosine_warm_restarts: True # If True, use CosineAnnealingWarmRestarts (after 
 lr_cosine_max: null # Peak LR eta_max per cycle; null = use ``lr``.
 lr_cosine_min: 1.0e-4 # Floor LR eta_min at the bottom of each cosine cycle.
 lr_cosine_period_epochs: 2000 # First cosine cycle length T_0 (epochs).
-lr_cosine_subsequent_cycle_mult: 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
+lr_cosine_subsequent_cycle_mult: 2 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
 weight_decay: 1.0e-12
 rechunk_every_n_epochs: 10 # Re-randomise chunk boundaries every N epochs (0 = disabled)
@@ -23,11 +23,11 @@ debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
 #     + ch_weight                         * L_ch_auc
 #     + pca_weight                        * L_pca
 #     + directional_weight                * L_directional
-other_trigger: 3500 # CH, PCA, and directional losses are forced to 0 until this epoch (0 = active from epoch 0).
+other_trigger: 6000 # CH, PCA, and directional losses are forced to 0 until this epoch (0 = active from epoch 0).
 transcriptome_multi_radius_weight: 1.0 # Multi-radius neighborhood transcriptome loss.
 ch_weight: 0 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
 pca_weight: 0 # Whole-slide PCA shape-descriptor loss.
-directional_weight: 0.1 # Transcriptome-weighted local orientation coherence loss.
+directional_weight: 0.4 # Transcriptome-weighted local orientation coherence loss.
 # --- Multi-radius neighborhood loss parameters (transcriptome_multi_radius_weight > 0) ----
 # Compares
 # neighborhood-averaged transcriptomes, log cell densities, and (optionally)
@@ -80,7 +80,7 @@ directional_neighbor_radius: 0.16 # Spatial radius for first-pass axis computati
 directional_coherence_radius: 0.08 # Spatial radius for second-pass axis smoothing.
 directional_trans_beta: 32.0 # Transcriptomic decay rate (exp(-beta * d_trans)).
 directional_soft_beta: 256.0 # Sigmoid sharpness for soft spatial membership.
-directional_length_weight: 10.0 # Weight on per-cell axis-length matching.
+directional_length_weight: 0 # Weight on per-cell axis-length matching.
 directional_pairwise_weight: 10e-2 # Weight on pairwise axis-angle matching.
 directional_min_valid_targets: 2 # Minimum valid targets before loss is skipped.
 directional_density_length_gate: False # If True, shorten pre-smoothing axis length for less-crowded-than-average neighborhoods (density-length gate).
