@@ -12,15 +12,18 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    For every cell type we end up with **two Wasserstein distances**:
 
    * ``wasserstein_whole_slice_alignment`` — every denoising sample's *full*
-     point cloud is rotation-aligned to the GT slice via Procrustes, the
+     point cloud is rigidly aligned to the GT slice via ICP (rotation +
+     translation jointly optimised, optional x/y reflection; no per-cell index
+     matching), the
      cells of the given type are turned into a 2-D continuous distribution
      (KDE), discretized on a shared grid, averaged over samples, and compared
      to the GT type sample (also KDE'd on the same grid). The distance is the
      Sinkhorn approximation of the Wasserstein-1 distance between the two
      discretized distributions.
    * ``wasserstein_per_class_alignment`` — instead of aligning the whole slice,
-     we align (Procrustes, rotation only) each sample's *cell-type-only* point
-     cloud to the GT cell-type sample, then build the per-sample KDE on the
+     we ICP-align each sample's *cell-type-only* point cloud to the GT
+     cell-type cloud (same rotation + translation + reflection search; no
+     per-cell matching), then build the per-sample KDE on the
      same shared grid, average over samples, and again compute the Sinkhorn
      distance to the GT type KDE.
 
@@ -69,6 +72,10 @@ Usage
         experiment=MERFISH_small_transcripts \\
         test.checkpoint_path=/path/to/epoch=19999.ckpt \\
         test.pipeline.num_samples=64
+
+    python metrics/test_testing_pipeline.py \\
+        experiment=MERFISH_small_transcripts \\
+        'test.checkpoint_paths=[/path/a/epoch=7999.ckpt,/path/b/epoch=12000.ckpt]'
 """
 
 from __future__ import annotations
@@ -92,7 +99,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from metrics.test_evaluation_statistics import align_point_clouds  # noqa: E402
 from utils.testing.diffusion2spatial_probs import (  # noqa: E402
     REPO_ROOT as _DIFFUSION_REPO_ROOT,
     SliceBatch,
@@ -130,8 +136,37 @@ def _checkpoint_stem(checkpoint_path: Path) -> str:
     return checkpoint_path.name.replace(".ckpt", "")
 
 
+def _checkpoint_output_id(checkpoint_path: Path) -> str:
+    """Unique artefact folder name for a checkpoint (avoids cross-session collisions)."""
+    stem = _checkpoint_stem(checkpoint_path)
+    parent = checkpoint_path.parent
+    if parent.name == "checkpoints":
+        run_label = parent.parent.name
+    else:
+        run_label = parent.name
+    return f"{run_label}_{stem}"
+
+
 def resolve_checkpoints(cfg: DictConfig) -> list[Path]:
-    """Resolve one or many checkpoint paths from ``cfg.test``."""
+    """Resolve one or many checkpoint paths from ``cfg.test``.
+
+    Precedence (same as ``main.test_model``):
+    1) ``test.checkpoint_paths`` — full paths, may span different training sessions
+    2) ``test.checkpoint_path`` — single checkpoint
+    3) ``test.checkpoints_parent_dir`` + ``test.checkpoints_name_list``
+    """
+    explicit_paths = getattr(cfg.test, "checkpoint_paths", None)
+    if explicit_paths:
+        if isinstance(explicit_paths, str):
+            explicit_paths = [explicit_paths]
+        paths = [Path(str(p)) for p in explicit_paths]
+        missing = [p for p in paths if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Missing checkpoint(s): " + ", ".join(str(p) for p in missing)
+            )
+        return paths
+
     if getattr(cfg.test, "checkpoint_path", None):
         ckpt = Path(str(cfg.test.checkpoint_path))
         if not ckpt.exists():
@@ -181,7 +216,7 @@ def pipeline_output_dir(cfg: DictConfig, checkpoint_path: Path) -> Path:
     base = cfg.test.save_dir
     if base is None:
         base = str(checkpoint_path.parent)
-    return Path(base) / cfg.general.name / "testing_pipeline" / _checkpoint_stem(checkpoint_path)
+    return Path(base) / cfg.general.name / "testing_pipeline" / _checkpoint_output_id(checkpoint_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -489,23 +524,138 @@ def sinkhorn_wasserstein_grid(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Procrustes alignment helpers
+# ICP-based rigid alignment helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _symmetric_chamfer_distance(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+) -> float:
+    """Mean bidirectional nearest-neighbour distance between two point sets."""
+    from scipy.spatial import cKDTree
+
+    if points_a.shape[0] == 0 or points_b.shape[0] == 0:
+        return float("inf")
+    tree_b = cKDTree(points_b)
+    tree_a = cKDTree(points_a)
+    ab = tree_b.query(points_a, k=1)[0]
+    ba = tree_a.query(points_b, k=1)[0]
+    return float(ab.mean() + ba.mean())
+
+
+def _procrustes_rigid(base: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Rigidly align ``target`` onto ``base`` (rotation + translation, no scaling).
+
+    Closed-form via SVD on the centred clouds. Cell order is used as the
+    correspondence, but for ICP that correspondence is the *nearest-neighbour*
+    pairing of the previous iteration, not the original cell index.
+    """
+    from scipy.linalg import svd
+
+    base_mean = base.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    base_c = base - base_mean
+    target_c = target - target_mean
+    U, _, Vt = svd(target_c.T @ base_c)
+    R = U @ Vt
+    return target_c @ R + base_mean 
+
+
+def align_point_clouds_icp(
+    reference: np.ndarray,
+    target: np.ndarray,
+    *,
+    max_iter: int = 50,
+    tol: float = 1e-6,
+    with_reflection: bool = True,
+    n_init_rotations: int = 12,
+) -> np.ndarray:
+    """Rigidly align ``target`` to ``reference`` via global Iterative Closest Point.
+
+    ICP does not assume a known cell-to-cell correspondence: each iteration
+    matches every point to its nearest neighbour in the reference cloud, then
+    solves the optimal rigid transform (rotation + translation) on those
+    pairings via Procrustes/SVD. Translation is optimised jointly with rotation
+    (the cloud is re-centred onto the matched reference points every step), so
+    the sample is genuinely moved, not just rotated.
+
+    Plain ICP is sensitive to its initialisation (it easily falls into a local
+    minimum when the target starts far from the reference). To make the search
+    global we run ICP from several seeds — a coarse grid of initial rotations
+    (``n_init_rotations`` angles on ``[0, 2π)``), each combined with the
+    optional x/y reflection — and keep the run with the smallest final
+    symmetric Chamfer distance. This recovers mirror-symmetric and
+    large-rotation alignments that single-start ICP misses.
+    """
+    from scipy.spatial import cKDTree
+
+    reference = np.asarray(reference, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if reference.shape[0] == 0:
+        return np.asarray(target, dtype=np.float32)
+    if target.shape[0] == 0:
+        return np.asarray(target, dtype=np.float32)
+
+    ref_tree = cKDTree(reference)
+    ref_mean = reference.mean(axis=0)
+    tgt_centered = target - target.mean(axis=0)
+
+    def _run_icp(seed_points: np.ndarray) -> tuple[np.ndarray, float]:
+        current = np.asarray(seed_points, dtype=np.float64).copy()
+        prev_error = float("inf")
+        for _ in range(max_iter):
+            dists, idxs = ref_tree.query(current, k=1)
+            matched = reference[idxs]
+            current = _procrustes_rigid(matched, current)
+            error = float(dists.mean())
+            if abs(prev_error - error) < tol:
+                break
+            prev_error = error
+        final_err = _symmetric_chamfer_distance(current, reference)
+        return current, final_err
+
+    # Build multi-start seeds: coarse rotation grid (centred at ref mean) x reflection.
+    flip_axes: list[int | None] = [None] if not with_reflection else [None, 0, 1]
+    angles = np.linspace(0.0, 2.0 * np.pi, n_init_rotations, endpoint=False)
+
+    seeds: list[np.ndarray] = []
+    for flip_axis in flip_axes:
+        candidate = tgt_centered
+        if flip_axis is not None:
+            candidate = candidate.copy()
+            candidate[:, flip_axis] *= -1.0
+        for angle in angles:
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=np.float64)
+            seeds.append(candidate @ rot.T + ref_mean)
+
+    best_aligned: np.ndarray | None = None
+    best_error = float("inf")
+    for seed in seeds:
+        aligned, err = _run_icp(seed)
+        if err < best_error:
+            best_error = err
+            best_aligned = aligned
+
+    assert best_aligned is not None
+    return np.asarray(best_aligned, dtype=np.float32)
 
 
 def align_samples_to_reference(
     samples: np.ndarray,
     reference: np.ndarray,
 ) -> np.ndarray:
-    """Rotation-only Procrustes align every sample onto ``reference``.
+    """ICP-align every sample onto ``reference`` (no per-cell correspondence).
 
     ``samples`` has shape ``(S, N, 2)`` and ``reference`` shape ``(N, 2)``;
-    each sample is aligned independently using ``align_point_clouds``.
+    each sample is aligned independently using
+    :func:`align_point_clouds_icp`.
     """
     samples = np.asarray(samples, dtype=np.float32)
     aligned = np.empty_like(samples)
     for i in range(samples.shape[0]):
-        aligned[i] = align_point_clouds(reference, samples[i])
+        aligned[i] = align_point_clouds_icp(reference, samples[i])
     return aligned
 
 
@@ -515,9 +665,10 @@ def align_samples_to_reference_torch(
 ) -> torch.Tensor:
     """Batched rotation-only Procrustes alignment of every sample onto ``reference``.
 
-    Vectorised GPU implementation of :func:`align_samples_to_reference` using
-    batched SVD (matches ``align_point_clouds`` exactly: rotation only, no
-    scaling, re-centered at the reference mean).
+    Vectorised GPU implementation of rotation-only Procrustes (no axis-reflection
+    search). Used for cross-sample spread metrics; for Wasserstein alignment
+    metrics see :func:`align_samples_to_reference`, which uses ICP with
+    reflection search.
 
     Args:
         samples: ``(S, N, 2)`` point clouds (one per denoising sample).
@@ -642,9 +793,11 @@ def compute_wasserstein_whole_slice_alignment(
     sinkhorn_reg: float,
     sinkhorn_iters: int,
 ) -> pd.DataFrame:
-    """Wasserstein distances after whole-slice Procrustes alignment.
+    """Wasserstein distances after whole-slice ICP alignment.
 
-    Every sample's full point cloud is rotation-aligned to the GT slice; for
+    Every sample's full point cloud is rigidly aligned to the GT slice via
+    ICP (rotation + translation jointly optimised, optional x/y reflection;
+    no per-cell matching); for
     each cell type the aligned class points are turned into a KDE on the shared
     grid, averaged over samples, and compared to the GT class KDE via Sinkhorn.
     """
@@ -697,10 +850,11 @@ def compute_wasserstein_per_class_alignment(
     sinkhorn_reg: float,
     sinkhorn_iters: int,
 ) -> pd.DataFrame:
-    """Wasserstein distances after per-cell-type Procrustes alignment.
+    """Wasserstein distances after per-cell-type ICP alignment.
 
-    For each cell type, every sample's class-only point cloud is rotation-
-    aligned to the GT class sample, KDE'd on the shared grid, averaged over
+    For each cell type, every sample's class-only point cloud is ICP-aligned
+    to the GT class cloud (rotation + translation + reflection, no per-cell
+    matching), KDE'd on the shared grid, averaged over
     samples, and compared to the GT class KDE via Sinkhorn.
     """
     gt_positions = batch.gt_positions.astype(np.float32)
@@ -719,7 +873,9 @@ def compute_wasserstein_per_class_alignment(
             class_pts = preds[s][mask]
             if class_pts.shape[0] < 2:
                 continue
-            aligned_pts = align_point_clouds(gt_class_points, class_pts)
+            aligned_pts = align_point_clouds_icp(
+                gt_class_points, class_pts
+            )
             sample_dists.append(
                 discretize_to_grid(aligned_pts, grid_x, grid_y, bandwidth)
             )
@@ -1588,7 +1744,7 @@ def run_testing_pipeline(cfg: DictConfig) -> list[Path]:
 
 
 def _checkpoint_label(checkpoint_path: Path) -> str:
-    return _checkpoint_stem(checkpoint_path)
+    return _checkpoint_output_id(checkpoint_path)
 
 
 def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | None]:
@@ -1688,7 +1844,7 @@ def _save_combined_comparison_csv(
     """Write the unified long checkpoint-comparison table to CSV.
 
     Columns: checkpoint, metric, value, normalized (per-metric min-max across
-    checkpoints so the CSV mirrors the bar plot).
+    checkpoints; kept for convenience in the CSV, not used by the PNG plot).
     """
     save_path.parent.mkdir(parents=True, exist_ok=True)
     if comparison.empty:
@@ -1712,76 +1868,234 @@ def _save_combined_comparison_csv(
     print(f"[testing_pipeline] Saved checkpoint comparison CSV → {save_path}")
 
 
+_COMPARISON_PANELS: list[tuple[str, list[str]]] = [
+    ("Position MSE", ["position_mse"]),
+    ("Directional length", ["directional_length"]),
+    ("Directional pairwise", ["directional_pairwise"]),
+    (
+        "Wasserstein",
+        ["wasserstein_whole_slice_alignment", "wasserstein_per_class_alignment"],
+    ),
+    (
+        "Cahn-Hilliard",
+        ["ch_energy_curve_loss", "voronoi_phase_pair_ch_energy_loss"],
+    ),
+    ("Cross-sample spread", ["cross_sample_spread"]),
+]
+
+_COMPARISON_METRIC_LABELS: dict[str, str] = {
+    "wasserstein_whole_slice_alignment": "whole slice",
+    "wasserstein_per_class_alignment": "per class",
+    "ch_energy_curve_loss": "CH energy",
+    "voronoi_phase_pair_ch_energy_loss": "Voronoi phase",
+}
+
+
 def plot_checkpoint_comparison(
     comparison: pd.DataFrame,
     save_path: Path,
 ) -> None:
-    """One single bar plot comparing every metric across checkpoints.
+    """Six-panel bar plot comparing every metric across checkpoints (raw scale).
 
-    Each metric is collapsed to one scalar per checkpoint. Because the metrics
-    live on very different scales, each metric is min-max normalised across
-    checkpoints (so the worst checkpoint = 0, the best = 1 for that metric)
-    before plotting — this lets every metric share one bar plot. The raw value
-    is annotated on top of each bar.
+    One row of subplots: three scalar metrics, one combined Wasserstein panel,
+    one combined Cahn-Hilliard panel, and cross-sample spread. Each checkpoint
+    keeps a fixed colour across all panels; raw values are annotated above bars
+    with two decimal places.
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.patches import Patch
+
+    sns.set_theme(style="whitegrid", context="notebook", font_scale=0.95)
+    plt.rcParams.update({
+        "axes.titleweight": "semibold",
+        "axes.labelcolor": "#333333",
+        "axes.edgecolor": "#cccccc",
+        "grid.color": "#e6e6e6",
+        "grid.linewidth": 0.8,
+        "legend.framealpha": 0.95,
+        "legend.edgecolor": "#dddddd",
+        "figure.facecolor": "#f8f9fb",
+        "axes.facecolor": "#ffffff",
+    })
 
     save_path = Path(save_path)
     if comparison.empty:
         print("[testing_pipeline] No checkpoint comparison data to plot.")
         return
 
-    metrics = list(dict.fromkeys(comparison["metric"].tolist()))
     checkpoints = list(dict.fromkeys(comparison["checkpoint"].tolist()))
-    n_metrics = len(metrics)
-    n_ckpt = len(checkpoints)
-    bar_w = 0.8 / max(n_ckpt, 1)
-    x = np.arange(n_metrics)
+    palette = sns.color_palette("deep", n_colors=max(len(checkpoints), 3))
+    ckpt_colors = {ckpt: palette[i % len(palette)] for i, ckpt in enumerate(checkpoints)}
 
-    # Per-metric min-max normalisation across checkpoints (the plot scale).
-    # All benchmarked metrics are "lower is better", so we invert: 1 = best (min),
-    # 0 = worst (max). This makes taller bars = better models.
-    norm_vals: dict[tuple[str, str], float] = {}
     raw_vals: dict[tuple[str, str], float] = {}
-    for metric in metrics:
-        sub = comparison[comparison["metric"] == metric].set_index("checkpoint")
-        sub = sub.reindex(checkpoints)
-        vals = sub["value"].to_numpy(dtype=float)
-        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
-        denom = hi - lo
-        for ckpt, v in zip(checkpoints, vals):
-            raw_vals[(ckpt, metric)] = float(v) if np.isfinite(v) else np.nan
-            if not np.isfinite(denom) or denom <= 0:
-                norm_vals[(ckpt, metric)] = 1.0
-            else:
-                norm_vals[(ckpt, metric)] = float((hi - v) / denom)
+    for _, row in comparison.iterrows():
+        raw_vals[(str(row["checkpoint"]), str(row["metric"]))] = float(row["value"])
 
-    fig, ax = plt.subplots(figsize=(max(10, 1.4 * n_metrics), 6))
-    cmap = plt.get_cmap("tab10")
-    for ci, ckpt in enumerate(checkpoints):
-        heights = np.array([norm_vals[(ckpt, m)] for m in metrics], dtype=float)
-        offsets = x + (ci - (n_ckpt - 1) / 2) * bar_w
-        ax.bar(offsets, heights, bar_w, label=ckpt, color=cmap(ci % 10), alpha=0.88,
-               edgecolor="black", linewidth=0.4)
-        for off, m, h in zip(offsets, metrics, heights):
-            v = raw_vals[(ckpt, m)]
-            if np.isfinite(v):
-                ax.text(off, h + 0.01, f"{v:.2g}",
-                        ha="center", va="bottom", fontsize=6.5, rotation=90)
+    fig, axes = plt.subplots(
+        1,
+        len(_COMPARISON_PANELS),
+        figsize=(24, 6.2),
+        facecolor=plt.rcParams["figure.facecolor"],
+    )
+    if len(_COMPARISON_PANELS) == 1:
+        axes = [axes]
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(metrics, rotation=25, ha="right")
-    ax.set_ylim(0, 1.15)
-    ax.set_ylabel("Per-metric normalised score (1 = best, 0 = worst across checkpoints; all metrics lower-is-better)")
-    ax.set_title("Model benchmark — metrics comparison across checkpoints (taller = better; raw values labelled)")
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.85, title="checkpoint")
-    ax.grid(axis="y", linestyle=":", alpha=0.5)
-    fig.tight_layout()
+    metric_alphas = (0.95, 0.55)
+
+    def _style_axis(ax: plt.Axes, *, show_ylabel: bool) -> None:
+        sns.despine(ax=ax, left=False, bottom=False)
+        ax.set_axisbelow(True)
+        ax.yaxis.grid(True, linestyle="-", alpha=0.7)
+        ax.xaxis.grid(False)
+        ax.tick_params(axis="both", labelsize=8, colors="#444444")
+        if show_ylabel:
+            ax.set_ylabel("Value", fontsize=9, color="#555555")
+        else:
+            ax.set_ylabel("")
+
+    def _annotate_bars(
+        ax: plt.Axes,
+        positions: np.ndarray,
+        heights: np.ndarray,
+        *,
+        fontsize: float,
+    ) -> float:
+        max_height = 0.0
+        for pos, height in zip(positions, heights):
+            if not np.isfinite(height):
+                continue
+            max_height = max(max_height, float(height))
+            ax.text(
+                pos,
+                height,
+                f"{height:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=fontsize,
+                color="#333333",
+                fontweight="medium",
+                bbox={
+                    "boxstyle": "round,pad=0.15",
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.75,
+                },
+            )
+        return max_height
+
+    for ax, (title, metrics) in zip(axes, _COMPARISON_PANELS):
+        available_metrics = [
+            m for m in metrics
+            if any((ckpt, m) in raw_vals for ckpt in checkpoints)
+        ]
+        if not available_metrics:
+            ax.set_title(title, fontsize=11, pad=10)
+            ax.text(
+                0.5, 0.5, "No data",
+                ha="center", va="center",
+                transform=ax.transAxes,
+                fontsize=10, color="#888888",
+            )
+            ax.set_axis_off()
+            continue
+
+        n_metrics = len(available_metrics)
+        n_ckpt = len(checkpoints)
+        max_height = 0.0
+
+        if n_metrics == 1:
+            metric = available_metrics[0]
+            x = np.arange(n_ckpt)
+            heights = np.array(
+                [raw_vals.get((ckpt, metric), np.nan) for ckpt in checkpoints],
+                dtype=float,
+            )
+            positions = x.astype(float)
+            ax.bar(
+                positions,
+                heights,
+                width=0.62,
+                color=[ckpt_colors[ckpt] for ckpt in checkpoints],
+                alpha=0.95,
+                edgecolor="white",
+                linewidth=1.0,
+                zorder=3,
+            )
+            ax.set_xticks(x)
+            ax.set_xticklabels(checkpoints, rotation=28, ha="right")
+            max_height = _annotate_bars(ax, positions, heights, fontsize=7.5)
+        else:
+            group_width = 0.78
+            bar_w = group_width / n_metrics
+            x = np.arange(n_ckpt)
+            for mi, metric in enumerate(available_metrics):
+                offsets = x + (mi - (n_metrics - 1) / 2) * bar_w
+                heights = np.array(
+                    [raw_vals.get((ckpt, metric), np.nan) for ckpt in checkpoints],
+                    dtype=float,
+                )
+                ax.bar(
+                    offsets,
+                    heights,
+                    bar_w,
+                    color=[ckpt_colors[ckpt] for ckpt in checkpoints],
+                    alpha=metric_alphas[mi % len(metric_alphas)],
+                    edgecolor="white",
+                    linewidth=1.0,
+                    label=_COMPARISON_METRIC_LABELS.get(metric, metric),
+                    zorder=3,
+                )
+                max_height = max(
+                    max_height,
+                    _annotate_bars(ax, offsets, heights, fontsize=6.8),
+                )
+            ax.set_xticks(x)
+            ax.set_xticklabels(checkpoints, rotation=28, ha="right")
+            ax.legend(
+                fontsize=7,
+                loc="upper right",
+                title="Metric",
+                title_fontsize=7,
+                frameon=True,
+                handlelength=1.2,
+                handleheight=0.9,
+            )
+
+        ax.set_title(title, fontsize=11, pad=10)
+        _style_axis(ax, show_ylabel=(ax is axes[0]))
+        if max_height > 0:
+            ax.set_ylim(0, max_height * 1.22)
+
+    handles = [
+        Patch(facecolor=ckpt_colors[ckpt], edgecolor="white", linewidth=0.8, label=ckpt)
+        for ckpt in checkpoints
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=min(len(checkpoints), 6),
+        bbox_to_anchor=(0.5, 1.03),
+        fontsize=9,
+        title="Checkpoint",
+        title_fontsize=9,
+        frameon=True,
+        columnspacing=1.4,
+        handletextpad=0.6,
+    )
+    fig.suptitle(
+        "Model benchmark — metrics comparison across checkpoints",
+        y=1.10,
+        fontsize=14,
+        fontweight="bold",
+        color="#222222",
+    )
+    fig.subplots_adjust(top=0.80, wspace=0.30, left=0.04, right=0.99, bottom=0.18)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, bbox_inches="tight", dpi=200)
+    fig.savefig(save_path, bbox_inches="tight", dpi=220, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"[testing_pipeline] Saved checkpoint comparison plot → {save_path}")
 

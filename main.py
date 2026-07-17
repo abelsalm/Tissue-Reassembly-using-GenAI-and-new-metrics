@@ -60,35 +60,79 @@ def train_model(cfg: DictConfig, datamodule, dataset_infos):
 
 def test_model(cfg: DictConfig, datamodule, dataset_infos):
     """Test the model using saved checkpoints."""
-    # Support both patterns:
-    # 1) test.checkpoints_parent_dir + test.checkpoints_name_list (directory-based)
-    # 2) test.checkpoint_path (single-checkpoint)
-    if cfg.test.checkpoints_parent_dir is None:
-        if getattr(cfg.test, "checkpoint_path", None):
-            ckpt = pathlib.Path(cfg.test.checkpoint_path)
+    # Supported patterns (checked in this order):
+    # 1) test.checkpoint_paths (list of full paths, may span different
+    #    training sessions / directories)
+    # 2) test.checkpoints_parent_dir + test.checkpoints_name_list (directory-based)
+    # 3) test.checkpoint_path (single-checkpoint)
+    checkpoint_paths = get_checkpoint_paths(cfg)
+
+    dataloaders_test = datamodule.test_dataloader()
+
+    for checkpoint_path in checkpoint_paths:
+        test_single_checkpoint(
+            cfg, datamodule, dataset_infos, checkpoint_path, dataloaders_test
+        )
+
+
+def _is_set(value) -> bool:
+    """True if a Hydra/OmegaConf value is present and non-empty."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    try:
+        return len(value) > 0
+    except TypeError:
+        return True
+
+
+def get_checkpoint_paths(cfg: DictConfig):
+    """Resolve the list of checkpoint paths to test.
+
+    Priority:
+      1) test.checkpoint_paths (optional list of full .ckpt paths)
+      2) test.checkpoints_parent_dir + test.checkpoints_name_list
+      3) test.checkpoint_path (single file)
+    """
+    # 1) Explicit list of full paths (may come from different training sessions).
+    explicit_paths = getattr(cfg.test, "checkpoint_paths", None)
+    if _is_set(explicit_paths):
+        if isinstance(explicit_paths, str):
+            explicit_paths = [explicit_paths]
+        resolved = [str(pathlib.Path(p)) for p in explicit_paths]
+        for p in resolved:
+            if not pathlib.Path(p).exists():
+                raise FileNotFoundError(f"Checkpoint not found: {p}")
+        return resolved
+
+    # 2) Directory-based: checkpoints_parent_dir + checkpoints_name_list
+    # 3) Single checkpoint: checkpoint_path
+    parent_dir = getattr(cfg.test, "checkpoints_parent_dir", None)
+    if not _is_set(parent_dir):
+        single = getattr(cfg.test, "checkpoint_path", None)
+        if _is_set(single):
+            ckpt = pathlib.Path(single)
             cfg.test.checkpoints_parent_dir = str(ckpt.parent)
             cfg.test.checkpoints_name_list = [ckpt.name]
         else:
             raise ValueError(
-                "For test_only you must set either "
-                "`test.checkpoint_path=/path/to/epoch=....ckpt` "
-                "or `test.checkpoints_parent_dir=/path/to/checkpoints`."
+                "For test_only you must set one of: "
+                "`test.checkpoint_paths=[/full/path/a.ckpt, /full/path/b.ckpt]`, "
+                "`test.checkpoint_path=/path/to/epoch=....ckpt`, "
+                "or `test.checkpoints_parent_dir=/path/to/checkpoints` "
+                "(with optional `test.checkpoints_name_list='all'`)."
             )
 
     checkpoints_parent_dir = pathlib.Path(cfg.test.checkpoints_parent_dir)
     print("Directory:", checkpoints_parent_dir)
 
     checkpoints_name_list = get_checkpoints_list(cfg, checkpoints_parent_dir)
-    checkpoints_paths = [
-        os.path.join(checkpoints_parent_dir, item) for item in checkpoints_name_list
-    ]
-
-    dataloaders_test = datamodule.test_dataloader()
-
-    for checkpoint_path in checkpoints_paths:
-        test_single_checkpoint(
-            cfg, datamodule, dataset_infos, checkpoint_path, dataloaders_test
+    if not checkpoints_name_list:
+        raise FileNotFoundError(
+            f"No checkpoints found under {checkpoints_parent_dir}"
         )
+    return [os.path.join(checkpoints_parent_dir, item) for item in checkpoints_name_list]
 
 
 def get_checkpoints_list(cfg: DictConfig, checkpoints_parent_dir: pathlib.Path):

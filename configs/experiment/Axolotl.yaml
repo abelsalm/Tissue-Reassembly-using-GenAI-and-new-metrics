@@ -10,23 +10,23 @@ dataset:
     dataset_name: 'Axolotl'
     gene_columns_start: 7   # first column after the index is a gene
     gene_columns_end: -1 
-    train_data_path: "/data-master/biodata/Axolotl/train_cells_expression_shuffled.csv"
-    test_data_path: "/data-master/biodata/Axolotl/train_cells_expression_shuffled.csv"
+    train_data_path: "/home/abel/biodata/Axolotl/train_cells_expression_shuffled.csv"
+    test_data_path: "/home/abel/biodata/Axolotl/train_cells_expression_shuffled.csv"
     validation_data_path: ""
     maximum_graph_size:
-        train:  2000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
-        test: 2000
+        train:  null   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: null
         validation: null
 
 train: # !!!!
-    n_epochs: 1000        # tiny number for a smoke-test; increase for real training
-    batch_size: 2      # keep small on CPU
-    lr: 5e-4
+    n_epochs: 8200        # tiny number for a smoke-test; increase for real training
+    batch_size: 1      # keep small on CPU
+    lr: 8e-4
 
 test:
-    save_dir: '/data-master/code/outputs'
-    checkpoints_parent_dir: "/data-master/code/outputs/2026-05-07/15-53-16-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
-    checkpoints_name_list: all #['epoch=1999.ckpt']
+    save_dir: '/home/abel/code/outputs'
+    checkpoints_parent_dir: "/home/abel/code/outputs/2026-07-07/12-08-22-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
+    checkpoints_name_list: ['epoch=7999.ckpt','epoch=7899.ckpt', 'epoch=8099.ckpt', 'epoch=8199.ckpt']
 
 validation: # !!!!
     if_validate: False

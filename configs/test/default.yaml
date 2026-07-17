@@ -1,15 +1,17 @@
-save_dir: "/data-master/code/outputs/MERFISH_small_transcripts/benchmark_test" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
+save_dir: "/home/abel/code/outputs" # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
-checkpoints_parent_dir: '/data-master/code/outputs/2026-07-02/10-21-27-MERFISH_small_transcripts/checkpoints/' # '/data-master/code/outputs/2026-06-04/23-30-17-MERFISH_small_transcripts/checkpoints' # only for 'test_only' mode, path to the checkpoint to test. 
-checkpoints_name_list:  'all' # ["epoch=14999.ckpt"] # only for 'test_only' mode, list of checkpoint paths to test. 'all' to test all checkpoints in the checkpoints_parent_dir., 'epoch=749.ckpt'
-batch_size: 32 # Batch size for testing
+# Optional: list of full .ckpt paths. Leave null to use checkpoints_parent_dir instead.
+checkpoint_paths: null
+checkpoints_parent_dir: '/home/abel/code/outputs/2026-07-16/16-22-44-MERFISH_small_transcripts/checkpoints'
+checkpoints_name_list: 'all' # 'all' | ["epoch=14999.ckpt", ...]
+batch_size: 8 # Batch size for testing
 epoch_index: null
 checkpoint_path: null #"/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
 # Statistical testing pipeline (metrics/testing_pipeline.py)
 pipeline:
-  num_samples: 64          # denoising runs per cell_section (different seeds)
+  num_samples: 32          # denoising runs per cell_section (different seeds)
   seed_start: 100             # seed for sample i is seed_start + i
   device: cuda                # auto | cpu | cuda
   min_cells_per_class: 10     # skip cell classes with fewer GT cells

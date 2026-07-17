@@ -14,6 +14,7 @@ from metrics.train_spatial_transcriptomics import MultiRadiusNeighborhoodLoss
 from metrics.train_ch_overall import SlideCHLoss
 from metrics.train_pca_overall import SlidePCALoss
 from metrics.train_directional_metric import DirectionalMetricLoss
+from metrics.train_mmds import SlideMMDLoss
 
 
 class CombinedTrainLoss(nn.Module):
@@ -27,8 +28,10 @@ class CombinedTrainLoss(nn.Module):
         * **pca_weight** — whole-slide PCA shape descriptors (``SlidePCALoss``).
         * **directional_weight** — transcriptome-weighted local orientation
           coherence (``DirectionalMetricLoss``).
+        * **mmd_weight** — per-class local-GT kernel MMD on cell positions
+          (``SlideMMDLoss``).
 
-    **other_trigger** — CH, PCA, and directional terms are forced to zero
+    **other_trigger** — CH, PCA, directional, and MMD terms are forced to zero
     (no forward compute) until ``current_epoch >= other_trigger``; configured
     weights apply only from that epoch onward. ``0`` = active from epoch 0.
 
@@ -158,6 +161,15 @@ class CombinedTrainLoss(nn.Module):
         else:
             self.directional = None
 
+        # ------------------------------------------------------------------ #
+        # MMD sub-loss (per-class local-GT kernel MMD)
+        # ------------------------------------------------------------------ #
+        self.mmd_weight = float(_get("mmd_weight", default=0.0))
+        if self.mmd_weight != 0.0:
+            self.mmd: Optional[SlideMMDLoss] = SlideMMDLoss(cfg)
+        else:
+            self.mmd = None
+
         self.other_trigger = int(_get("other_trigger", default=0))
         self._current_epoch = 0
 
@@ -167,6 +179,7 @@ class CombinedTrainLoss(nn.Module):
         self._last_ch: float = -1.0
         self._last_pca: float = -1.0
         self._last_directional: float = -1.0
+        self._last_mmd: float = -1.0
 
     # ------------------------------------------------------------------ #
     # Epoch tracking (forwarded to neighborhood for tolerance warmup)
@@ -196,7 +209,10 @@ class CombinedTrainLoss(nn.Module):
 
         device = masked_pred.positions.device
         dtype = masked_pred.positions.dtype
-        loss = torch.zeros(1, device=device, dtype=dtype).squeeze()
+        # Seed from pred positions so the combined loss always carries a grad_fn,
+        # even when every sub-loss is disabled / gated off (e.g. by other_trigger).
+        # Otherwise loss.backward() raises "element 0 does not require grad".
+        loss = masked_pred.positions.sum() * 0.0
         to_log: Dict[str, float] = {}
         prefix = "train_loss" if train_stage else "val_loss"
 
@@ -269,6 +285,21 @@ class CombinedTrainLoss(nn.Module):
             if log and d_log:
                 to_log.update(d_log)
 
+        # ---- MMD ----
+        if self.mmd is not None and self.mmd_weight != 0.0 and self._other_losses_active():
+            m_loss, m_log = self.mmd(
+                masked_pred, masked_true,
+                train_stage=train_stage,
+                log=log,
+            )
+            weighted = self.mmd_weight * m_loss
+            loss = loss + weighted
+            self._last_mmd = float(m_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/mmd_weighted"] = float(weighted.detach().item())
+            if log and m_log:
+                to_log.update(m_log)
+
         self._last_loss = float(loss.detach().item())
 
         if log:
@@ -291,6 +322,8 @@ class CombinedTrainLoss(nn.Module):
             self.pca.reset()
         if self.directional is not None and hasattr(self.directional, "reset"):
             self.directional.reset()
+        if self.mmd is not None:
+            self.mmd.reset()
         self.clear_gt_cache()
 
     def log_epoch_metrics(self, train_stage: bool = True) -> Dict[str, float]:
@@ -337,6 +370,15 @@ class CombinedTrainLoss(nn.Module):
                 )
             else:
                 to_log[f"{epoch_prefix}/directional_weighted"] = 0.0
+        if self.mmd is not None and self.mmd_weight != 0.0:
+            if self._other_losses_active():
+                to_log[f"{epoch_prefix}/mmd"] = float(self._last_mmd)
+                to_log[f"{epoch_prefix}/mmd_weighted"] = float(
+                    self._last_mmd * self.mmd_weight
+                )
+                to_log.update(self.mmd.log_epoch_metrics(train_stage=train_stage))
+            else:
+                to_log[f"{epoch_prefix}/mmd_weighted"] = 0.0
         if wandb.run:
             wandb.log(to_log, commit=False)
         return to_log
@@ -349,3 +391,5 @@ class CombinedTrainLoss(nn.Module):
             self.ch.clear_gt_cache()
         if self.pca is not None:
             self.pca.clear_gt_cache()
+        if self.mmd is not None:
+            self.mmd.clear_gt_cache()

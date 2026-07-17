@@ -73,9 +73,13 @@ def get_test_save_path(root_dir, cfg):
     Creates a directory for saving the evaluation results for the test epoch.
     """
     epoch_index = cfg.test.epoch_index
-    model_name = cfg.test.checkpoint_path.split("/")[-3].split("_")[0]
+    ckpt = pathlib.Path(cfg.test.checkpoint_path)
+    if ckpt.parent.name == "checkpoints":
+        run_label = ckpt.parent.parent.name
+    else:
+        run_label = ckpt.parent.name
     test_save_path = os.path.join(
-        root_dir, f"model_{model_name}_epoch_{str(epoch_index)}"
+        root_dir, f"model_{run_label}_epoch_{str(epoch_index)}"
     )
     os.makedirs(test_save_path, exist_ok=True)
     return test_save_path
