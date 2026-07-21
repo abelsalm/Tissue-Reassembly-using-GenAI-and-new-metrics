@@ -282,7 +282,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
          ``512 * r``) before aggregation.
       6. Aggregate: mean over valid cells, then mean over radii, then::
 
-             L = transcriptome_term
+             L = avg_transcriptome_weight * transcriptome_term
                + density_weight * density_term
                + global_transcriptome_weight * global_term
 
@@ -299,6 +299,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
     def __init__(
         self,
         radii: Sequence[float] = (0.005, 0.01, 0.05, 0.1),
+        avg_transcriptome_weight: float = 1.0,
         density_weight: float = 1.0,
         global_transcriptome_weight: float = 0.0,
         loss_radius_scale: float = 512.0,
@@ -318,6 +319,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self.radii, self.transcriptome_tolerance_per_shell = (
             _align_radii_and_transcriptome_tolerances(radii, transcriptome_tolerance)
         )
+        self.avg_transcriptome_weight = float(avg_transcriptome_weight)
         self.density_weight = float(density_weight)
         self.global_transcriptome_weight = float(global_transcriptome_weight)
         self.loss_radius_scale = float(loss_radius_scale)
@@ -573,7 +575,7 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         density_term = dens_per_r.mean()
         global_term = global_per_r.mean()
         loss = (
-            transcriptome_term
+            self.avg_transcriptome_weight * transcriptome_term
             + self.density_weight * density_term
             + self.global_transcriptome_weight * global_term
         )
@@ -645,6 +647,5 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
                 self._last_global_transcriptome
             ),
         }
-        if wandb.run:
-            wandb.log(to_log, commit=False)
+        # No per-step wandb.log — Lightning averages these at epoch end.
         return to_log

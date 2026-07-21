@@ -635,6 +635,5 @@ class DirectionalMetricLoss(nn.Module):
             f"{epoch_prefix}/directional_length": float(self._last_length),
             f"{epoch_prefix}/directional_pairwise": float(self._last_pairwise),
         }
-        if wandb.run:
-            wandb.log(to_log, commit=False)
+        # No per-step wandb.log — Lightning averages these at epoch end.
         return to_log

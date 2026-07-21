@@ -101,7 +101,5 @@ class LossFunction(nn.Module):
             f"{epoch_prefix}/position_mse": epoch_position_loss,
         }
 
-        if wandb.run:
-            wandb.log(to_log, commit=False)
-
+        # No per-step wandb.log — Lightning averages these at epoch end.
         return to_log

@@ -6,32 +6,25 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    the test split. Sampling is organised **seed-first**: for each seed, all
    sections are inferred in batches of ``test.batch_size`` graphs; analysis
    runs only after every seed/section pair has been collected.
-2. Computes **precise per-cell-type distributional distances** between the
-   predicted spatial distributions and the ground-truth slice.
+2. Computes **isotropic IMQ-MMD distances** (from ``metrics/train_mmds.py``,
+   no anisotropy) between predicted and GT point clouds, under two ICP
+   registrations:
 
-   For every cell type we end up with **two Wasserstein distances**:
+   * **global ICP** — align the full predicted cloud to the GT slice once.
+   * **per-class ICP** — independently ICP-align each cell-type cloud to its
+     GT class cloud (then stitch class clouds for the whole-slice term).
 
-   * ``wasserstein_whole_slice_alignment`` — every denoising sample's *full*
-     point cloud is rigidly aligned to the GT slice via ICP (rotation +
-     translation jointly optimised, optional x/y reflection; no per-cell index
-     matching), the
-     cells of the given type are turned into a 2-D continuous distribution
-     (KDE), discretized on a shared grid, averaged over samples, and compared
-     to the GT type sample (also KDE'd on the same grid). The distance is the
-     Sinkhorn approximation of the Wasserstein-1 distance between the two
-     discretized distributions.
-   * ``wasserstein_per_class_alignment`` — instead of aligning the whole slice,
-     we ICP-align each sample's *cell-type-only* point cloud to the GT
-     cell-type cloud (same rotation + translation + reflection search; no
-     per-cell matching), then build the per-sample KDE on the
-     same shared grid, average over samples, and again compute the Sinkhorn
-     distance to the GT type KDE.
+   For each registration we report three scalars (averaged over denoising
+   samples, then over sections):
 
-   The continuous→discrete step is shared by both alignments: a 2-D Gaussian
-   KDE is built from the point set, evaluated on a regular grid, and mass-
-   normalised so each distribution sums to 1 on the grid. The Sinkhorn
-   iteration runs on these two histograms with the ground-cost matrix given
-   by the Euclidean distance between grid cell centres.
+   * ``mmd_whole_slice`` — isotropic IMQ-MMD on the full point cloud
+     (bandwidths = median pairwise × ``whole_slice_band_mults``).
+   * ``mmd_pair_dist`` — IMQ-MMD on pairwise-distance distributions
+     (bandwidths = median pair-dist × ``pair_dist_band_mults``), averaged
+     over cell types.
+   * ``mmd_spatial`` — isotropic IMQ-MMD on per-class spatial point clouds
+     (bandwidths = median pairwise × ``spatial_band_mults``), averaged
+     over cell types.
 
 3. Computes **Cahn-Hilliard energy comparison metrics** (see
    ``metrics/test_ch_and_voronoi.py``) per denoising sample, then averages
@@ -80,12 +73,11 @@ Usage
 
 from __future__ import annotations
 
-import argparse
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import hydra
 import numpy as np
@@ -117,6 +109,15 @@ from metrics.test_ch_and_voronoi import (  # noqa: E402
 )
 from metrics.test_vanilla_loss import LossFunction as PositionMSELoss  # noqa: E402
 from metrics.train_directional_metric import DirectionalMetricLoss  # noqa: E402
+from metrics.train_spatial_transcriptomics import MultiRadiusNeighborhoodLoss  # noqa: E402
+from metrics.train_mmds import (  # noqa: E402
+    PAIR_DIST_MMD_MAX_SAMPLES,
+    mmd2_imq_iso,
+    pair_dist_mmd_loss,
+    pair_dist_mmd_sigmas,
+    precompute_pair_dist_mmd_gt,
+    precompute_whole_slice_mmd_cache,
+)
 from utils.data.dataholder import DataHolder  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,174 +357,6 @@ def cell_classes_with_min_cells(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Continuous distributions (KDE) + grid discretization
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_common_grid(
-    points_list: Iterable[np.ndarray],
-    grid_resolution: int,
-    grid_margin: float,
-) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float, float]]:
-    """Build a shared regular grid covering the bounding box of every point set.
-
-    ``points_list`` should include both the GT and (a representative sample of)
-    the predicted point clouds so the grid contains every distribution we will
-    discretize. Returns ``(grid_x, grid_y, extent)`` where ``extent`` follows
-    matplotlib's ``(xmin, xmax, ymin, ymax)`` convention.
-    """
-    stacked = np.concatenate(
-        [np.asarray(pts, dtype=np.float64) for pts in points_list if pts.size],
-        axis=0,
-    )
-    if stacked.size == 0:
-        raise ValueError("Cannot build a grid from an empty point set.")
-    xmin, ymin = stacked.min(axis=0) - grid_margin
-    xmax, ymax = stacked.max(axis=0) + grid_margin
-    grid_x = np.linspace(xmin, xmax, grid_resolution, dtype=np.float64)
-    grid_y = np.linspace(ymin, ymax, grid_resolution, dtype=np.float64)
-    extent = (float(xmin), float(xmax), float(ymin), float(ymax))
-    return grid_x, grid_y, extent
-
-
-def _kde_eval_on_grid(
-    points: np.ndarray,
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    bandwidth: float,
-) -> np.ndarray:
-    """Evaluate an isotropic 2-D Gaussian KDE at ``points`` over the grid.
-
-    Returns a ``(len(grid_y), len(grid_x))`` density array. Uses
-    ``scipy.stats.gaussian_kde`` with a fixed bandwidth (Scott's factor is
-    overridden via ``bw_method = bandwidth / std`` per axis-covariance so the
-    resulting kernel std is exactly ``bandwidth`` in both x and y). When fewer
-    than two points are provided, falls back to a single Gaussian placed at the
-    (one) point so the function stays total.
-    """
-    from scipy.stats import gaussian_kde
-
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    n = pts.shape[0]
-    if n == 0:
-        return np.zeros((grid_y.size, grid_x.size), dtype=np.float64)
-    if n < 2:
-        # Place a single isotropic Gaussian at the lone point.
-        dx = grid_x[None, :] - pts[0, 0]
-        dy = grid_y[None, :] - pts[0, 1]
-        g = np.exp(-(dx**2 + dy**2) / (2.0 * bandwidth**2))
-        g /= 2.0 * np.pi * bandwidth**2
-        return g.astype(np.float64)
-
-    # gaussian_kde scales the kernel by bw_method * data_covariance. To get a
-    # kernel whose std is exactly ``bandwidth`` regardless of the spread of the
-    # data, we first standardise the points and set bw_method so the resulting
-    # std on the standardised scale equals bandwidth / per_axis_std. Working on
-    # the standardised data keeps the covariance isotropic.
-    pts_T = pts.T  # (2, n)
-    kde = gaussian_kde(pts_T, bw_method=bandwidth)
-    X, Y = np.meshgrid(grid_x, grid_y, indexing="xy")  # both (H, W)
-    coords = np.vstack([X.ravel(), Y.ravel()])
-    density = kde(coords).reshape(X.shape).astype(np.float64)
-    return density
-
-
-def discretize_to_grid(
-    points: np.ndarray,
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    bandwidth: float,
-    eps: float = 1e-12,
-) -> np.ndarray:
-    """Build a normalized probability matrix from ``points`` on the grid.
-
-    A 2-D Gaussian KDE is built from ``points`` and evaluated at every grid
-    cell centre; the resulting density is then mass-normalised to sum to 1
-    (i.e. a discrete probability distribution over grid cells). Returns an
-    array of shape ``(len(grid_y), len(grid_x))``.
-    """
-    density = _kde_eval_on_grid(points, grid_x, grid_y, bandwidth)
-    total = density.sum()
-    if total <= 0.0:
-        out = np.full_like(density, eps)
-        return out / out.sum()
-    density = density / total
-    # Avoid exact zeros so the Sinkhorn iterations stay numerically stable.
-    density = np.where(density > eps, density, eps)
-    density /= density.sum()
-    return density
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sinkhorn approximation of the Wasserstein-1 distance on a grid
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _grid_cost_matrix(grid_x: np.ndarray, grid_y: np.ndarray) -> np.ndarray:
-    """Euclidean ground cost between every pair of grid cell centres.
-
-    Returns a matrix of shape ``(nx*ny, nx*ny)`` where cell ``(ix, iy)`` is
-    flattened in row-major order over y then x (i.e. index = iy * nx + ix).
-    """
-    X, Y = np.meshgrid(grid_x, grid_y, indexing="xy")  # both (ny, nx)
-    centres = np.stack([X.ravel(), Y.ravel()], axis=1)  # (nx*ny, 2)
-    diff = centres[:, None, :] - centres[None, :, :]
-    cost = np.sqrt((diff**2).sum(axis=-1))
-    return cost.astype(np.float64)
-
-
-def sinkhorn_wasserstein_grid(
-    P: np.ndarray,
-    Q: np.ndarray,
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    reg: float,
-    n_iters: int = 500,
-    tol: float = 1e-9,
-    cost: np.ndarray | None = None,
-) -> float:
-    """Approximate the Wasserstein-1 distance between two grid distributions.
-
-    Both ``P`` and ``Q`` must be probability matrices of shape
-    ``(len(grid_y), len(grid_x))`` summing to 1. Sinkhorn's algorithm is run
-    with entropic regularization ``reg`` (the larger ``reg``, the smoother /
-    more biased the estimate). The returned scalar is the regularised Sinkhorn
-    transport cost — an upper-bound proxy for the true Wasserstein-1 distance.
-    """
-    P = np.asarray(P, dtype=np.float64).ravel()
-    Q = np.asarray(Q, dtype=np.float64).ravel()
-    if P.shape != Q.shape:
-        raise ValueError(
-            f"P and Q must share shape; got {P.shape} and {Q.shape}."
-        )
-    if P.sum() <= 0 or Q.sum() <= 0:
-        raise ValueError("P and Q must be non-empty probability distributions.")
-
-    P = P / P.sum()
-    Q = Q / Q.sum()
-    if cost is None:
-        cost = _grid_cost_matrix(grid_x, grid_y)
-
-    K = np.exp(-cost / reg)
-    u = np.ones_like(P)
-    v = np.ones_like(Q)
-    for _ in range(n_iters):
-        u_prev = u
-        # K v
-        kv = K @ v
-        u = P / np.where(kv > 0, kv, 1e-300)
-        ku = K.T @ u
-        v = Q / np.where(ku > 0, ku, 1e-300)
-        if np.max(np.abs(u - u_prev)) < tol:
-            break
-
-    # Regularised transport cost = sum_ij T_ij * cost_ij with T = diag(u) K diag(v).
-    transport = u[:, None] * K * v[None, :]
-    wdist = float((transport * cost).sum())
-    return wdist
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # ICP-based rigid alignment helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -666,9 +499,7 @@ def align_samples_to_reference_torch(
     """Batched rotation-only Procrustes alignment of every sample onto ``reference``.
 
     Vectorised GPU implementation of rotation-only Procrustes (no axis-reflection
-    search). Used for cross-sample spread metrics; for Wasserstein alignment
-    metrics see :func:`align_samples_to_reference`, which uses ICP with
-    reflection search.
+    search). Used for cross-sample spread metrics.
 
     Args:
         samples: ``(S, N, 2)`` point clouds (one per denoising sample).
@@ -775,7 +606,7 @@ def compute_cross_sample_position_spread(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-cell-type distributional distances
+# Isotropic IMQ-MMD distances (ICP global + ICP per-class)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -783,256 +614,279 @@ def _class_mask_for_sample(batch: SliceBatch, cell_class: str) -> np.ndarray:
     return np.asarray([str(c) == str(cell_class) for c in batch.cell_class_labels])
 
 
-def compute_wasserstein_whole_slice_alignment(
-    preds: np.ndarray,
-    batch: SliceBatch,
-    cell_classes: list[str],
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    bandwidth: float,
-    sinkhorn_reg: float,
-    sinkhorn_iters: int,
-) -> pd.DataFrame:
-    """Wasserstein distances after whole-slice ICP alignment.
+def _to_torch_xy(points: np.ndarray, device: Any) -> torch.Tensor:
+    return torch.as_tensor(np.asarray(points, dtype=np.float32), dtype=torch.float32, device=device)
 
-    Every sample's full point cloud is rigidly aligned to the GT slice via
-    ICP (rotation + translation jointly optimised, optional x/y reflection;
-    no per-cell matching); for
-    each cell type the aligned class points are turned into a KDE on the shared
-    grid, averaged over samples, and compared to the GT class KDE via Sinkhorn.
+
+def _iso_mmd(
+    pred_xy: torch.Tensor,
+    gt_xy: torch.Tensor,
+    band_mults: tuple[float, ...],
+) -> float:
+    """Isotropic IMQ-MMD between two 2-D point clouds (no anisotropy)."""
+    if pred_xy.shape[0] < 2 or gt_xy.shape[0] < 2:
+        return float("nan")
+    cache = precompute_whole_slice_mmd_cache(gt_xy, band_mults)
+    if cache is None:
+        return float("nan")
+    return float(mmd2_imq_iso(pred_xy, cache.G, cache.sigmas, cache.ky_offdiag).item())
+
+
+def _pair_dist_mmd(
+    pred_xy: torch.Tensor,
+    gt_xy: torch.Tensor,
+    band_mults: tuple[float, ...],
+    max_samples: int,
+) -> float:
+    """IMQ-MMD between pairwise-distance distributions of two point clouds."""
+    if pred_xy.shape[0] < 2 or gt_xy.shape[0] < 2:
+        return float("nan")
+    dist_sigmas = pair_dist_mmd_sigmas(gt_xy, band_mults)
+    gt_samples, gt_self = precompute_pair_dist_mmd_gt(gt_xy, dist_sigmas, max_samples)
+    val = pair_dist_mmd_loss(pred_xy, gt_samples, gt_self, dist_sigmas, max_samples)
+    return float(val.item())
+
+
+def _mean_finite(values: list[float]) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(arr.mean())
+
+
+def _mmd_triplet_on_clouds(
+    *,
+    pred_full: torch.Tensor,
+    gt_full: torch.Tensor,
+    class_pairs: list[tuple[torch.Tensor, torch.Tensor]],
+    whole_slice_band_mults: tuple[float, ...],
+    spatial_band_mults: tuple[float, ...],
+    pair_dist_band_mults: tuple[float, ...],
+    pair_dist_max_samples: int,
+) -> dict[str, float]:
+    """Compute whole-slice / spatial / pair-dist MMD for one aligned sample.
+
+    ``class_pairs`` is a list of ``(pred_class_xy, gt_class_xy)`` tensors used
+    for the per-class spatial and pair-distance terms. ``pred_full`` /
+    ``gt_full`` are the clouds used for the whole-slice term (globally
+    aligned full clouds, or the concatenation of independently aligned
+    class clouds).
     """
-    gt_positions = batch.gt_positions.astype(np.float32)
-    aligned_preds = align_samples_to_reference(preds, gt_positions)
+    whole = _iso_mmd(pred_full, gt_full, whole_slice_band_mults)
 
-    cost = _grid_cost_matrix(grid_x, grid_y)
-    rows = []
-    for cell_class in cell_classes:
-        mask = _class_mask_for_sample(batch, cell_class)
-        gt_class_points = gt_positions[mask]
-        if gt_class_points.shape[0] < 2:
-            continue
-
-        gt_dist = discretize_to_grid(gt_class_points, grid_x, grid_y, bandwidth)
-
-        sample_dists = []
-        for s in range(aligned_preds.shape[0]):
-            class_pts = aligned_preds[s][mask]
-            if class_pts.shape[0] == 0:
-                continue
-            sample_dists.append(
-                discretize_to_grid(class_pts, grid_x, grid_y, bandwidth)
-            )
-        if not sample_dists:
-            continue
-        pred_dist = np.mean(np.stack(sample_dists, axis=0), axis=0)
-        pred_dist = pred_dist / pred_dist.sum()
-
-        wdist = sinkhorn_wasserstein_grid(
-            pred_dist, gt_dist, grid_x, grid_y,
-            reg=sinkhorn_reg, n_iters=sinkhorn_iters, cost=cost,
+    spatial_vals: list[float] = []
+    pair_vals: list[float] = []
+    for X, G in class_pairs:
+        spatial_vals.append(_iso_mmd(X, G, spatial_band_mults))
+        pair_vals.append(
+            _pair_dist_mmd(X, G, pair_dist_band_mults, pair_dist_max_samples)
         )
-        rows.append({
-            "cell_class": str(cell_class),
-            "wasserstein_whole_slice_alignment": wdist,
-            "n_class_cells": int(mask.sum()),
-            "n_samples_used": len(sample_dists),
-        })
-    return pd.DataFrame(rows)
+    return {
+        "mmd_whole_slice": whole,
+        "mmd_spatial": _mean_finite(spatial_vals),
+        "mmd_pair_dist": _mean_finite(pair_vals),
+    }
 
 
-def compute_wasserstein_per_class_alignment(
+def compute_section_mmd_metrics(
     preds: np.ndarray,
     batch: SliceBatch,
     cell_classes: list[str],
-    grid_x: np.ndarray,
-    grid_y: np.ndarray,
-    bandwidth: float,
-    sinkhorn_reg: float,
-    sinkhorn_iters: int,
+    mmd_cfg: Any,
+    device: Any,
 ) -> pd.DataFrame:
-    """Wasserstein distances after per-cell-type ICP alignment.
+    """Per-sample isotropic MMDs under global ICP and per-class ICP.
 
-    For each cell type, every sample's class-only point cloud is ICP-aligned
-    to the GT class cloud (rotation + translation + reflection, no per-cell
-    matching), KDE'd on the shared grid, averaged over
-    samples, and compared to the GT class KDE via Sinkhorn.
+    Returns one row per denoising sample with columns:
+    ``sample_index``,
+    ``mmd_whole_slice_global``, ``mmd_pair_dist_global``, ``mmd_spatial_global``,
+    ``mmd_whole_slice_per_class``, ``mmd_pair_dist_per_class``, ``mmd_spatial_per_class``.
     """
-    gt_positions = batch.gt_positions.astype(np.float32)
-    cost = _grid_cost_matrix(grid_x, grid_y)
-    rows = []
-    for cell_class in cell_classes:
-        mask = _class_mask_for_sample(batch, cell_class)
-        gt_class_points = gt_positions[mask]
-        if gt_class_points.shape[0] < 2:
-            continue
-
-        gt_dist = discretize_to_grid(gt_class_points, grid_x, grid_y, bandwidth)
-
-        sample_dists = []
-        for s in range(preds.shape[0]):
-            class_pts = preds[s][mask]
-            if class_pts.shape[0] < 2:
-                continue
-            aligned_pts = align_point_clouds_icp(
-                gt_class_points, class_pts
-            )
-            sample_dists.append(
-                discretize_to_grid(aligned_pts, grid_x, grid_y, bandwidth)
-            )
-        if not sample_dists:
-            continue
-        pred_dist = np.mean(np.stack(sample_dists, axis=0), axis=0)
-        pred_dist = pred_dist / pred_dist.sum()
-
-        wdist = sinkhorn_wasserstein_grid(
-            pred_dist, gt_dist, grid_x, grid_y,
-            reg=sinkhorn_reg, n_iters=sinkhorn_iters, cost=cost,
-        )
-        rows.append({
-            "cell_class": str(cell_class),
-            "wasserstein_per_class_alignment": wdist,
-            "n_class_cells": int(mask.sum()),
-            "n_samples_used": len(sample_dists),
-        })
-    return pd.DataFrame(rows)
-
-
-def compute_section_wasserstein_metrics(
-    preds: np.ndarray,
-    batch: SliceBatch,
-    cell_classes: list[str],
-    wasserstein_cfg: Any,
-) -> pd.DataFrame:
-    """Compute both Wasserstein distances for every cell type of one section."""
-    grid_resolution = int(wasserstein_cfg.grid_resolution)
-    grid_margin = float(wasserstein_cfg.grid_margin)
-    bandwidth = float(wasserstein_cfg.kde_bandwidth)
-    sinkhorn_reg = float(wasserstein_cfg.sinkhorn_reg)
-    sinkhorn_iters = int(wasserstein_cfg.sinkhorn_iters)
-
-    gt_positions = batch.gt_positions.astype(np.float32)
-    grid_x, grid_y, _ = build_common_grid(
-        [gt_positions] + [preds[s] for s in range(preds.shape[0])],
-        grid_resolution=grid_resolution,
-        grid_margin=grid_margin,
+    whole_slice_band_mults = tuple(float(x) for x in mmd_cfg.whole_slice_band_mults)
+    spatial_band_mults = tuple(float(x) for x in mmd_cfg.spatial_band_mults)
+    pair_dist_band_mults = tuple(float(x) for x in mmd_cfg.pair_dist_band_mults)
+    pair_dist_max_samples = int(
+        getattr(mmd_cfg, "pair_dist_max_samples", PAIR_DIST_MMD_MAX_SAMPLES)
     )
 
-    whole_df = compute_wasserstein_whole_slice_alignment(
-        preds, batch, cell_classes, grid_x, grid_y,
-        bandwidth, sinkhorn_reg, sinkhorn_iters,
-    )
-    per_class_df = compute_wasserstein_per_class_alignment(
-        preds, batch, cell_classes, grid_x, grid_y,
-        bandwidth, sinkhorn_reg, sinkhorn_iters,
-    )
-
-    if whole_df.empty and per_class_df.empty:
+    gt_np = batch.gt_positions.astype(np.float32)
+    gt_full = _to_torch_xy(gt_np, device)
+    class_masks = [_class_mask_for_sample(batch, c) for c in cell_classes]
+    # Drop empty / tiny classes for per-class terms.
+    kept = []
+    for mask in class_masks:
+        if int(mask.sum()) >= 2:
+            kept.append(mask)
+    class_masks = kept
+    if not class_masks:
         return pd.DataFrame()
-    merged = pd.merge(
-        whole_df, per_class_df,
-        on=["cell_class", "n_class_cells", "n_samples_used"],
-        how="outer",
-    )
-    return merged
+
+    rows = []
+    for s in range(preds.shape[0]):
+        pred_s = preds[s].astype(np.float32)
+
+        # --- Global ICP: one rigid transform on the full cloud ---
+        aligned_global_np = align_point_clouds_icp(gt_np, pred_s)
+        aligned_global = _to_torch_xy(aligned_global_np, device)
+        global_pairs = [
+            (aligned_global[mask], gt_full[mask]) for mask in class_masks
+        ]
+        global_vals = _mmd_triplet_on_clouds(
+            pred_full=aligned_global,
+            gt_full=gt_full,
+            class_pairs=global_pairs,
+            whole_slice_band_mults=whole_slice_band_mults,
+            spatial_band_mults=spatial_band_mults,
+            pair_dist_band_mults=pair_dist_band_mults,
+            pair_dist_max_samples=pair_dist_max_samples,
+        )
+
+        # --- Per-class ICP: independent rigid transform per cell type ---
+        aligned_classes: list[torch.Tensor] = []
+        gt_classes: list[torch.Tensor] = []
+        for mask in class_masks:
+            class_pred = pred_s[mask]
+            class_gt_np = gt_np[mask]
+            aligned_c = align_point_clouds_icp(class_gt_np, class_pred)
+            aligned_classes.append(_to_torch_xy(aligned_c, device))
+            gt_classes.append(gt_full[mask])
+        stitched = torch.cat(aligned_classes, dim=0)
+        gt_stitched = torch.cat(gt_classes, dim=0)
+        per_class_pairs = list(zip(aligned_classes, gt_classes))
+        per_class_vals = _mmd_triplet_on_clouds(
+            pred_full=stitched,
+            gt_full=gt_stitched,
+            class_pairs=per_class_pairs,
+            whole_slice_band_mults=whole_slice_band_mults,
+            spatial_band_mults=spatial_band_mults,
+            pair_dist_band_mults=pair_dist_band_mults,
+            pair_dist_max_samples=pair_dist_max_samples,
+        )
+
+        rows.append({
+            "sample_index": s,
+            "mmd_whole_slice_global": global_vals["mmd_whole_slice"],
+            "mmd_pair_dist_global": global_vals["mmd_pair_dist"],
+            "mmd_spatial_global": global_vals["mmd_spatial"],
+            "mmd_whole_slice_per_class": per_class_vals["mmd_whole_slice"],
+            "mmd_pair_dist_per_class": per_class_vals["mmd_pair_dist"],
+            "mmd_spatial_per_class": per_class_vals["mmd_spatial"],
+        })
+    return pd.DataFrame(rows)
 
 
-def aggregate_wasserstein_across_sections(
+_MMD_METRIC_PAIRS: list[tuple[str, str, str]] = [
+    ("mmd_whole_slice", "mmd_whole_slice_global", "mmd_whole_slice_per_class"),
+    ("mmd_pair_dist", "mmd_pair_dist_global", "mmd_pair_dist_per_class"),
+    ("mmd_spatial", "mmd_spatial_global", "mmd_spatial_per_class"),
+]
+
+
+def aggregate_mmd_across_sections(
     section_tables: list[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Average the two Wasserstein distances per cell type across sections."""
+    """Average per-sample MMD metrics across sections (one row per section + ALL)."""
     if not section_tables:
         return pd.DataFrame()
     combined = pd.concat(section_tables, ignore_index=True)
     if combined.empty:
         return pd.DataFrame()
+
+    metric_cols = [
+        "mmd_whole_slice_global",
+        "mmd_pair_dist_global",
+        "mmd_spatial_global",
+        "mmd_whole_slice_per_class",
+        "mmd_pair_dist_per_class",
+        "mmd_spatial_per_class",
+    ]
     grouped = (
-        combined.groupby("cell_class", as_index=False)
-        .agg(
-            mean_wasserstein_whole_slice_alignment=(
-                "wasserstein_whole_slice_alignment", "mean"
-            ),
-            std_wasserstein_whole_slice_alignment=(
-                "wasserstein_whole_slice_alignment", "std"
-            ),
-            mean_wasserstein_per_class_alignment=(
-                "wasserstein_per_class_alignment", "mean"
-            ),
-            std_wasserstein_per_class_alignment=(
-                "wasserstein_per_class_alignment", "std"
-            ),
-            n_sections=("cell_class", "size"),
-            total_cells=("n_class_cells", "sum"),
-        )
-        .sort_values("cell_class")
+        combined.groupby("cell_section", as_index=False)[metric_cols]
+        .agg(["mean", "std"])
+        .reset_index()
     )
-    for col in (
-        "std_wasserstein_whole_slice_alignment",
-        "std_wasserstein_per_class_alignment",
-    ):
-        grouped[col] = grouped[col].fillna(0.0)
-    return grouped
+    grouped.columns = [
+        "_".join(col).strip("_") if isinstance(col, tuple) else col
+        for col in grouped.columns
+    ]
+    if "index" in grouped.columns:
+        grouped = grouped.drop(columns=["index"])
+
+    overall = {"cell_section": "ALL"}
+    for col in metric_cols:
+        overall[f"{col}_mean"] = float(combined[col].mean())
+        overall[f"{col}_std"] = float(combined[col].std(ddof=0))
+    out = pd.concat([grouped, pd.DataFrame([overall])], ignore_index=True)
+    for col in metric_cols:
+        std_col = f"{col}_std"
+        if std_col in out.columns:
+            out[std_col] = out[std_col].fillna(0.0)
+    return out
 
 
-def plot_wasserstein_summary(
+def plot_mmd_summary(
     summary_df: pd.DataFrame,
     save_path: Path,
-    n_sections_total: int | None = None,
 ) -> None:
-    """Grouped bar chart of the two per-class Wasserstein distances."""
+    """Three-subplot bar chart: whole-slice / pair-dist / spatial MMD.
+
+    Each subplot shows global ICP vs per-class ICP (two bars per section).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if summary_df.empty:
-        print("[testing_pipeline] No Wasserstein data to plot.")
+        print("[testing_pipeline] No MMD data to plot.")
         return
 
     save_path = Path(save_path)
-    plot_df = summary_df.sort_values("mean_wasserstein_whole_slice_alignment")
-    classes = plot_df["cell_class"].to_numpy()
-    y = np.arange(len(classes))
-    bar_h = 0.4
+    plot_df = summary_df[summary_df["cell_section"] != "ALL"].copy()
+    if plot_df.empty:
+        plot_df = summary_df.copy()
+    labels = plot_df["cell_section"].tolist()
+    x = np.arange(len(labels))
+    w = 0.36
 
-    fig, ax = plt.subplots(figsize=(10, max(4.0, 0.4 * len(classes))))
-    ax.barh(
-        y - bar_h / 2,
-        plot_df["mean_wasserstein_whole_slice_alignment"],
-        xerr=plot_df["std_wasserstein_whole_slice_alignment"],
-        height=bar_h,
-        color="tab:blue",
-        alpha=0.85,
-        capsize=3,
-        label="Whole-slice alignment",
+    titles = (
+        "Whole-slice MMD\n(isotropic IMQ, multi-bandwidth)",
+        "Pair-distance MMD\n(distance-distribution IMQ, multi-bandwidth)",
+        "Spatial MMD\n(per-class isotropic IMQ, multi-bandwidth)",
     )
-    ax.barh(
-        y + bar_h / 2,
-        plot_df["mean_wasserstein_per_class_alignment"],
-        xerr=plot_df["std_wasserstein_per_class_alignment"],
-        height=bar_h,
-        color="tab:orange",
-        alpha=0.85,
-        capsize=3,
-        label="Per-class alignment",
+    pairs = _MMD_METRIC_PAIRS
+
+    fig, axes = plt.subplots(1, 3, figsize=(max(12.0, 1.1 * len(labels) * 3), 5.2))
+    for ax, title, (_, global_key, per_class_key) in zip(axes, titles, pairs):
+        g_means = plot_df[f"{global_key}_mean"].to_numpy(dtype=float)
+        g_stds = plot_df[f"{global_key}_std"].to_numpy(dtype=float)
+        p_means = plot_df[f"{per_class_key}_mean"].to_numpy(dtype=float)
+        p_stds = plot_df[f"{per_class_key}_std"].to_numpy(dtype=float)
+        ax.bar(
+            x - w / 2, g_means, w, yerr=g_stds, capsize=3,
+            color="tab:blue", alpha=0.85, label="Global ICP",
+        )
+        ax.bar(
+            x + w / 2, p_means, w, yerr=p_stds, capsize=3,
+            color="tab:orange", alpha=0.85, label="Per-class ICP",
+        )
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=30, ha="right")
+        ax.set_ylabel("MMD² (mean over samples)")
+        ax.set_title(title, fontsize=10)
+        ax.legend(loc="best", fontsize=8, framealpha=0.85)
+
+    fig.suptitle(
+        "Isotropic IMQ-MMD to GT under two ICP registrations",
+        fontsize=12,
+        fontweight="semibold",
     )
-    ax.set_yticks(y)
-    ax.set_yticklabels(classes)
-    ax.invert_yaxis()
-    ax.set_xlabel("Sinkhorn-approximated Wasserstein distance to GT")
-    ax.set_ylabel("Cell class")
-    sections_note = (
-        f", {n_sections_total} sections" if n_sections_total is not None else ""
-    )
-    ax.set_title(
-        "Per-cell-type Wasserstein distance to GT spatial distribution\n"
-        f"(KDE on grid + Sinkhorn{sections_note}; "
-        f"{int(plot_df['total_cells'].sum())} cells total)"
-    )
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.8)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
-    print(f"[testing_pipeline] Saved Wasserstein summary plot → {save_path}")
+    print(f"[testing_pipeline] Saved MMD summary plot → {save_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +944,39 @@ def _build_directional_loss(dir_cfg: Any) -> DirectionalMetricLoss:
         density_length_beta=float(getattr(dir_cfg, "density_length_beta", 4.0)),
         density_radius_gate=bool(getattr(dir_cfg, "density_radius_gate", False)),
         density_radius_beta=float(getattr(dir_cfg, "density_radius_beta", 4.0)),
+    )
+
+
+def _build_multi_radius_loss(mr_cfg: Any) -> MultiRadiusNeighborhoodLoss:
+    """Instantiate the multi-radius neighborhood loss from config (train defaults)."""
+    soft_beta = getattr(mr_cfg, "soft_beta", None)
+    soft_beta = None if soft_beta is None else float(soft_beta)
+    tol_beta = getattr(mr_cfg, "transcriptome_tolerance_soft_beta", None)
+    tol_beta = None if tol_beta is None else float(tol_beta)
+    tol = getattr(mr_cfg, "transcriptome_tolerance", 0.05)
+    if hasattr(tol, "__iter__") and not isinstance(tol, (str, bytes)):
+        tol = [float(x) for x in tol]
+    else:
+        tol = float(tol)
+    return MultiRadiusNeighborhoodLoss(
+        radii=[float(r) for r in mr_cfg.radii],
+        avg_transcriptome_weight=float(
+            getattr(mr_cfg, "avg_transcriptome_weight", 1.0)
+        ),
+        density_weight=float(getattr(mr_cfg, "density_weight", 0.0)),
+        global_transcriptome_weight=float(
+            getattr(mr_cfg, "global_transcriptome_weight", 1.0)
+        ),
+        loss_radius_scale=float(getattr(mr_cfg, "loss_radius_scale", 512.0)),
+        transcriptome_tolerance=tol,
+        transcriptome_tolerance_gate_beta=tol_beta,
+        transcriptome_tolerance_warmup_epochs=int(
+            getattr(mr_cfg, "transcriptome_tolerance_warmup_epochs", 0)
+        ),
+        soft_beta=soft_beta,
+        eps=float(getattr(mr_cfg, "eps", 1e-6)),
+        include_self=bool(getattr(mr_cfg, "include_self", True)),
+        cache_gt=False,
     )
 
 
@@ -1352,6 +1239,34 @@ def _slice_directional_losses(
     return length_val, pairwise_val
 
 
+def _slice_multi_radius_loss(
+    pred_positions: np.ndarray,
+    gt_positions: np.ndarray,
+    node_features: np.ndarray,
+    cell_class_int: np.ndarray,
+    device: Any,
+    *,
+    multi_radius_module: MultiRadiusNeighborhoodLoss,
+) -> float:
+    """Multi-radius neighborhood transcriptome loss for one (pred, GT) pair.
+
+    Uses GT ``node_features`` on both sides (positions differ), mirroring
+    ``MultiRadiusNeighborhoodLoss.forward``.
+    """
+    mask = _valid_cells_mask(cell_class_int)
+    if mask.sum() < 2:
+        return float("nan")
+
+    feat = np.asarray(node_features, dtype=np.float32)
+    if feat.ndim == 3 and feat.shape[0] == 1:
+        feat = feat[0]
+    true_h = _make_minimal_holder(gt_positions, feat, mask, device)
+    pred_h = _make_minimal_holder(pred_positions, feat, mask, device)
+    with torch.no_grad():
+        loss, _ = multi_radius_module(pred_h, true_h, train_stage=False, log=False)
+    return float(loss.item())
+
+
 def compute_section_scalar_losses(
     batch: "SliceBatch",
     pred_positions: np.ndarray,           # (S, N, 2)
@@ -1363,19 +1278,19 @@ def compute_section_scalar_losses(
     compute_directional: bool,
     directional_module: Optional[DirectionalMetricLoss],
     directional_base_seed: int,
+    multi_radius_module: MultiRadiusNeighborhoodLoss,
 ) -> pd.DataFrame:
-    """Per-sample scalar losses (position MSE, directional length/pairwise).
+    """Per-sample scalar losses (position MSE, directional, multi-radius).
 
     Returns a long DataFrame with one row per (sample, metric_name).
+    ``transcriptome_multi_radius`` is always computed.
     """
     records: list[dict[str, Any]] = []
     S = int(pred_positions.shape[0])
 
-    node_features = None
-    if compute_directional:
-        node_features = np.asarray(batch.holder.node_features, dtype=np.float32)
-        if node_features.ndim == 3 and node_features.shape[0] == 1:
-            node_features = node_features[0]
+    node_features = np.asarray(batch.holder.node_features, dtype=np.float32)
+    if node_features.ndim == 3 and node_features.shape[0] == 1:
+        node_features = node_features[0]
 
     for s in range(S):
         pred = pred_positions[s]
@@ -1390,6 +1305,16 @@ def compute_section_scalar_losses(
             )
             records.append({"sample_index": s, "metric": "directional_length", "value": length_val})
             records.append({"sample_index": s, "metric": "directional_pairwise", "value": pairwise_val})
+
+        mr_val = _slice_multi_radius_loss(
+            pred, gt_positions, node_features, cell_class_int, device,
+            multi_radius_module=multi_radius_module,
+        )
+        records.append({
+            "sample_index": s,
+            "metric": "transcriptome_multi_radius",
+            "value": mr_val,
+        })
 
     return pd.DataFrame.from_records(records, columns=["sample_index", "metric", "value"])
 
@@ -1471,7 +1396,7 @@ def run_checkpoint_pipeline(
 ) -> Path:
     """Run the full statistical testing pipeline for one checkpoint."""
     pipe_cfg = cfg.test.pipeline
-    wasserstein_cfg = pipe_cfg.wasserstein_analysis
+    mmd_cfg = pipe_cfg.mmd_analysis
     ch_voronoi_cfg = pipe_cfg.ch_voronoi_analysis
     scalar_cfg = pipe_cfg.scalar_losses_analysis
     num_samples = int(pipe_cfg.num_samples)
@@ -1490,15 +1415,20 @@ def run_checkpoint_pipeline(
     compute_position_mse = bool(getattr(scalar_cfg, "compute_position_mse", True))
     compute_directional = bool(getattr(scalar_cfg, "compute_directional", True))
     directional_module: Optional[DirectionalMetricLoss] = None
+    directional_base_seed = 0
     if compute_directional:
         directional_module = _build_directional_loss(scalar_cfg.directional)
-    directional_base_seed = int(getattr(scalar_cfg.directional, "base_seed", 0))
+        directional_base_seed = int(getattr(scalar_cfg.directional, "base_seed", 0))
+    multi_radius_module = _build_multi_radius_loss(pipe_cfg.multi_radius_analysis)
     print("=" * 78)
     print(f"[testing_pipeline] Checkpoint : {checkpoint_path}")
     print(f"[testing_pipeline] Output dir  : {output_dir}")
     print(f"[testing_pipeline] num_samples : {num_samples}")
     print(f"[testing_pipeline] batch_size  : {batch_size}")
     print(f"[testing_pipeline] device      : {device}")
+    print(f"[testing_pipeline] position_mse: {compute_position_mse}")
+    print(f"[testing_pipeline] directional : {compute_directional}")
+    print(f"[testing_pipeline] multi_radius: always on")
     print("=" * 78)
 
     load_model_config_from_checkpoint(cfg, checkpoint_path)
@@ -1527,8 +1457,8 @@ def run_checkpoint_pipeline(
     except Exception:
         pass
 
-    print("[testing_pipeline] Phase 2/2: analysis (Wasserstein + CH/Voronoi + spread)…")
-    section_wasserstein_tables: list[pd.DataFrame] = []
+    print("[testing_pipeline] Phase 2/2: analysis (MMD + CH/Voronoi + spread)…")
+    section_mmd_tables: list[pd.DataFrame] = []
     section_ch_voronoi_tables: list[pd.DataFrame] = []
     section_spread_rows: list[dict] = []
     section_spread_per_cell_tables: list[pd.DataFrame] = []
@@ -1557,22 +1487,23 @@ def run_checkpoint_pipeline(
         cell_classes = cell_classes_with_min_cells(gt_df, min_cells)
         if not cell_classes:
             print(
-                f"[testing_pipeline] Skipping Wasserstein for {cell_section!r}: "
+                f"[testing_pipeline] Skipping MMD for {cell_section!r}: "
                 f"no cell class with >= {min_cells} cells."
             )
         else:
-            section_wasserstein = compute_section_wasserstein_metrics(
+            section_mmd = compute_section_mmd_metrics(
                 preds=preds,
                 batch=batch,
                 cell_classes=cell_classes,
-                wasserstein_cfg=wasserstein_cfg,
+                mmd_cfg=mmd_cfg,
+                device=device,
             )
-            if not section_wasserstein.empty:
-                section_wasserstein.insert(0, "cell_section", str(cell_section))
-                section_wasserstein.to_csv(
-                    section_dir / "wasserstein_per_class.csv", index=False
+            if not section_mmd.empty:
+                section_mmd.insert(0, "cell_section", str(cell_section))
+                section_mmd.to_csv(
+                    section_dir / "mmd_per_sample.csv", index=False
                 )
-                section_wasserstein_tables.append(section_wasserstein)
+                section_mmd_tables.append(section_mmd)
 
         section_ch_voronoi = compute_section_ch_voronoi_losses(
             preds=preds,
@@ -1610,39 +1541,47 @@ def run_checkpoint_pipeline(
         )
         section_spread_per_cell_tables.append(spread_per_cell_df)
 
-        if compute_position_mse or compute_directional:
-            section_scalar = compute_section_scalar_losses(
-                batch=batch,
-                pred_positions=preds,
-                gt_positions=batch.gt_positions.astype(np.float32),
-                cell_class_int=np.asarray(batch.cell_class_int),
-                device=device,
-                compute_position_mse=compute_position_mse,
-                compute_directional=compute_directional,
-                directional_module=directional_module,
-                directional_base_seed=directional_base_seed,
-            )
-            if not section_scalar.empty:
-                section_scalar.insert(0, "cell_section", str(cell_section))
-                section_scalar.to_csv(
-                    section_dir / "scalar_losses_per_sample.csv", index=False
-                )
-                section_scalar_losses_tables.append(section_scalar)
-
-    wasserstein_summary = aggregate_wasserstein_across_sections(
-        section_wasserstein_tables
-    )
-    wasserstein_csv = output_dir / "wasserstein_summary.csv"
-    wasserstein_plot = output_dir / "wasserstein_summary_by_cell_class.png"
-    if not wasserstein_summary.empty:
-        wasserstein_summary.to_csv(wasserstein_csv, index=False)
-        plot_wasserstein_summary(
-            wasserstein_summary,
-            wasserstein_plot,
-            n_sections_total=len(cell_sections),
+        section_scalar = compute_section_scalar_losses(
+            batch=batch,
+            pred_positions=preds,
+            gt_positions=batch.gt_positions.astype(np.float32),
+            cell_class_int=np.asarray(batch.cell_class_int),
+            device=device,
+            compute_position_mse=compute_position_mse,
+            compute_directional=compute_directional,
+            directional_module=directional_module,
+            directional_base_seed=directional_base_seed,
+            multi_radius_module=multi_radius_module,
         )
+        if not section_scalar.empty:
+            section_scalar.insert(0, "cell_section", str(cell_section))
+            section_scalar.to_csv(
+                section_dir / "scalar_losses_per_sample.csv", index=False
+            )
+            section_scalar_losses_tables.append(section_scalar)
+
+    mmd_summary = aggregate_mmd_across_sections(section_mmd_tables)
+    mmd_csv = output_dir / "mmd_summary.csv"
+    mmd_plot = output_dir / "mmd_summary.png"
+    if not mmd_summary.empty:
+        mmd_summary.to_csv(mmd_csv, index=False)
+        plot_mmd_summary(mmd_summary, mmd_plot)
+        all_row = mmd_summary[mmd_summary["cell_section"] == "ALL"]
+        if not all_row.empty:
+            for label, key in (
+                ("whole_slice/global", "mmd_whole_slice_global_mean"),
+                ("whole_slice/per_class", "mmd_whole_slice_per_class_mean"),
+                ("pair_dist/global", "mmd_pair_dist_global_mean"),
+                ("pair_dist/per_class", "mmd_pair_dist_per_class_mean"),
+                ("spatial/global", "mmd_spatial_global_mean"),
+                ("spatial/per_class", "mmd_spatial_per_class_mean"),
+            ):
+                print(
+                    f"[testing_pipeline] MMD {label}: "
+                    f"{float(all_row[key].iloc[0]):.6g}"
+                )
     else:
-        print("[testing_pipeline] No Wasserstein summaries produced.")
+        print("[testing_pipeline] No MMD summaries produced.")
 
     ch_voronoi_summary = aggregate_ch_voronoi_across_sections(
         section_ch_voronoi_tables
@@ -1750,7 +1689,7 @@ def _checkpoint_label(checkpoint_path: Path) -> str:
 def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | None]:
     """Load the per-checkpoint summary CSVs produced by ``run_checkpoint_pipeline``."""
     summaries = {
-        "wasserstein": output_dir / "wasserstein_summary.csv",
+        "mmd": output_dir / "mmd_summary.csv",
         "ch_voronoi": output_dir / "ch_voronoi_summary.csv",
         "spread": output_dir / "cross_sample_spread_summary.csv",
         "scalar_losses": output_dir / "scalar_losses_summary.csv",
@@ -1764,6 +1703,9 @@ def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | Non
 def _collect_checkpoint_comparison(
     checkpoint_paths: list[Path],
     output_dirs: list[Path],
+    *,
+    include_directional: bool = True,
+    include_position_mse: bool = True,
 ) -> pd.DataFrame:
     """Collapse every metric to one scalar per checkpoint into a long table.
 
@@ -1771,37 +1713,68 @@ def _collect_checkpoint_comparison(
     each row is a single benchmark number for one checkpoint (no cell-type / no
     per-section split). Metrics (in fixed display order):
 
-      * ``position_mse``
-      * ``directional_length``
-      * ``directional_pairwise``
+      * ``position_mse`` (if enabled)
+      * ``directional_length`` / ``directional_pairwise`` (if enabled)
+      * ``transcriptome_multi_radius`` (always)
       * ``ch_energy_curve_loss``
       * ``voronoi_phase_pair_ch_energy_loss``
-      * ``wasserstein_whole_slice_alignment``
-      * ``wasserstein_per_class_alignment``
+      * ``mmd_whole_slice_global`` / ``mmd_whole_slice_per_class``
+      * ``mmd_pair_dist_global`` / ``mmd_pair_dist_per_class``
+      * ``mmd_spatial_global`` / ``mmd_spatial_per_class``
       * ``cross_sample_spread``
     """
-    order = [
-        "position_mse",
-        "directional_length",
-        "directional_pairwise",
+    order = []
+    if include_position_mse:
+        order.append("position_mse")
+    if include_directional:
+        order.extend(["directional_length", "directional_pairwise"])
+    order.append("transcriptome_multi_radius")
+    order.extend([
         "ch_energy_curve_loss",
         "voronoi_phase_pair_ch_energy_loss",
-        "wasserstein_whole_slice_alignment",
-        "wasserstein_per_class_alignment",
+        "mmd_whole_slice_global",
+        "mmd_whole_slice_per_class",
+        "mmd_pair_dist_global",
+        "mmd_pair_dist_per_class",
+        "mmd_spatial_global",
+        "mmd_spatial_per_class",
         "cross_sample_spread",
-    ]
+    ])
+
+    allowed_scalar = {"transcriptome_multi_radius"}
+    if include_position_mse:
+        allowed_scalar.add("position_mse")
+    if include_directional:
+        allowed_scalar.update({"directional_length", "directional_pairwise"})
 
     rows: list[dict[str, Any]] = []
     for ckpt, out_dir in zip(checkpoint_paths, output_dirs):
         label = _checkpoint_label(ckpt)
         loaded = _load_checkpoint_summaries(out_dir)
 
-        w = loaded.get("wasserstein")
-        if w is not None and not w.empty:
-            rows.append({"checkpoint": label, "metric": "wasserstein_whole_slice_alignment",
-                         "value": float(w["mean_wasserstein_whole_slice_alignment"].mean())})
-            rows.append({"checkpoint": label, "metric": "wasserstein_per_class_alignment",
-                         "value": float(w["mean_wasserstein_per_class_alignment"].mean())})
+        m = loaded.get("mmd")
+        if m is not None and not m.empty:
+            if "cell_section" in m.columns:
+                all_rows = m[m["cell_section"] == "ALL"]
+            else:
+                all_rows = m
+            if all_rows.empty:
+                all_rows = m
+            for metric in (
+                "mmd_whole_slice_global",
+                "mmd_whole_slice_per_class",
+                "mmd_pair_dist_global",
+                "mmd_pair_dist_per_class",
+                "mmd_spatial_global",
+                "mmd_spatial_per_class",
+            ):
+                col = f"{metric}_mean"
+                if col in all_rows.columns:
+                    rows.append({
+                        "checkpoint": label,
+                        "metric": metric,
+                        "value": float(all_rows[col].mean()),
+                    })
 
         cv = loaded.get("ch_voronoi")
         if cv is not None and not cv.empty:
@@ -1824,7 +1797,10 @@ def _collect_checkpoint_comparison(
         sl = loaded.get("scalar_losses")
         if sl is not None and not sl.empty:
             for metric, sub in sl.groupby("metric"):
-                rows.append({"checkpoint": label, "metric": str(metric),
+                metric_name = str(metric)
+                if metric_name not in allowed_scalar:
+                    continue
+                rows.append({"checkpoint": label, "metric": metric_name,
                              "value": float(sub["mean"].mean())})
 
     df = pd.DataFrame.from_records(rows, columns=["checkpoint", "metric", "value"])
@@ -1868,24 +1844,48 @@ def _save_combined_comparison_csv(
     print(f"[testing_pipeline] Saved checkpoint comparison CSV → {save_path}")
 
 
-_COMPARISON_PANELS: list[tuple[str, list[str]]] = [
-    ("Position MSE", ["position_mse"]),
-    ("Directional length", ["directional_length"]),
-    ("Directional pairwise", ["directional_pairwise"]),
-    (
-        "Wasserstein",
-        ["wasserstein_whole_slice_alignment", "wasserstein_per_class_alignment"],
-    ),
-    (
-        "Cahn-Hilliard",
-        ["ch_energy_curve_loss", "voronoi_phase_pair_ch_energy_loss"],
-    ),
-    ("Cross-sample spread", ["cross_sample_spread"]),
-]
+def _comparison_panels(
+    *,
+    include_directional: bool = True,
+    include_position_mse: bool = True,
+) -> list[tuple[str, list[str]]]:
+    """Build checkpoint-comparison subplot specs from enabled scalar flags."""
+    panels: list[tuple[str, list[str]]] = []
+    if include_position_mse:
+        panels.append(("Position MSE", ["position_mse"]))
+    if include_directional:
+        panels.append(("Directional length", ["directional_length"]))
+        panels.append(("Directional pairwise", ["directional_pairwise"]))
+    panels.append(("Transcriptome multi-radius", ["transcriptome_multi_radius"]))
+    panels.extend([
+        (
+            "MMD whole-slice",
+            ["mmd_whole_slice_global", "mmd_whole_slice_per_class"],
+        ),
+        (
+            "MMD pair-dist",
+            ["mmd_pair_dist_global", "mmd_pair_dist_per_class"],
+        ),
+        (
+            "MMD spatial",
+            ["mmd_spatial_global", "mmd_spatial_per_class"],
+        ),
+        (
+            "Cahn-Hilliard",
+            ["ch_energy_curve_loss", "voronoi_phase_pair_ch_energy_loss"],
+        ),
+        ("Cross-sample spread", ["cross_sample_spread"]),
+    ])
+    return panels
+
 
 _COMPARISON_METRIC_LABELS: dict[str, str] = {
-    "wasserstein_whole_slice_alignment": "whole slice",
-    "wasserstein_per_class_alignment": "per class",
+    "mmd_whole_slice_global": "global ICP",
+    "mmd_whole_slice_per_class": "per-class ICP",
+    "mmd_pair_dist_global": "global ICP",
+    "mmd_pair_dist_per_class": "per-class ICP",
+    "mmd_spatial_global": "global ICP",
+    "mmd_spatial_per_class": "per-class ICP",
     "ch_energy_curve_loss": "CH energy",
     "voronoi_phase_pair_ch_energy_loss": "Voronoi phase",
 }
@@ -1894,13 +1894,15 @@ _COMPARISON_METRIC_LABELS: dict[str, str] = {
 def plot_checkpoint_comparison(
     comparison: pd.DataFrame,
     save_path: Path,
+    *,
+    include_directional: bool = True,
+    include_position_mse: bool = True,
 ) -> None:
-    """Six-panel bar plot comparing every metric across checkpoints (raw scale).
+    """Bar plot comparing metrics across checkpoints (raw scale).
 
-    One row of subplots: three scalar metrics, one combined Wasserstein panel,
-    one combined Cahn-Hilliard panel, and cross-sample spread. Each checkpoint
-    keeps a fixed colour across all panels; raw values are annotated above bars
-    with two decimal places.
+    Subplot count follows the enabled scalar flags: position MSE and/or both
+    directional metrics, always-on transcriptome multi-radius, then three MMD
+    panels, Cahn-Hilliard, and cross-sample spread.
     """
     import matplotlib
 
@@ -1927,6 +1929,14 @@ def plot_checkpoint_comparison(
         print("[testing_pipeline] No checkpoint comparison data to plot.")
         return
 
+    panels = _comparison_panels(
+        include_directional=include_directional,
+        include_position_mse=include_position_mse,
+    )
+    if not panels:
+        print("[testing_pipeline] No checkpoint comparison panels to plot.")
+        return
+
     checkpoints = list(dict.fromkeys(comparison["checkpoint"].tolist()))
     palette = sns.color_palette("deep", n_colors=max(len(checkpoints), 3))
     ckpt_colors = {ckpt: palette[i % len(palette)] for i, ckpt in enumerate(checkpoints)}
@@ -1937,11 +1947,11 @@ def plot_checkpoint_comparison(
 
     fig, axes = plt.subplots(
         1,
-        len(_COMPARISON_PANELS),
-        figsize=(24, 6.2),
+        len(panels),
+        figsize=(max(12.0, 3.2 * len(panels)), 6.2),
         facecolor=plt.rcParams["figure.facecolor"],
     )
-    if len(_COMPARISON_PANELS) == 1:
+    if len(panels) == 1:
         axes = [axes]
 
     metric_alphas = (0.95, 0.55)
@@ -1987,7 +1997,7 @@ def plot_checkpoint_comparison(
             )
         return max_height
 
-    for ax, (title, metrics) in zip(axes, _COMPARISON_PANELS):
+    for ax, (title, metrics) in zip(axes, panels):
         available_metrics = [
             m for m in metrics
             if any((ckpt, m) in raw_vals for ckpt in checkpoints)
@@ -2116,9 +2126,23 @@ def compare_checkpoints(
     parent_dir = Path(base) / cfg.general.name / "testing_pipeline"
     parent_dir.mkdir(parents=True, exist_ok=True)
 
-    combined = _collect_checkpoint_comparison(checkpoint_paths, output_dirs)
+    scalar_cfg = cfg.test.pipeline.scalar_losses_analysis
+    include_directional = bool(getattr(scalar_cfg, "compute_directional", True))
+    include_position_mse = bool(getattr(scalar_cfg, "compute_position_mse", True))
+
+    combined = _collect_checkpoint_comparison(
+        checkpoint_paths,
+        output_dirs,
+        include_directional=include_directional,
+        include_position_mse=include_position_mse,
+    )
     _save_combined_comparison_csv(combined, parent_dir / "checkpoint_comparison.csv")
-    plot_checkpoint_comparison(combined, parent_dir / "checkpoint_comparison.png")
+    plot_checkpoint_comparison(
+        combined,
+        parent_dir / "checkpoint_comparison.png",
+        include_directional=include_directional,
+        include_position_mse=include_position_mse,
+    )
     return parent_dir
 
 

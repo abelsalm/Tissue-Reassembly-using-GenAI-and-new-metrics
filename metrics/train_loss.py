@@ -71,6 +71,9 @@ class CombinedTrainLoss(nn.Module):
             self.neighborhood: Optional[MultiRadiusNeighborhoodLoss] = (
                 MultiRadiusNeighborhoodLoss(
                     radii=list(_get("multi_radius_radii", default=[0.02, 0.04, 0.08, 0.16])),
+                    avg_transcriptome_weight=float(
+                        _get("multi_radius_avg_transcriptome_weight", default=1.0)
+                    ),
                     density_weight=float(_get("multi_radius_density_weight", default=1.0)),
                     global_transcriptome_weight=float(
                         _get("multi_radius_global_transcriptome_weight", default=0.0)
@@ -379,8 +382,9 @@ class CombinedTrainLoss(nn.Module):
                 to_log.update(self.mmd.log_epoch_metrics(train_stage=train_stage))
             else:
                 to_log[f"{epoch_prefix}/mmd_weighted"] = 0.0
-        if wandb.run:
-            wandb.log(to_log, commit=False)
+        # Do not wandb.log here: this is called every training/val step so
+        # Lightning can average with ``on_epoch=True``. WandB is updated once
+        # per epoch from ``on_*_epoch_end``.
         return to_log
 
     def clear_gt_cache(self) -> None:
