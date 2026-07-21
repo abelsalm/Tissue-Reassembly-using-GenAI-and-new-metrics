@@ -9,10 +9,10 @@ epoch_index: null
 checkpoint_path: null #"/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
-# Statistical testing pipeline (metrics/testing_pipeline.py)
+# Statistical testing pipeline (metrics/testing_pipeline.py)w
 pipeline:
-  num_samples: 32          # denoising runs per cell_section (different seeds)
-  seed_start: 100             # seed for sample i is seed_start + i
+  num_samples: 10          # denoising runs per cell_section (different seeds)
+  seed_start: 67             # seed for sample i is seed_start + i
   device: cuda                # auto | cpu | cuda
   min_cells_per_class: 10     # skip cell classes with fewer GT cells
   spatial_analysis:
@@ -22,14 +22,25 @@ pipeline:
     align_reference: 0
     epsilon: 1.0e-12
     overlay_gt_scatter_size: 6.0   # GT dot size on section density grid plots
-    section_density_plot_cols: 4    # max columns in the per-section multi-class figure
-  wasserstein_analysis:            # precise per-cell-type distributional distances
-    kde_bandwidth: 0.02            # std of the isotropic Gaussian KDE kernel
-    grid_resolution: 64            # side length of the shared discretization grid
-                                   # (cost matrix is (res^2)x(res^2); keep modest)
-    grid_margin: 0.05              # padding around the combined bbox of GT + preds
-    sinkhorn_reg: 0.01             # entropic regularization (larger = smoother/biased)
-    sinkhorn_iters: 500            # max Sinkhorn iterations
+    section_density_plot_cols: 8    # max columns in the per-section multi-class figure
+  mmd_analysis:                     # isotropic IMQ-MMD (replaces Wasserstein)
+    whole_slice_band_mults: [0.12, 0.25]          # × median pairwise
+    spatial_band_mults: [0.04, 0.16, 0.64, 1.28, 2.56, 5.12]        # × median pairwise (per class)
+    pair_dist_band_mults: [1.0, 2.0, 4.0]           # × median pair-distance
+    pair_dist_max_samples: 2000      # subsample cap for pair-distance MMD
+  # Multi-radius neighborhood transcriptome loss (always on; mirrors configs/train)
+  multi_radius_analysis:
+    radii: [0.02, 0.04, 0.08, 0.16]
+    avg_transcriptome_weight: 0
+    density_weight: 0.0
+    global_transcriptome_weight: 1.0
+    transcriptome_tolerance: [0.02, 0.04, 0.04, 0.02]
+    transcriptome_tolerance_soft_beta: 64.0
+    transcriptome_tolerance_warmup_epochs: 0
+    loss_radius_scale: 512
+    soft_beta: 128.0
+    eps: 1.0e-6
+    include_self: true
   ch_voronoi_analysis:             # Cahn-Hilliard / Voronoi phase-pair energy losses
     cahn_hilliard:                 # per-cell-type CH energy-curve loss
       radii: [0.005, 0.01, 0.02, 0.04, 0.08]   # bump-radius sweep for E(r)
@@ -55,7 +66,8 @@ pipeline:
       chunk: 4096                  # grid-axis chunk for the distance computation
   scalar_losses_analysis:          # single-value-per-sample losses (no cell-type split)
     compute_position_mse: true     # vanilla position MSE (pairwise distance-matrix MSE)
-    compute_directional: true      # directional length + pairwise axis-angle losses
+    compute_directional: false      # if false: skip both directional_length & directional_pairwise
+                                   # (computation + scalar/comparison subplots); if true: run both
     directional:                   # mirrors metrics/train_directional_metric.py defaults
       n_target: 1024               # cells subsampled per sample for the axis pipeline
       neighbor_radius: 0.16        # first-radius soft-neighborhood membership cutoff

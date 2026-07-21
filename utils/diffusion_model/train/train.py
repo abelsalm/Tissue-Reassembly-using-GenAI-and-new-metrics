@@ -16,11 +16,6 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     Returns:
     - torch.Tensor: Loss for the current batch.
     """
-    # Get the current learning rate and log it if using WandB
-    lr = self.optimizers().param_groups[0]["lr"]
-    if wandb.run:
-        wandb.log({"LR": lr}, commit=False)
-
     # Set the model to train mode
     self.model.train()
 
@@ -29,29 +24,22 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     z_t = self.noise_model.apply_noise(batched_data)
 
     # Forward pass through the model
-
     pred = self.forward(z_t)
 
-    loss, tl_log_dict = self.train_loss(
+    # ``log=False``: do not emit per-batch ``train_loss/*`` metrics (those
+    # create spiky WandB curves). Epoch aggregates are logged below.
+    loss, _ = self.train_loss(
         masked_pred=pred,
         masked_true=batched_data,
-        log=i % self.log_every_steps == 0,
+        log=False,
         batch_idx=i,
     )
 
-    # Log the training loss and metrics if available
-    if tl_log_dict is not None:
-        self.log_dict(tl_log_dict, batch_size=self.BS)
-
-    # Log epoch metrics for training loss. ``on_epoch=True`` is required so
-    # the key is guaranteed to be in ``trainer.callback_metrics`` at the end
-    # of the epoch (otherwise the per-epoch print below silently no-ops).
+    # Feed last-step scalars into Lightning every batch; ``on_epoch=True``
+    # averages them into a single point per epoch.
     tle_log = self.train_loss.log_epoch_metrics()
     self.log_dict(tle_log, batch_size=self.BS, on_step=False, on_epoch=True)
 
-    # Log the epoch number if using WandB
-    if wandb.run:
-        wandb.log({"epoch": self.current_epoch}, commit=False)
     return loss
 
 
@@ -80,6 +68,22 @@ def on_train_epoch_end_func(self) -> None:
             print(f"[Epoch {self.current_epoch}] Loss: {epoch_loss}", flush=True)
     else:
         print(f"[Epoch {self.current_epoch}] done (no loss in callback_metrics)", flush=True)
+
+    # Push epoch-averaged metrics (and LR) to WandB once per epoch.
+    if wandb.run:
+        wandb_log = {"epoch": self.current_epoch}
+        try:
+            wandb_log["LR"] = float(self.optimizers().param_groups[0]["lr"])
+        except Exception:
+            pass
+        for key, value in cm.items():
+            key_str = str(key)
+            if key_str.startswith("train_epoch/"):
+                try:
+                    wandb_log[key_str] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        wandb.log(wandb_log, commit=False)
 
 
 def on_train_epoch_start_func(self) -> None:

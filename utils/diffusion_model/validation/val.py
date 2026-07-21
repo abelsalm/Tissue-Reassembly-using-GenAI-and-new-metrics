@@ -21,34 +21,29 @@ def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     """Validation step: combined training loss + vanilla position MSE on the side."""
     self.model.eval()
     batch_size = _validation_batch_size(self)
-    should_log = i % self.log_every_steps == 0
 
     with torch.no_grad():
         batched_data = to_batch(data)
         z_t = self.noise_model.apply_noise(batched_data, train_flag=False)
         pred = self.forward(z_t)
 
-        loss, val_log_dict = self.train_loss(
+        # ``log=False``: skip per-batch ``val_loss/*`` metrics (spiky curves).
+        loss, _ = self.train_loss(
             masked_pred=pred,
             masked_true=batched_data,
             train_stage=False,
-            log=should_log,
+            log=False,
             batch_idx=i,
         )
 
-        _, vanilla_log_dict = self.vanilla_val_loss(
+        self.vanilla_val_loss(
             masked_pred=pred,
             masked_true=batched_data,
             train_stage=False,
-            log=should_log,
+            log=False,
         )
 
-    if val_log_dict is not None:
-        self.log_dict(val_log_dict, batch_size=batch_size)
-
-    if vanilla_log_dict is not None:
-        self.log_dict(vanilla_log_dict, batch_size=batch_size)
-
+    # Feed last-step scalars into Lightning; averaged once per epoch.
     val_epoch_log = self.train_loss.log_epoch_metrics(train_stage=False)
     self.log_dict(val_epoch_log, batch_size=batch_size, on_step=False, on_epoch=True)
 
