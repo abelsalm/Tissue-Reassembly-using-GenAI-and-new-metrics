@@ -55,6 +55,36 @@ class NoiseModel:
             torch.log(-torch.special.expm1(2 * log_alpha_bar)) - 2 * log_alpha_bar
         )
 
+    def get_snr(
+        self, t_normalized=None, t_int=None, key="p"
+    ) -> torch.Tensor:
+        """Signal-to-noise ratio ``SNR(t) = alpha_bar(t)^2 / sigma_bar(t)^2``.
+
+        Matches the Hang et al. (ICCV 2023) definition used for Min-SNR
+        weighting. ``alpha_bar`` / ``sigma_bar`` are the same coefficients used
+        in ``apply_noise`` (``pos_t = a * x + s * eps``). Defaults to the
+        position component (``key="p"``).
+        """
+        a = self.get_alpha_bar(t_normalized=t_normalized, t_int=t_int, key=key)
+        s = self.get_sigma_bar(t_normalized=t_normalized, t_int=t_int, key=key)
+        return (a / s.clamp_min(1e-12)).pow(2)
+
+    def get_min_snr_weight(
+        self,
+        t_normalized=None,
+        t_int=None,
+        gamma: float = 5.0,
+        key="p",
+    ) -> torch.Tensor:
+        """Min-SNR-γ loss weight ``w(t) = min{SNR(t), γ}`` (Hang et al. 2023).
+
+        High-noise (low-SNR) timesteps get a small weight so bad predictions
+        there contribute less to the training objective; low-noise timesteps
+        are capped at ``gamma`` so they do not dominate.
+        """
+        snr = self.get_snr(t_normalized=t_normalized, t_int=t_int, key=key)
+        return torch.clamp(snr, max=float(gamma))
+
     def get_alpha_bar(
         self, t_normalized: int = None, t_int: int = None, key: int = None
     ) -> torch.Tensor:

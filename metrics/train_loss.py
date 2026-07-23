@@ -15,12 +15,15 @@ from metrics.train_ch_overall import SlideCHLoss
 from metrics.train_pca_overall import SlidePCALoss
 from metrics.train_directional_metric import DirectionalMetricLoss
 from metrics.train_mmds import SlideMMDLoss
+from metrics.test_vanilla_loss import LossFunction as VanillaPositionMSELoss
 
 
 class CombinedTrainLoss(nn.Module):
     """Master loss: weighted sum of active sub-losses driven by config weights.
 
     Global weights (all in ``cfg`` under ``train``):
+        * **vanilla_weight** — pairwise distance-matrix MSE between pred and GT
+          positions (``LossFunction`` / vanilla LUNA loss).
         * **transcriptome_multi_radius_weight** — multi-radius neighborhood
           transcriptome RMSE + log-density (``MultiRadiusNeighborhoodLoss``).
         * **ch_weight** — whole-slide Cahn-Hilliard energy-curve AUC
@@ -34,6 +37,13 @@ class CombinedTrainLoss(nn.Module):
     **other_trigger** — CH, PCA, directional, and MMD terms are forced to zero
     (no forward compute) until ``current_epoch >= other_trigger``; configured
     weights apply only from that epoch onward. ``0`` = active from epoch 0.
+    Vanilla and transcriptome terms are not gated by ``other_trigger``.
+
+    **min_snr_weighting** — when enabled (config) and a ``min_snr_weight``
+    tensor is passed into ``forward`` (training only), the combined loss is
+    multiplied by the batch-mean Min-SNR-γ weight ``min(SNR(t), min_snr_gamma)``
+    from ``NoiseModel`` (Hang et al. ICCV 2023), down-weighting high-noise
+    steps for stabler gradients. Validation must not pass this weight.
 
     A global weight of ``0`` disables that term entirely (no module init, no
     forward compute). Legacy ``slide_*`` / ``neighborhood_weight`` keys are
@@ -55,6 +65,15 @@ class CombinedTrainLoss(nn.Module):
                 if v is not None:
                     return v
             return default
+
+        # ------------------------------------------------------------------ #
+        # Vanilla pairwise distance-matrix MSE (original LUNA position loss)
+        # ------------------------------------------------------------------ #
+        self.vanilla_weight = float(_get("vanilla_weight", default=0.0))
+        if self.vanilla_weight != 0.0:
+            self.vanilla: Optional[VanillaPositionMSELoss] = VanillaPositionMSELoss()
+        else:
+            self.vanilla = None
 
         # ------------------------------------------------------------------ #
         # Transcriptome multi-radius neighborhood sub-loss
@@ -178,11 +197,15 @@ class CombinedTrainLoss(nn.Module):
 
         # Shared caches for logging (raw unweighted sub-loss values)
         self._last_loss: float = -1.0
+        self._last_vanilla: float = -1.0
         self._last_transcriptome_multi_radius: float = -1.0
         self._last_ch: float = -1.0
         self._last_pca: float = -1.0
         self._last_directional: float = -1.0
         self._last_mmd: float = -1.0
+        self._last_min_snr_weight: float = 1.0
+        self.min_snr_weighting = bool(_get("min_snr_weighting", default=False))
+        self.min_snr_gamma = float(_get("min_snr_gamma", default=5.0))
 
     # ------------------------------------------------------------------ #
     # Epoch tracking (forwarded to neighborhood for tolerance warmup)
@@ -207,6 +230,7 @@ class CombinedTrainLoss(nn.Module):
         train_stage: bool = True,
         log: bool = True,
         batch_idx: Optional[int] = None,
+        min_snr_weight: Optional[torch.Tensor] = None,
         **_unused: object,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
 
@@ -218,6 +242,22 @@ class CombinedTrainLoss(nn.Module):
         loss = masked_pred.positions.sum() * 0.0
         to_log: Dict[str, float] = {}
         prefix = "train_loss" if train_stage else "val_loss"
+
+        # ---- Vanilla pairwise distance-matrix MSE ----
+        if self.vanilla is not None and self.vanilla_weight != 0.0:
+            # Sub-loss may wandb.log its own keys; CombinedTrainLoss also logs
+            # the weighted aggregate below, so pass log=False here.
+            v_loss, _ = self.vanilla(
+                masked_pred, masked_true,
+                train_stage=train_stage,
+                log=False,
+            )
+            weighted = self.vanilla_weight * v_loss
+            loss = loss + weighted
+            self._last_vanilla = float(v_loss.detach().item())
+            if log:
+                to_log[f"{prefix}/vanilla_weighted"] = float(weighted.detach().item())
+                to_log[f"{prefix}/position_mse"] = float(v_loss.detach().item())
 
         # ---- Transcriptome multi-radius ----
         if self.neighborhood is not None and self.transcriptome_multi_radius_weight != 0.0:
@@ -303,6 +343,16 @@ class CombinedTrainLoss(nn.Module):
             if log and m_log:
                 to_log.update(m_log)
 
+        # ---- Min-SNR-γ global reweight (Hang et al.): w = min(SNR(t), γ) ----
+        if min_snr_weight is not None:
+            w = min_snr_weight.detach().reshape(-1).mean()
+            loss = loss * w
+            self._last_min_snr_weight = float(w.item())
+            if log:
+                to_log[f"{prefix}/min_snr_weight"] = self._last_min_snr_weight
+        else:
+            self._last_min_snr_weight = 1.0
+
         self._last_loss = float(loss.detach().item())
 
         if log:
@@ -317,6 +367,8 @@ class CombinedTrainLoss(nn.Module):
     # ------------------------------------------------------------------ #
 
     def reset(self) -> None:
+        if self.vanilla is not None:
+            self.vanilla.reset()
         if self.neighborhood is not None:
             self.neighborhood.reset()
         if self.ch is not None:
@@ -334,6 +386,14 @@ class CombinedTrainLoss(nn.Module):
         to_log: Dict[str, float] = {
             f"{epoch_prefix}/combined": float(self._last_loss),
         }
+        if self.min_snr_weighting:
+            to_log[f"{epoch_prefix}/min_snr_weight"] = float(self._last_min_snr_weight)
+        if self.vanilla is not None and self.vanilla_weight != 0.0:
+            to_log[f"{epoch_prefix}/position_mse"] = float(self._last_vanilla)
+            to_log[f"{epoch_prefix}/vanilla_weighted"] = float(
+                self._last_vanilla * self.vanilla_weight
+            )
+            to_log.update(self.vanilla.log_epoch_metrics(train_stage=train_stage))
         if self.neighborhood is not None and self.transcriptome_multi_radius_weight != 0.0:
             to_log[f"{epoch_prefix}/transcriptome_multi_radius"] = float(
                 self._last_transcriptome_multi_radius

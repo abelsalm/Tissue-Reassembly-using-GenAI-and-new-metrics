@@ -28,6 +28,8 @@ def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         pred = self.forward(z_t)
 
         # ``log=False``: skip per-batch ``val_loss/*`` metrics (spiky curves).
+        # Do not apply min-SNR weighting here: that reweight is training-only
+        # (gradient balancing); validation should report the unweighted loss.
         loss, _ = self.train_loss(
             masked_pred=pred,
             masked_true=batched_data,

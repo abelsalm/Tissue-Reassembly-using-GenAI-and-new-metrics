@@ -26,6 +26,14 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     # Forward pass through the model
     pred = self.forward(z_t)
 
+    min_snr_weight = None
+    if getattr(self.cfg.train, "min_snr_weighting", False):
+        min_snr_weight = self.noise_model.get_min_snr_weight(
+            t_int=z_t.t_int,
+            gamma=float(getattr(self.cfg.train, "min_snr_gamma", 5.0)),
+            key="p",
+        )
+
     # ``log=False``: do not emit per-batch ``train_loss/*`` metrics (those
     # create spiky WandB curves). Epoch aggregates are logged below.
     loss, _ = self.train_loss(
@@ -33,6 +41,7 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         masked_true=batched_data,
         log=False,
         batch_idx=i,
+        min_snr_weight=min_snr_weight,
     )
 
     # Feed last-step scalars into Lightning every batch; ``on_epoch=True``

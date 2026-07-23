@@ -116,8 +116,80 @@ def class_barycenters(positions: torch.Tensor, labels: torch.Tensor, mask: torch
     return torch.stack([pts[labs == int(c)].mean(dim=0) for c in classes])
 
 
-def procrustes_similarity(source: torch.Tensor, target: torch.Tensor, with_scale: bool = True):
-    """Best-fit similarity (R, t, s) aligning ``source`` to ``target``.
+def class_covariances(positions: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor,
+                       classes: torch.Tensor) -> torch.Tensor:
+    """Stack the per-class 2x2 (biased) covariance matrices of ``positions[mask]``.
+
+    Same class order as ``class_barycenters``. Classes with a single cell get
+    an all-zero covariance (no orientation information, handled by the
+    caller's gating logic rather than here).
+    """
+    pts = positions[mask]
+    labs = labels[mask]
+    covs = []
+    for c in classes:
+        p = pts[labs == int(c)]
+        d = p - p.mean(dim=0, keepdim=True)
+        cov = (d.unsqueeze(-1) * d.unsqueeze(-2)).mean(dim=0) if d.shape[0] > 0 else torch.zeros(
+            positions.shape[-1], positions.shape[-1], device=positions.device, dtype=positions.dtype
+        )
+        covs.append(cov)
+    return torch.stack(covs)
+
+
+def class_anisotropy(cov: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Closed-form eigenvalue-ratio anisotropy ``(lambda1 - lambda2) / lambda1`` for a
+    batch of 2x2 covariance matrices, computed from trace/det (no ``eigh`` call
+    needed for this scalar summary)."""
+    a, d = cov[..., 0, 0], cov[..., 1, 1]
+    b = cov[..., 0, 1]
+    half = 0.5 * (a + d)
+    det = (a * d - b * b).clamp_min(0.0)
+    disc = torch.sqrt((half * half - det).clamp_min(0.0))
+    lam1 = half + disc
+    return (2.0 * disc) / (lam1 + eps)
+
+
+def class_top_eigvec(cov: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Top (largest-eigenvalue) unit eigenvector and eigenvalue of a batch of
+    2x2 symmetric PSD matrices. Sign of the eigenvector is arbitrary (as for
+    any eigendecomposition) and must be resolved by the caller."""
+    evals, evecs = torch.linalg.eigh(cov)  # ascending eigenvalues
+    return evecs[..., :, -1], evals[..., -1]
+
+
+def class_axis_landmarks(
+    barycenters: torch.Tensor,
+    cov: torch.Tensor,
+    ref_dirs: torch.Tensor,
+    length_mult: float = 1.0,
+) -> torch.Tensor:
+    """One pseudo-landmark per class at ``barycenter + length * axis_direction``.
+
+    ``length`` is the class's own standard deviation along its principal axis
+    (``sqrt(top eigenvalue)``), scaled by ``length_mult``. The eigenvector's
+    sign is resolved against ``ref_dirs`` (unit vectors, one per class) by
+    flipping it to have a non-negative dot product with ``ref_dirs`` -- this
+    is what makes the landmark well-defined despite the inherent sign
+    ambiguity of eigenvectors (see ``_aligned_pred_xy`` for how ``ref_dirs``
+    is derived from a reference rotation so pred/GT axes are paired
+    consistently rather than arbitrarily by whatever an eigensolver returns).
+    """
+    v, lam = class_top_eigvec(cov)
+    sign = torch.sign((v * ref_dirs).sum(dim=-1, keepdim=True))
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    v = v * sign
+    length = length_mult * torch.sqrt(lam.clamp_min(0.0)).unsqueeze(-1)
+    return barycenters + length * v
+
+
+def procrustes_similarity(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    with_scale: bool = True,
+    weights: Optional[torch.Tensor] = None,
+):
+    """Best-fit weighted similarity (R, t, s) aligning ``source`` to ``target``.
 
     Returns ``(R, t, s)`` as float tensors on the input device. ``s`` is forced
     to ``1`` when ``with_scale`` is False (rotation + translation only). The
@@ -125,14 +197,28 @@ def procrustes_similarity(source: torch.Tensor, target: torch.Tensor, with_scale
     input dtype. Intended to be called on **detached** inputs so the fitted
     transform is a stop-gradient constant (keeps the loss rotation-invariant
     without backprop through the SVD).
+
+    ``weights``, if given, is a non-negative per-row weight (one per landmark
+    point) used for the mean, cross-covariance, and scale terms -- standard
+    weighted orthogonal Procrustes. Defaults to uniform weights (equivalent to
+    the original unweighted fit).
     """
     X = source.detach().to(torch.float64)
     Y = target.detach().to(torch.float64)
 
-    mu_x, mu_y = X.mean(0), Y.mean(0)
+    if weights is None:
+        w = torch.ones(X.shape[0], dtype=torch.float64, device=X.device)
+    else:
+        w = weights.detach().to(torch.float64)
+    w = w / w.sum().clamp_min(1e-12)
+
+    mu_x = (w[:, None] * X).sum(0)
+    mu_y = (w[:, None] * Y).sum(0)
     Xc, Yc = X - mu_x, Y - mu_y
 
-    U, _, Vh = torch.linalg.svd(Xc.T @ Yc)
+    H = Xc.T @ (w[:, None] * Yc)
+
+    U, _, Vh = torch.linalg.svd(H)
     R = Vh.T @ U.T
     if torch.det(R) < 0:
         Vh = Vh.clone()
@@ -140,7 +226,7 @@ def procrustes_similarity(source: torch.Tensor, target: torch.Tensor, with_scale
         R = Vh.T @ U.T
 
     if with_scale:
-        s = (Yc * (Xc @ R.T)).sum() / Xc.pow(2).sum()
+        s = (w * (Yc * (Xc @ R.T)).sum(-1)).sum() / (w * Xc.pow(2).sum(-1)).sum()
     else:
         s = torch.tensor(1.0, dtype=torch.float64, device=source.device)
     t = mu_y - s * R @ mu_x
@@ -450,6 +536,16 @@ class MMDConfig:
     # Procrustes pre-alignment (rotation / translation / scale invariance):
     procrustes_align: bool = True
     procrustes_with_scale: bool = True
+    # Optional per-class shape/orientation term added to the Procrustes fit
+    # (matches per-class covariance "ellipses" via their matrix square roots,
+    # which is sign-ambiguity-free unlike raw eigenvector matching). Helps
+    # stabilize the fitted rotation when barycenter geometry alone is nearly
+    # degenerate (e.g. few classes, collinear or symmetric centroids).
+    procrustes_axis_align: bool = False
+    procrustes_axis_weight: float = 1.0
+    procrustes_axis_min_cells: int = 5
+    procrustes_axis_min_anisotropy: float = 0.2
+    procrustes_axis_length_mult: float = 1.0
     # The following mirror alignment_config.json but are unused in training
     # (no inner coordinate optimizer / Procrustes starting point here):
     mmd_steps: int = 200
@@ -491,6 +587,11 @@ def _mmd_config_from_cfg(cfg) -> MMDConfig:
         whole_slice_MMD_band_mults=tup("whole_slice_MMD_band_mults", (1.0, 2.0, 4.0, 8.0)),
         procrustes_align=bool(g("procrustes_align", True)),
         procrustes_with_scale=bool(g("procrustes_with_scale", True)),
+        procrustes_axis_align=bool(g("procrustes_axis_align", False)),
+        procrustes_axis_weight=float(g("procrustes_axis_weight", 1.0)),
+        procrustes_axis_min_cells=int(g("procrustes_axis_min_cells", 5)),
+        procrustes_axis_min_anisotropy=float(g("procrustes_axis_min_anisotropy", 0.2)),
+        procrustes_axis_length_mult=float(g("procrustes_axis_length_mult", 1.0)),
         mmd_steps=int(g("mmd_steps", 200)),
         mmd_lr=float(g("mmd_lr", 1e-2)),
         mmd_cosine_lr=bool(g("mmd_cosine_lr", False)),
@@ -536,6 +637,12 @@ class SlideMMDLoss(nn.Module):
     value is rotation / translation / scale invariant while gradients remain
     stable (no backprop through the SVD). Disable with ``procrustes_align``
     or drop the scale term with ``procrustes_with_scale``.
+
+    Optionally (``procrustes_axis_align``), the rotation fit is additionally
+    informed by per-class shape/orientation (covariance) matching on top of
+    the barycenters, which stabilizes the estimated rotation when the
+    barycenter geometry alone is weak (few classes, near-collinear or
+    near-symmetric centroids). See ``class_shape_alignment_term``.
     """
 
     def __init__(self, cfg) -> None:
@@ -651,6 +758,22 @@ class SlideMMDLoss(nn.Module):
         flow through ``pred_xy`` only via the linear application
         ``s * (X @ R.T) + t``. Returns ``pred_xy`` unchanged when alignment is
         disabled or there are too few usable barycenters (< 2 classes).
+
+        When ``procrustes_axis_align`` is set, classes with enough GT cells
+        (``procrustes_axis_min_cells``) and a sufficiently anisotropic GT
+        shape (``procrustes_axis_min_anisotropy``) also contribute a
+        per-class principal-axis pseudo-landmark (pred vs GT) to the fit,
+        weighted by ``procrustes_axis_weight`` relative to the (unit-weight)
+        barycenter landmarks. Gating on the *GT*-side anisotropy (fixed
+        target, not the still-training prediction) keeps the set of classes
+        used for orientation matching stable across training steps.
+
+        Axis eigenvectors are only defined up to sign, so a cheap
+        barycenter-only rotation fit is computed first and used purely as a
+        reference to pick each class's pred-axis sign consistently with its
+        GT-axis pairing (see ``class_axis_landmarks``); the final fit then
+        re-solves the rotation using both barycenters and axis landmarks
+        together.
         """
         if not self.cfg.procrustes_align:
             return pred_xy
@@ -670,7 +793,48 @@ class SlideMMDLoss(nn.Module):
         classes_t = torch.tensor(usable, device=pred_xy.device, dtype=labels.dtype)
         P_bc = class_barycenters(pred_xy, labels, mask_b, classes_t)
         G_bc = class_barycenters(true_xy, labels, mask_b, classes_t)
-        R, t, s = procrustes_similarity(P_bc, G_bc, with_scale=self.cfg.procrustes_with_scale)
+
+        P_all, G_all, weights = P_bc, G_bc, None
+        if self.cfg.procrustes_axis_align:
+            counts = torch.tensor(
+                [int(((labels == c) & mask_b).sum().item()) for c in usable],
+                device=pred_xy.device,
+            )
+            axis_gate = counts >= self.cfg.procrustes_axis_min_cells
+            if bool(axis_gate.any()):
+                G_cov = class_covariances(true_xy, labels, mask_b, classes_t)
+                gt_aniso = class_anisotropy(G_cov)
+                axis_gate = axis_gate & (gt_aniso >= self.cfg.procrustes_axis_min_anisotropy)
+                if bool(axis_gate.any()):
+                    P_cov = class_covariances(pred_xy, labels, mask_b, classes_t)
+                    R0, _, _ = procrustes_similarity(P_bc, G_bc, with_scale=False)
+                    G_axis_dir, _ = class_top_eigvec(G_cov)
+                    # Reference direction for the pred-side axis, expressed in
+                    # the pred frame (inverse of R0 applied to the GT axis),
+                    # so the sign flip in ``class_axis_landmarks`` pairs each
+                    # pred axis with the GT axis it is closest to under R0.
+                    ref_dirs = G_axis_dir @ R0
+                    P_axis = class_axis_landmarks(
+                        P_bc, P_cov, ref_dirs, self.cfg.procrustes_axis_length_mult
+                    )
+                    G_axis = class_axis_landmarks(
+                        G_bc, G_cov, G_axis_dir, self.cfg.procrustes_axis_length_mult
+                    )
+                    P_axis = P_axis[axis_gate]
+                    G_axis = G_axis[axis_gate]
+                    P_all = torch.cat([P_bc, P_axis], dim=0)
+                    G_all = torch.cat([G_bc, G_axis], dim=0)
+                    weights = torch.cat([
+                        torch.ones(P_bc.shape[0], device=pred_xy.device),
+                        torch.full(
+                            (P_axis.shape[0],), self.cfg.procrustes_axis_weight,
+                            device=pred_xy.device,
+                        ),
+                    ])
+
+        R, t, s = procrustes_similarity(
+            P_all, G_all, with_scale=self.cfg.procrustes_with_scale, weights=weights,
+        )
         return apply_similarity(pred_xy, R, t, s)
 
     # ------------------------------------------------------------------ #

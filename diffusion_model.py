@@ -1,3 +1,5 @@
+import math
+
 import pytorch_lightning as pl
 import torch
 from metrics.train_loss import CombinedTrainLoss
@@ -22,6 +24,45 @@ from utils.diffusion_model.validation.val import (
     on_validation_epoch_start_func,
     validation_step_func,
 )
+
+
+class LogCosineAnnealingWarmRestarts(torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
+    """Cosine warm-restarts with log-space interpolation between ``eta_max`` and ``eta_min``.
+
+    Standard ``CosineAnnealingWarmRestarts`` interpolates LR linearly between
+    the peak and the floor. This variant interpolates ``log(lr)`` instead, so
+    the schedule is geometric in LR space::
+
+        log(η_t) = log(η_min) + ½ (log(η_max) - log(η_min)) (1 + cos(π T_cur / T_i))
+
+    Requires ``eta_min > 0`` and positive base learning rates.
+    """
+
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+        if float(eta_min) <= 0.0:
+            raise ValueError(
+                "LogCosineAnnealingWarmRestarts requires eta_min > 0 "
+                f"(got {eta_min})."
+            )
+        super().__init__(
+            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, last_epoch=last_epoch
+        )
+
+    def get_lr(self):
+        if not self._get_lr_called_within_step:
+            import warnings
+
+            warnings.warn(
+                "To get the last learning rate computed by the scheduler, "
+                "please use `get_last_lr()`.",
+                UserWarning,
+            )
+        cos_term = (1.0 + math.cos(math.pi * self.T_cur / self.T_i)) / 2.0
+        log_min = math.log(float(self.eta_min))
+        return [
+            math.exp(log_min + (math.log(float(base_lr)) - log_min) * cos_term)
+            for base_lr in self.base_lrs
+        ]
 
 
 class FullDenoisingDiffusion(pl.LightningModule):
@@ -117,6 +158,7 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 getattr(train, "lr_cosine_subsequent_cycle_mult", None)
                 or getattr(train, "lr_cosine_period_mult", 1)
             )
+            log_scale = bool(getattr(train, "lr_cosine_log_scale", False))
             if period < 1:
                 raise ValueError("lr_cosine_period_epochs must be >= 1.")
             if period_mult < 1:
@@ -126,6 +168,11 @@ class FullDenoisingDiffusion(pl.LightningModule):
             if constant_after < 0:
                 raise ValueError(
                     "lr_cosine_constant_at_min_after_epochs must be >= 0."
+                )
+            if log_scale and lr_min <= 0.0:
+                raise ValueError(
+                    "lr_cosine_log_scale=True requires lr_cosine_min > 0 "
+                    f"(got {lr_min})."
                 )
             # LinearLR warmup scales from lr_max / n_warmup up to lr_max.
             opt_lr = lr_max
@@ -145,7 +192,12 @@ class FullDenoisingDiffusion(pl.LightningModule):
         )
 
         if use_cosine:
-            cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            cosine_cls = (
+                LogCosineAnnealingWarmRestarts
+                if log_scale
+                else torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+            )
+            cosine = cosine_cls(
                 optimizer,
                 T_0=period,
                 T_mult=period_mult,
