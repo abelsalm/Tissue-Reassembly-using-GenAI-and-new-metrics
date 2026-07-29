@@ -169,10 +169,13 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     max_epochs = cfg.train.n_epochs
     check_val_every_n_epochs = 0 if not cfg.validation.if_validate else cfg.validation.check_val_every_n_epochs
 
-    # Optional mixed-precision and gradient-accumulation knobs. They are
-    # opt-in via the ``train`` config so existing experiments behave the same.
+    # Optional numerical-stability and accumulation knobs.
     precision = getattr(cfg.train, "precision", "32-true")
     accumulate_grad_batches = int(getattr(cfg.train, "accumulate_grad_batches", 1))
+    gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 1.0))
+    gradient_clip_algorithm = str(
+        getattr(cfg.train, "gradient_clip_algorithm", "norm")
+    )
 
     return Trainer(
         devices=gpus,
@@ -185,5 +188,7 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         enable_progress_bar=cfg.general.enable_progress_bar,
         precision=precision,
         accumulate_grad_batches=accumulate_grad_batches,
+        gradient_clip_val=gradient_clip_val,
+        gradient_clip_algorithm=gradient_clip_algorithm,
     )
 

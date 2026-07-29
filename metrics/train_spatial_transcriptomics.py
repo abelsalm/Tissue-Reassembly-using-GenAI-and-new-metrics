@@ -201,6 +201,77 @@ def _align_radii_and_transcriptome_tolerances(
     return sorted_radii, sorted_tols
 
 
+def soft_ranks(
+    x: torch.Tensor,
+    tau: float,
+    *,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Differentiable soft ranks along the last axis (pairwise sigmoid).
+
+    For each vector ``x[..., :]`` of length ``F``::
+
+        r_i = sum_j sigmoid( (x_i - x_j) / tau )
+
+    Self-comparisons contribute ``0.5``, so ranks lie in ``(0.5, F-0.5)`` and
+    approach the usual midrank encoding as ``tau -> 0``.
+
+    ``x`` may be ``[..., F]`` with arbitrary leading dims. When the leading
+    product is large (many cells × shells), ranks are computed in chunks of
+    ``chunk_size`` flattened leading rows so a full ``[..., F, F]`` tensor is
+    never materialised for the whole batch at once.
+    """
+    if tau <= 0.0:
+        raise ValueError(f"soft-rank temperature tau must be > 0, got {tau}")
+    *lead, F = x.shape
+    if F < 2:
+        return x.new_zeros(x.shape)
+
+    flat = x.reshape(-1, F)
+    n_rows = flat.shape[0]
+    inv_tau = 1.0 / float(tau)
+    chunks = []
+    for start in range(0, n_rows, int(chunk_size)):
+        chunk = flat[start : start + chunk_size]          # [C, F]
+        diff = chunk.unsqueeze(-1) - chunk.unsqueeze(-2)  # [C, F, F]
+        chunks.append(torch.sigmoid(diff * inv_tau).sum(dim=-1))
+    return torch.cat(chunks, dim=0).reshape(*lead, F)
+
+
+def pearson_corr_last(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Pearson correlation along the last axis; returns ``[...,]``."""
+    a_c = a - a.mean(dim=-1, keepdim=True)
+    b_c = b - b.mean(dim=-1, keepdim=True)
+    num = (a_c * b_c).sum(dim=-1)
+    den = (a_c.norm(dim=-1) * b_c.norm(dim=-1)).clamp_min(eps)
+    return (num / den).clamp(-1.0, 1.0)
+
+
+def soft_spearman_distance(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    tau: float,
+    *,
+    eps: float = 1e-6,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """``1 - soft_Spearman(pred, gt)`` along the gene axis.
+
+    Soft-ranks both profiles, then Pearson on those ranks. GT ranks are
+    computed under ``no_grad`` (fixed profiles); gradients flow through the
+    pred soft-ranks only. Shape ``pred``/``gt``: ``[..., F]`` → ``[...]``.
+    """
+    with torch.no_grad():
+        gt_ranks = soft_ranks(gt, tau, chunk_size=chunk_size)
+    pred_ranks = soft_ranks(pred, tau, chunk_size=chunk_size)
+    rho = pearson_corr_last(pred_ranks, gt_ranks, eps=eps)
+    return 1.0 - rho
+
+
 def _gt_relative_band_squared_error(
     pred: torch.Tensor,
     gt: torch.Tensor,
@@ -248,52 +319,20 @@ def _gt_relative_band_squared_error(
 
 
 class MultiRadiusNeighborhoodLoss(nn.Module):
-    """Multi-radius neighborhood loss: transcriptome RMSE + log-density diff.
+    """Multi-radius neighborhood loss: transcriptome RMSE / soft-Spearman + density.
 
-    Pipeline (per side: ``pred``, ``gt``):
-      1. Sort ``radii`` ascending and build **annulus** masks (each shell
-         is ``ball(r_k) \\ ball(r_{k-1})``). Compute ``avg``, ``log_density``,
-         and optional neighborhood sums per shell via
-         :func:`compute_neighborhood_avg_and_density_multi_radius`.
-      2. Per-cell per-shell per-**gene** transcriptome term (averaged vs averaged).
-         For each gene ``f`` and shell ``k``, a GT-relative band
-         ``gt_f +/- tolerance[k] * |gt_f|`` softly zeros in-band error
-         (sigmoid gate). ``tolerance[k]`` aligns with ``radii[k]`` in the
-         config list (re-sorted with radii internally). Forgiveness ramps over the first
-         ``transcriptome_tolerance_warmup_epochs`` epochs: epoch ``0`` is
-         plain RMSE; epoch ``k`` keeps ``(n-k)/n`` of in-band loss; epoch
-         ``n+`` applies the full band::
+    Shared neighborhood pipeline (radii, soft_beta, include_self), then optional
+    comparison heads gated by weight (0 = skip compute for that head):
 
-             rmse(i, r) = sqrt( mean_f gated_sq_err_f + eps )
+      L = avg_transcriptome_weight * avg_rmse
+        + avg_spearman_weight * avg_soft_spearman
+        + density_weight * density_term
+        + global_transcriptome_weight * global_rmse
+        + global_spearman_weight * global_soft_spearman
 
-      3. Per-cell per-radius density term::
-
-             dens(i, r) = | log_density_pred(i, r) - log_density_gt(i, r) |
-
-      4. Per-cell per-radius *global* transcriptome term (pred vs GT
-         neighborhood **without** averaging over neighbor count)::
-
-             global_rmse(i, r) = sqrt( mean_f gated_sq_err_f + eps )
-
-         with the same GT-relative band as the transcriptome term.
-         ``sum_side = sum_j w_ij * features[j]`` (no division by count).
-
-      5. Scale only the global term by ``loss_radius_scale * r`` (default
-         ``512 * r``) before aggregation.
-      6. Aggregate: mean over valid cells, then mean over radii, then::
-
-             L = avg_transcriptome_weight * transcriptome_term
-               + density_weight * density_term
-               + global_transcriptome_weight * global_term
-
-    Differentiability is governed by ``soft_beta`` exactly like the
-    single-radius variant (set it to ``None`` for a non-differentiable
-    diagnostic, set it to a positive float for training).
-
-    The GT side does **not** depend on the model and can be precomputed
-    via :meth:`precompute_gt` and passed as ``cached_gt_avg`` /
-    ``cached_gt_log_density`` / ``cached_gt_neighborhood_sum`` to skip the
-    GT recomputation every step.
+    Soft Spearman is ``1 - Pearson(soft_rank(pred), soft_rank(gt))`` along genes
+    (temperature ``spearman_tau``). Global heads are divided by
+    ``loss_radius_scale * r``. RMSE heads use the GT-relative tolerance band.
     """
 
     def __init__(
@@ -302,6 +341,10 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         avg_transcriptome_weight: float = 1.0,
         density_weight: float = 1.0,
         global_transcriptome_weight: float = 0.0,
+        avg_spearman_weight: float = 0.0,
+        global_spearman_weight: float = 0.0,
+        spearman_tau: float = 0.1,
+        spearman_chunk_size: int = 64,
         loss_radius_scale: float = 512.0,
         transcriptome_tolerance: Union[float, Sequence[float]] = 0.05,
         transcriptome_tolerance_gate_beta: Optional[float] = 256.0,
@@ -322,6 +365,10 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self.avg_transcriptome_weight = float(avg_transcriptome_weight)
         self.density_weight = float(density_weight)
         self.global_transcriptome_weight = float(global_transcriptome_weight)
+        self.avg_spearman_weight = float(avg_spearman_weight)
+        self.global_spearman_weight = float(global_spearman_weight)
+        self.spearman_tau = float(spearman_tau)
+        self.spearman_chunk_size = int(spearman_chunk_size)
         self.loss_radius_scale = float(loss_radius_scale)
         self.transcriptome_tolerance_gate_beta = (
             None
@@ -342,6 +389,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self._last_transcriptome: float = -1.0
         self._last_density: float = -1.0
         self._last_global_transcriptome: float = -1.0
+        self._last_avg_spearman: float = -1.0
+        self._last_global_spearman: float = -1.0
 
     def set_current_epoch(self, epoch: int) -> None:
         """Track trainer epoch for tolerance-band warmup (called each epoch)."""
@@ -390,7 +439,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
             soft_beta=self.soft_beta,
             include_self=self.include_self,
             eps=self.eps,
-            return_neighborhood_sum=self.global_transcriptome_weight > 0.0,
+            return_neighborhood_sum=self._needs_neighborhood_sum(),
+        )
+
+    def _needs_neighborhood_sum(self) -> bool:
+        return (
+            self.global_transcriptome_weight > 0.0
+            or self.global_spearman_weight > 0.0
         )
 
     def clear_gt_cache(self) -> None:
@@ -461,7 +516,13 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         node_features = masked_true.node_features
         true_xy = masked_true.positions[..., :2]
         pred_xy = masked_pred.positions[..., :2]
-        use_global = self.global_transcriptome_weight > 0.0
+
+        use_avg_rmse = self.avg_transcriptome_weight > 0.0
+        use_global_rmse = self.global_transcriptome_weight > 0.0
+        use_avg_spearman = self.avg_spearman_weight > 0.0
+        use_global_spearman = self.global_spearman_weight > 0.0
+        use_global = self._needs_neighborhood_sum()
+        use_any_rmse = use_avg_rmse or use_global_rmse
 
         cached_gt = self._get_cached_gt(
             masked_true, node_features.device, node_features.dtype, use_global
@@ -515,32 +576,38 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
             )
         )
 
-        # ---- Transcriptome term: per-cell RMSE over the feature axis,
-        # for each (sample, radius). GT-relative band zeros loss inside
-        # ``gt +/- tolerance * |gt|`` per gene; outside uses ``(pred-gt)^2``.
-        tolerance_forgiveness = self._tolerance_forgiveness()
-        shell_tolerance = self._shell_tolerance_tensor(
-            device=pred_avg.device,
-            dtype=pred_avg.dtype,
-            n_shells=pred_avg.shape[1],
-        )
-        sq_err = _gt_relative_band_squared_error(
-            pred_avg,
-            gt_avg,
-            shell_tolerance,
-            gate_beta=self.transcriptome_tolerance_gate_beta,
-            forgiveness=tolerance_forgiveness,
-            eps=self.eps,
-        )                                              # [B, R, N, F]
-        per_cell_rmse = torch.sqrt(sq_err.mean(dim=-1) + self.eps)
-
         # ---- Density term: |log d_pred - log d_gt|, per cell per radius.
         per_cell_dens = (pred_logd - gt_logd).abs()    # [B, R, N]
+        zero_bn = pred_avg.new_zeros(pred_avg.shape[:3])  # [B, R, N]
 
-        # ---- Global transcriptome term: pred vs GT neighborhood weighted
-        # sums (same comparison as transcriptome, but without / sum_w).
-        if use_global:
+        # ---- RMSE heads (skipped entirely when both RMSE weights are 0).
+        tolerance_forgiveness = self._tolerance_forgiveness()
+        if use_any_rmse:
+            shell_tolerance = self._shell_tolerance_tensor(
+                device=pred_avg.device,
+                dtype=pred_avg.dtype,
+                n_shells=pred_avg.shape[1],
+            )
+        else:
+            shell_tolerance = None
+
+        if use_avg_rmse:
+            assert shell_tolerance is not None
+            sq_err = _gt_relative_band_squared_error(
+                pred_avg,
+                gt_avg,
+                shell_tolerance,
+                gate_beta=self.transcriptome_tolerance_gate_beta,
+                forgiveness=tolerance_forgiveness,
+                eps=self.eps,
+            )                                              # [B, R, N, F]
+            per_cell_rmse = torch.sqrt(sq_err.mean(dim=-1) + self.eps)
+        else:
+            per_cell_rmse = zero_bn
+
+        if use_global_rmse:
             assert pred_sum is not None and gt_sum is not None
+            assert shell_tolerance is not None
             sq_err_global = _gt_relative_band_squared_error(
                 pred_sum,
                 gt_sum,
@@ -549,35 +616,75 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
                 forgiveness=tolerance_forgiveness,
                 eps=self.eps,
             )                                              # [B, R, N, F]
-            per_cell_global = torch.sqrt(
+            per_cell_global_rmse = torch.sqrt(
                 sq_err_global.mean(dim=-1) + self.eps
             )                                              # [B, R, N]
+        else:
+            per_cell_global_rmse = zero_bn
+
+        # ---- Soft-Spearman heads (same profiles; separate comparison).
+        if use_avg_spearman:
+            per_cell_avg_spearman = soft_spearman_distance(
+                pred_avg,
+                gt_avg,
+                self.spearman_tau,
+                eps=self.eps,
+                chunk_size=self.spearman_chunk_size,
+            )
+        else:
+            per_cell_avg_spearman = zero_bn
+
+        if use_global_spearman:
+            assert pred_sum is not None and gt_sum is not None
+            per_cell_global_spearman = soft_spearman_distance(
+                pred_sum,
+                gt_sum,
+                self.spearman_tau,
+                eps=self.eps,
+                chunk_size=self.spearman_chunk_size,
+            )
+        else:
+            per_cell_global_spearman = zero_bn
+
+        # Scale only global (sum) heads by loss_radius_scale * r.
+        if use_global_rmse or use_global_spearman:
             radius_div = torch.tensor(
                 [self.loss_radius_scale * r for r in self.radii],
-                device=per_cell_global.device,
-                dtype=per_cell_global.dtype,
+                device=zero_bn.device,
+                dtype=zero_bn.dtype,
             ).view(1, -1, 1)
-            per_cell_global = per_cell_global / radius_div
-        else:
-            per_cell_global = torch.zeros_like(per_cell_dens)
+            if use_global_rmse:
+                per_cell_global_rmse = per_cell_global_rmse / radius_div
+            if use_global_spearman:
+                per_cell_global_spearman = per_cell_global_spearman / radius_div
 
         # ---- Aggregation: mean over valid cells -> mean over radii ->
         # mean over batch. Doing it in two steps (cells, then radii)
         # means a sample with many cells does not dominate per-radius
         # statistics.
-        valid_i = node_mask.to(per_cell_rmse.dtype).unsqueeze(1)   # [B, 1, N]
-        n_valid = valid_i.sum(dim=-1).clamp_min(1.0)               # [B, 1]
-        rmse_per_r = (per_cell_rmse * valid_i).sum(dim=-1) / n_valid  # [B, R]
-        dens_per_r = (per_cell_dens * valid_i).sum(dim=-1) / n_valid  # [B, R]
-        global_per_r = (per_cell_global * valid_i).sum(dim=-1) / n_valid  # [B, R]
+        valid_i = node_mask.to(zero_bn.dtype).unsqueeze(1)   # [B, 1, N]
+        n_valid = valid_i.sum(dim=-1).clamp_min(1.0)         # [B, 1]
+
+        def _mean_per_r(per_cell: torch.Tensor) -> torch.Tensor:
+            return (per_cell * valid_i).sum(dim=-1) / n_valid  # [B, R]
+
+        rmse_per_r = _mean_per_r(per_cell_rmse)
+        dens_per_r = _mean_per_r(per_cell_dens)
+        global_rmse_per_r = _mean_per_r(per_cell_global_rmse)
+        avg_spearman_per_r = _mean_per_r(per_cell_avg_spearman)
+        global_spearman_per_r = _mean_per_r(per_cell_global_spearman)
 
         transcriptome_term = rmse_per_r.mean()
         density_term = dens_per_r.mean()
-        global_term = global_per_r.mean()
+        global_term = global_rmse_per_r.mean()
+        avg_spearman_term = avg_spearman_per_r.mean()
+        global_spearman_term = global_spearman_per_r.mean()
         loss = (
             self.avg_transcriptome_weight * transcriptome_term
+            + self.avg_spearman_weight * avg_spearman_term
             + self.density_weight * density_term
             + self.global_transcriptome_weight * global_term
+            + self.global_spearman_weight * global_spearman_term
         )
 
         # Cache scalars for log_epoch_metrics (Lightning aggregates these
@@ -585,6 +692,8 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
         self._last_transcriptome = float(transcriptome_term.detach().item())
         self._last_density = float(density_term.detach().item())
         self._last_global_transcriptome = float(global_term.detach().item())
+        self._last_avg_spearman = float(avg_spearman_term.detach().item())
+        self._last_global_spearman = float(global_spearman_term.detach().item())
         self._last_loss = float(loss.detach().item())
 
         to_log: Optional[Dict[str, float]] = None
@@ -595,30 +704,32 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
                 f"{prefix}/neighborhood_multi_radius_transcriptome": float(
                     transcriptome_term.detach().item()
                 ),
-                #f"{prefix}/neighborhood_multi_radius_density": float(
-                #    density_term.detach().item()
-                #),
                 f"{prefix}/neighborhood_multi_radius_global_transcriptome": float(
                     global_term.detach().item()
                 ),
+                f"{prefix}/neighborhood_multi_radius_avg_spearman": float(
+                    avg_spearman_term.detach().item()
+                ),
+                f"{prefix}/neighborhood_multi_radius_global_spearman": float(
+                    global_spearman_term.detach().item()
+                ),
                 f"{prefix}/tolerance_forgiveness": float(tolerance_forgiveness),
             }
-            # Also expose per-radius diagnostics (one number per (B, r) pair
-            # averaged over the batch). Useful for tuning the radius set:
-            # if the smallest radius dominates ``rmse`` you may want to
-            # add a larger one and vice-versa.
             rmse_per_r_mean = rmse_per_r.mean(dim=0).detach()
-            dens_per_r_mean = dens_per_r.mean(dim=0).detach()
             for ri, r in enumerate(self.radii):
                 to_log[f"{prefix}/neighborhood_multi_radius_rmse_r{r:g}"] = float(
                     rmse_per_r_mean[ri].item()
                 )
-                #to_log[f"{prefix}/neighborhood_multi_radius_density_r{r:g}"] = float(
-                #    dens_per_r_mean[ri].item()
-                #)
                 to_log[
                     f"{prefix}/neighborhood_multi_radius_global_transcriptome_r{r:g}"
-                ] = float(global_per_r.mean(dim=0).detach()[ri].item())
+                ] = float(global_rmse_per_r.mean(dim=0).detach()[ri].item())
+                if use_avg_spearman or use_global_spearman:
+                    to_log[
+                        f"{prefix}/neighborhood_multi_radius_avg_spearman_r{r:g}"
+                    ] = float(avg_spearman_per_r.mean(dim=0).detach()[ri].item())
+                    to_log[
+                        f"{prefix}/neighborhood_multi_radius_global_spearman_r{r:g}"
+                    ] = float(global_spearman_per_r.mean(dim=0).detach()[ri].item())
             if wandb.run:
                 wandb.log(to_log, commit=True)
 
@@ -645,6 +756,12 @@ class MultiRadiusNeighborhoodLoss(nn.Module):
             ),
             f"{epoch_prefix}/neighborhood_multi_radius_global": float(
                 self._last_global_transcriptome
+            ),
+            f"{epoch_prefix}/neighborhood_multi_radius_avg_spearman": float(
+                self._last_avg_spearman
+            ),
+            f"{epoch_prefix}/neighborhood_multi_radius_global_spearman": float(
+                self._last_global_spearman
             ),
         }
         # No per-step wandb.log — Lightning averages these at epoch end.

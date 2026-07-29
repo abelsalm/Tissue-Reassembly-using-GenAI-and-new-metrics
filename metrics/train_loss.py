@@ -97,6 +97,16 @@ class CombinedTrainLoss(nn.Module):
                     global_transcriptome_weight=float(
                         _get("multi_radius_global_transcriptome_weight", default=0.0)
                     ),
+                    avg_spearman_weight=float(
+                        _get("multi_radius_avg_spearman_weight", default=0.0)
+                    ),
+                    global_spearman_weight=float(
+                        _get("multi_radius_global_spearman_weight", default=0.0)
+                    ),
+                    spearman_tau=float(_get("multi_radius_spearman_tau", default=0.1)),
+                    spearman_chunk_size=int(
+                        _get("multi_radius_spearman_chunk_size", default=64)
+                    ),
                     loss_radius_scale=float(_get("multi_radius_loss_radius_scale", default=512.0)),
                     transcriptome_tolerance=_get("multi_radius_transcriptome_tolerance", default=0.05),
                     transcriptome_tolerance_gate_beta=_get(

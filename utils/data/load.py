@@ -36,22 +36,20 @@ def create_anndata(
 
 def clean_data(data: np.array) -> np.array:
     """
-    Cleans the given dataset by replacing NaN and infinite values with zeros.
+    Validate that an array contains only finite values.
 
     Parameters:
     data (np.array): A NumPy array containing the dataset.
 
     Returns:
-    np.array: The cleaned dataset with only finite values.
+    np.array: The unchanged finite dataset.
+
+    Raises:
+        ValueError: If the dataset contains NaN or infinite values.
     """
-    # Check for NaN values and replace them
-    if np.isnan(data).any():
-        data = np.nan_to_num(data)
-
-    # Check for infinite values and replace them
-    if np.isinf(data).any():
-        data = np.where(np.isinf(data), 0, data)
-
+    nonfinite_count = int((~np.isfinite(data)).sum())
+    if nonfinite_count:
+        raise ValueError(f"Dataset contains {nonfinite_count} non-finite values")
     return data
 
 def standardise_dataframe_colnames(raw_data):
@@ -236,14 +234,26 @@ def remove_mean_with_mask(x: torch.Tensor, node_mask: torch.Tensor) -> torch.Ten
     # Expand node_mask dimensions
     node_mask = node_mask.unsqueeze(-1)
 
-    # Calculate the absolute sum of masked values
-    masked_max_abs_value = (x * (~node_mask)).abs().sum().item()
+    active_values = x[node_mask.expand_as(x)]
+    if not torch.isfinite(active_values).all():
+        nonfinite_count = int((~torch.isfinite(active_values)).sum().item())
+        raise FloatingPointError(
+            f"Position tensor contains {nonfinite_count} non-finite active values"
+        )
+
+    # Sum only padding slots via ``where`` (not ``* ~mask``) so NaNs on
+    # active nodes do not become ``nan * 0 == nan`` and trip this check.
+    masked_max_abs_value = (
+        torch.where(node_mask, torch.zeros_like(x), x).abs().sum().item()
+    )
 
     # Check if the absolute sum is within the acceptable range
     assert masked_max_abs_value < 1e-5, f"Error {masked_max_abs_value} too high"
 
     # Calculate the count of unmasked nodes
     N = node_mask.sum(1, keepdims=True)
+    if bool((N == 0).any()):
+        raise ValueError("Cannot center a graph with no active nodes")
 
     # Calculate the mean along the second dimension
     mean = torch.sum(x, dim=1, keepdim=True) / N

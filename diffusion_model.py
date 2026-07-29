@@ -2,6 +2,7 @@ import math
 
 import pytorch_lightning as pl
 import torch
+import wandb
 from metrics.train_loss import CombinedTrainLoss
 from metrics.test_vanilla_loss import LossFunction
 from models.model import Model
@@ -98,11 +99,77 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.noise_model = NoiseModel(cfg)
 
     def on_train_epoch_start(self) -> None:
+        anomaly_from_epoch = int(
+            getattr(self.cfg.train, "detect_anomaly_from_epoch", -1)
+        )
+        anomaly_enabled = (
+            anomaly_from_epoch >= 0 and self.current_epoch >= anomaly_from_epoch
+        )
+        torch.autograd.set_detect_anomaly(anomaly_enabled, check_nan=True)
+        if (
+            anomaly_enabled
+            and self.current_epoch == anomaly_from_epoch
+            and self.trainer.is_global_zero
+        ):
+            print(
+                f"[Epoch {self.current_epoch}] Autograd anomaly detection enabled.",
+                flush=True,
+            )
         on_train_epoch_start_func(self)
 
     def training_step(self, data, i) -> torch.Tensor:
         loss = training_step_func(self, data, i)
         return loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Log the global pre-clipping gradient norm and reject non-finite gradients."""
+        squared_norm = torch.zeros((), device=self.device, dtype=torch.float64)
+        max_abs = torch.zeros((), device=self.device)
+        nonfinite_tensors = []
+
+        for name, parameter in self.named_parameters():
+            if parameter.grad is None:
+                continue
+            grad = parameter.grad.detach()
+            if not torch.isfinite(grad).all():
+                nonfinite_tensors.append(name)
+                continue
+            grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float64)
+            squared_norm += grad_norm.square()
+            max_abs = torch.maximum(max_abs, grad.abs().max().to(max_abs.dtype))
+
+        global_norm = squared_norm.sqrt()
+        global_norm_value = float(global_norm.item())
+        max_abs_value = float(max_abs.item())
+        clip_val = float(getattr(self.cfg.train, "gradient_clip_val", 1.0))
+
+        self.log(
+            "train_step/grad_global_l2_norm_pre_clip",
+            global_norm,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            logger=True,
+        )
+        if self.trainer.is_global_zero and wandb.run:
+            wandb.log(
+                {
+                    "grad/global_l2_norm_pre_clip": global_norm_value,
+                    "grad/max_abs_pre_clip": max_abs_value,
+                    "grad/clip_threshold": clip_val,
+                    "grad/nonfinite_tensor_count": len(nonfinite_tensors),
+                    "trainer/global_step": int(self.global_step),
+                },
+                commit=True,
+            )
+
+        if nonfinite_tensors or not math.isfinite(global_norm_value):
+            names = ", ".join(nonfinite_tensors[:10])
+            suffix = " ..." if len(nonfinite_tensors) > 10 else ""
+            raise FloatingPointError(
+                "Non-finite gradients detected before the optimizer step"
+                + (f" in: {names}{suffix}" if names else "")
+            )
 
     def on_train_epoch_end(self) -> None:
         on_train_epoch_end_func(self)

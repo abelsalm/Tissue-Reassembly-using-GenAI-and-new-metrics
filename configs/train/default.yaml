@@ -1,19 +1,22 @@
 n_epochs: 1000 # Number of epochs
 batch_size: 2 # Batch size for training
 lr: 5e-5 # Learning rate (also default peak LR when lr_cosine_max is null).
-lr_warmup_epochs: 100 # near LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
+lr_warmup_epochs: 200 # 100 # near LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
 # --- Cosine annealing with warm restarts (optional) -------------------------
 lr_cosine_warm_restarts: True # If True, use CosineAnnealingWarmRestarts (after warmup when lr_warmup_epochs > 0).
 lr_cosine_log_scale: True # If True, interpolate log(lr) between max and min (geometric cosine); requires lr_cosine_min > 0.
 lr_cosine_max: null # Peak LR eta_max per cycle; null = use ``lr``.
-lr_cosine_min: 5.0e-5 # Floor LR eta_min at the bottom of each cosine cycle.
-lr_cosine_period_epochs: 900 #irst cosine cycle length T_0 (epochs).
+lr_cosine_min: 1.0e-4 # Floor LR eta_min at the bottom of each cosine cycle.
+lr_cosine_period_epochs: 600 #irst cosine cycle length T_0 (epochs).
 lr_cosine_subsequent_cycle_mult: 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
 # After this many cosine epochs (post-warmup), freeze LR at lr_cosine_min for the rest of training.
 # 0 = disabled (cosine / warm-restarts continue for all remaining epochs).
-lr_cosine_constant_at_min_after_epochs: 900
+lr_cosine_constant_at_min_after_epochs: 600
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
-weight_decay: 1.0e-5
+weight_decay: 2.0e-5
+gradient_clip_val: 10.0 # Clip the global gradient L2 norm before each optimizer step (<= 0 disables clipping).
+gradient_clip_algorithm: norm # PyTorch Lightning clipping algorithm: "norm" or "value".
+detect_anomaly_from_epoch: 300 # Enable autograd anomaly detection from this 0-based epoch onward; -1 disables it.
 rechunk_every_n_epochs: 0 # Re-randomise chunk boundaries every N epochs (0 = disabled)
 # --- Global smooth position warp (training augmentation) ------------
 position_warp_augment: True # If True, apply one smooth warp field per epoch to all train cells.
@@ -21,7 +24,7 @@ position_warp_max_displacement: 0.05 # Max |displacement| in normalised coord un
 position_warp_max_angle_span: 1.5707963267948966 # Max direction variation (rad) over the domain; pi/2.
 position_warp_grid_size: 8 # Control-grid resolution for the smooth warp field.
 debug_print_shuffle_every_n_epochs: 10 # Print a shuffle canary every N epochs (0 = disabled)
-debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-based)
+debug_shuffle_row_index: 10 # Fixed row index to print after shuffle (0-base0d)
 # --- Min-SNR loss reweighting (Hang et al. ICCV 2023) ----------------------
 # When enabled, the combined loss is multiplied by batch-mean
 #   w(t) = min{ SNR(t), min_snr_gamma } ,  SNR(t) = alpha_bar(t)^2 / sigma_bar(t)^2
@@ -31,14 +34,14 @@ min_snr_gamma: 1.0 # Clamp threshold γ in w = min(SNR, γ); paper default is 5.
 # --- Global combined loss weights (0 = term disabled, no compute) --------
 #   L = vanilla_weight                    * L_vanilla_position_mse
 #     + transcriptome_multi_radius_weight * L_transcriptome_multi_radius
-#     + ch_weight                         * L_ch_auc
+#     + ch_weight1                         * L_ch_auc
 #     + pca_weight                        * L_pca
 #     + directional_weight                * L_directional
 #     + mmd_weight                        * L_mmd
 #   then if min_snr_weighting: L <- mean(min(SNR(t), min_snr_gamma)) * L
 other_trigger: 0 # CH, PCA, directional, and MMD losses are forced to 0 until this epoch (0 = active from epoch 0). Vanilla and transcriptome are not gated.
 vanilla_weight: 0 # Original LUNA pairwise distance-matrix MSE on positions (0 = disabled, no compute).
-mmd_weight: 1.0 # Global weight of the whole-slide per-class MMD loss term (0 = disabled, no compute).
+mmd_weight: 64 # Global weight of the whole-slide per-class MMD loss term (0 = disabled, no compute).
 transcriptome_multi_radius_weight: 1.0 # Multi-radius neighborhood transcriptome loss.
 ch_weight: 0 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
 pca_weight: 0 # Whole-slide PCA shape-descriptor loss.
@@ -50,19 +53,29 @@ directional_weight: 0 # Transcriptome-weighted local orientation coherence loss.
 # each shell is ball(r_k) minus ball(r_{k-1}), not overlapping balls). Aggregated as
 #   L = multi_radius_avg_transcriptome_weight
 #         * transcriptome_rmse(avg_pred, avg_gt)   # per-gene GT band: see tolerance below
+#     + multi_radius_avg_spearman_weight
+#         * (1 - soft_Spearman(avg_pred, avg_gt))  # soft ranks, temp = spearman_tau
 #     + multi_radius_density_weight * |log d_pred - log d_gt|
 #     + multi_radius_global_transcriptome_weight
 #       * mean_{i,r} rmse(sum_pred(i,r), sum_gt(i,r)) / (scale * r)
-# Transcriptome + global: per cell, per shell, per **gene** f, in-band loss ramps
-# from full RMSE (epoch 0) to ~0 (epoch n+): sq *= (n-k)/n inside band at epoch k.
+#     + multi_radius_global_spearman_weight
+#       * mean_{i,r} (1 - soft_Spearman(sum_pred, sum_gt)) / (scale * r)
+# Any weight of 0 disables that head (no compute). RMSE and soft-Spearman share
+# the same neighborhood tensors / radii / soft_beta; only the comparison differs.
+# Transcriptome RMSE + global RMSE: per cell, per shell, per **gene** f, in-band loss
+# ramps from full RMSE (epoch 0) to ~0 (epoch n+): sq *= (n-k)/n inside band at epoch k.
 multi_radius_radii: [0.02, 0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
 multi_radius_avg_transcriptome_weight: 0 # Weight of pred-vs-GT neighborhood-averaged transcriptome RMSE (0 = disabled).
 multi_radius_density_weight: 0.0 # Relative weight of the log-density term vs. the transcriptome-RMSE term.
-multi_radius_global_transcriptome_weight: 1.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
+multi_radius_global_transcriptome_weight: 0.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
+multi_radius_avg_spearman_weight: 0.0 # Weight of soft-Spearman on neighborhood-averaged profiles (0 = disabled).
+multi_radius_global_spearman_weight: 1.0 # Weight of soft-Spearman on neighborhood sums (0 = disabled); set >0 and zero RMSE weights to replace RMSE.
+multi_radius_spearman_tau: 1 # Soft-rank temperature; smaller → closer to hard ranks (sharper, weaker grads).
+multi_radius_spearman_chunk_size: 512 # Rows (cells×shells flattened) per soft-rank chunk; lower = less peak GPU memory.
 multi_radius_transcriptome_tolerance: [0.02, 0.04, 0.06, 0.08] # Per-shell GT band half-width per gene (same length/order as multi_radius_radii; scalar = same for all shells).
 multi_radius_transcriptome_tolerance_soft_beta: 64.0 # Sigmoid sharpness for the per-gene tolerance gate; null = hard cutoff at band edge.
 multi_radius_transcriptome_tolerance_warmup_epochs: 0 # Epochs n to ramp band forgiveness: epoch k keeps (n-k)/n of in-band loss; 0 = full band from epoch 0.
-multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is this times r.
+multi_radius_loss_radius_scale: 512 # Global term only: per-radius divisor is this times r (applies to both global RMSE and global Spearman).
 multi_radius_soft_beta: 128.0 # Sigmoid sharpness for soft neighborhood membership; null = hard cutoff (no gradient through positions; diagnostic only).
 multi_radius_eps: 1.0e-6 # Numerical floor for sqrt + log + weight normalisation.
 multi_radius_include_self: True # Include cell i itself in its own neighborhood when averaging / counting.
@@ -71,8 +84,8 @@ pca_anisotropy_weight: 1.0 # Relative weight of anisotropy term inside L_pca.
 pca_omnivariance_weight: 1.0 # Relative weight of omnivariance term inside L_pca.
 pca_linearity_weight: 1.0 # Relative weight of linearity term inside L_pca.
 # --- Cahn-Hilliard AUC parameters (only used when ch_weight > 0) ----
-ch_radii: [0.002, 0.008, 0.016, 0.064, 0.128] # Radii for CH AUC integration.
-ch_grid_resolution: 512 # CH landscape grid resolution.
+ch_radii: [0.004, 0.0016, 0.064, 0.256] # Radii for CH AUC integration.
+ch_grid_resolution: 256 # CH landscape grid resolution.
 ch_kappa: 0.5 # CH kappa.
 ch_soft_max_beta: 32.0 # Soft-max beta for landscape combination.
 ch_support_factor: 8 # Bump support factor.
@@ -112,23 +125,24 @@ directional_density_radius_beta: 32.0 # Sigmoid sharpness for the density-radius
 # mmd_steps / mmd_lr* / mmd_max_grad keys are unused here (kept for parity).
 mmd_min_cells: 10 # Skip cell classes with fewer GT cells.
 mmd_cache_gt: True # Cache per-(slide,class) GT kernel constants; cleared each epoch.
+mmd_average_over_cell_types: True # True = mean eligible cell-type losses per slide; False = sum them.
 procrustes_align: True # Fit one Procrustes similarity per slide on per-class barycenters and apply it to all pred cells before the MMD (rotation/translation/scale invariance).
 procrustes_with_scale: False # Include the Procrustes scale term (full similarity); False = rotation + translation only (s=1).
-procrustes_axis_align: True #  optional: fit the Procrustes rotation using a per-class principal-axis pseudo-landmark (barycenter +/- axis direction), not just barycenters; stabilizes rotation when centroid geometry alone is weak (few/near-coincident/symmetric classes).
+procrustes_axis_align: True # Also fit Procrustes using per-class PCA1 landmarks: n≈sqrt(n_cells) points evenly spaced on [bc - L·PCA1, bc + L·PCA1] (plus barycenters); stabilizes rotation when centroid geometry alone is weak.
 procrustes_axis_weight: 1.0 # Weight of each axis landmark relative to a (unit-weight) barycenter landmark in the weighted Procrustes fit, when procrustes_axis_align is True.
-procrustes_axis_min_cells: 10 # Skip a class's axis landmark if it has fewer than this many GT cells (its covariance would be too noisy to trust).
-procrustes_axis_min_anisotropy: 0.2 # Skip a class's axis landmark if its GT anisotropy (0=isotropic, 1=perfectly aligned) is below this (a near-round GT shape carries no reliable orientation signal).
-procrustes_axis_length_mult: 1.0 # Axis landmark distance from the barycenter = this multiplier * sqrt(class's own principal-axis variance).
+procrustes_axis_min_cells: 64 # Skip a class's axis landmarks if it has fewer than this many GT cells (its covariance would be too noisy to trust).
+procrustes_axis_min_anisotropy: 0.4 # Skip a class's axis landmarks if its GT anisotropy (0=isotropic, 1=perfectly aligned) is below this (a near-round GT shape carries no reliable orientation signal).
+procrustes_axis_length_mult: 1.0 # Half-length of the PCA1 segment = this multiplier * sqrt(class's own principal-axis variance).
 sigmoid_tau_frac: 0.24 # Sigmoid softness (fraction of sigma) for the local PCA neighborhood.
 pca_scale_factor: 16.0 # Divisor applied to sigma before the local PCA neighborhood weighting.
 pair_dist_weight: 0.0 # Weight of the mean-pairwise-distance matching term inside the MMD loss.
 min_dist_weight: 0 # Weight of the min-distance repulsion term (prevents cell collapse).
 min_dist_thresh: null # Absolute min-distance threshold; null = use min_dist_quantile of GT.
 min_dist_quantile: 0.1 # Quantile of GT pairwise distances used as the min-distance threshold.
-pair_dist_mmd_weight: 48.0 # Weight of the pairwise-distance-distribution IMQ-MMD term.
-pair_dist_mmd_band_mults: [0.04, 0.16, 0.64, 1.28, 2.56, 5.12] # Band multipliers (x median GT pairwise distance) for the pair-distance MMD.
-local_aniso_stretch_power: 0.2 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
-spatial_band_mults: [1.0, 2.0, 4.0] # Band multipliers (x median GT pairwise distance) for the spatial IMQ-MMD.
-whole_slice_MMD_weight: 384.0 # Weight of the whole-slice isotropic MMD coherence term (0 = disabled).
-whole_slice_MMD_band_mults: [0.06, 0.12, 0.25] # Band multipliers for the whole-slice isotropic MMD.
+pair_dist_mmd_weight: 16.0 # Weight of the pairwise-distance-distribution IMQ-MMD term.
+pair_dist_mmd_band_mults: [0.08, 0.16, 0.64] # 1.28] # Band multipliers (x median GT pairwise distance) for the pair-distance MMD.
+local_aniso_stretch_power: 0.4 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
+spatial_band_mults: [0.08, 0.16, 0.64] # Band multipliers (x median GT pairwise distance) for the spatial IMQ-MMD.
+whole_slice_MMD_weight: 16.0 # Weight of the whole-slice isotropic MMD coherence term (0 = disabled).
+whole_slice_MMD_band_mults: [0.08, 0.32] # Band multipliers for the whole-slice isotropic MMD.
 support_margin_mult: 3.0 # Support margin in units of GT nearest-neighbor spacing.

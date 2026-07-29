@@ -78,19 +78,20 @@ def _sigmas_tensor(sigmas, like: torch.Tensor) -> torch.Tensor:
 def imq_selfterm_1d(d: torch.Tensor, sigmas) -> torch.Tensor:
     if d.numel() < 2:
         return d.new_zeros(())
+    sig = _sigmas_tensor(sigmas, d)
     d2 = (d[:, None] - d[None, :]).pow(2)
-    c2 = _sigmas_tensor(sigmas, d).pow(2)
-    K = c2[:, None, None] / (c2[:, None, None] + d2)
-    return _off_diag_mean(K).mean()
+    per_band = _off_diag_mean(_imq_from_sqdist(d2, sig))
+    # σ²-scale each band so grads stay O(1) for small bandwidths.
+    return (per_band * sig.pow(2).clamp_min(1e-12)).mean()
 
 
 def imq_crossterm_1d(a: torch.Tensor, b: torch.Tensor, sigmas) -> torch.Tensor:
     if a.numel() == 0 or b.numel() == 0:
         return a.new_zeros(())
+    sig = _sigmas_tensor(sigmas, a)
     d2 = (a[:, None] - b[None, :]).pow(2)
-    c2 = _sigmas_tensor(sigmas, a).pow(2)
-    K = c2[:, None, None] / (c2[:, None, None] + d2)
-    return K.mean(dim=(1, 2)).mean()
+    per_band = _imq_from_sqdist(d2, sig).mean(dim=(1, 2))
+    return (per_band * sig.pow(2).clamp_min(1e-12)).mean()
 
 
 def support_penalty(X, G, margin):
@@ -140,14 +141,15 @@ def class_covariances(positions: torch.Tensor, labels: torch.Tensor, mask: torch
 def class_anisotropy(cov: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Closed-form eigenvalue-ratio anisotropy ``(lambda1 - lambda2) / lambda1`` for a
     batch of 2x2 covariance matrices, computed from trace/det (no ``eigh`` call
-    needed for this scalar summary)."""
+    needed for this scalar summary). The exact value is in ``[0, 1]``; clamp
+    round-off outside that interval before it is used for axis gating."""
     a, d = cov[..., 0, 0], cov[..., 1, 1]
     b = cov[..., 0, 1]
     half = 0.5 * (a + d)
     det = (a * d - b * b).clamp_min(0.0)
     disc = torch.sqrt((half * half - det).clamp_min(0.0))
     lam1 = half + disc
-    return (2.0 * disc) / (lam1 + eps)
+    return ((2.0 * disc) / (lam1 + eps)).clamp(0.0, 1.0)
 
 
 def class_top_eigvec(cov: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -162,25 +164,43 @@ def class_axis_landmarks(
     barycenters: torch.Tensor,
     cov: torch.Tensor,
     ref_dirs: torch.Tensor,
+    counts: torch.Tensor,
     length_mult: float = 1.0,
 ) -> torch.Tensor:
-    """One pseudo-landmark per class at ``barycenter + length * axis_direction``.
+    """Per-class PCA1 landmarks evenly spaced on ``[bc - L v, bc + L v]``.
 
-    ``length`` is the class's own standard deviation along its principal axis
-    (``sqrt(top eigenvalue)``), scaled by ``length_mult``. The eigenvector's
-    sign is resolved against ``ref_dirs`` (unit vectors, one per class) by
-    flipping it to have a non-negative dot product with ``ref_dirs`` -- this
-    is what makes the landmark well-defined despite the inherent sign
-    ambiguity of eigenvectors (see ``_aligned_pred_xy`` for how ``ref_dirs``
-    is derived from a reference rotation so pred/GT axes are paired
-    consistently rather than arbitrarily by whatever an eigensolver returns).
+    For each class, builds ``n ≈ round(sqrt(n_cells))`` (at least 2) points
+    along the principal axis through the barycenter, from
+    ``barycenter - length * axis`` to ``barycenter + length * axis``.
+    ``length`` is ``length_mult * sqrt(top eigenvalue)``.
+
+    The eigenvector sign is resolved against ``ref_dirs`` (unit vectors, one
+    per class) by flipping to a non-negative dot product -- this makes the
+    landmarks well-defined despite eigenvector sign ambiguity (see
+    ``_aligned_pred_xy`` for how ``ref_dirs`` is derived from a reference
+    rotation so pred/GT axes are paired consistently).
+
+    Returns a concatenated ``[sum_c n_c, D]`` tensor (classes may contribute
+    different ``n``). Empty input returns an empty ``[0, D]`` tensor.
     """
+    if barycenters.shape[0] == 0:
+        return barycenters.new_zeros((0, barycenters.shape[-1]))
+
     v, lam = class_top_eigvec(cov)
     sign = torch.sign((v * ref_dirs).sum(dim=-1, keepdim=True))
     sign = torch.where(sign == 0, torch.ones_like(sign), sign)
     v = v * sign
-    length = length_mult * torch.sqrt(lam.clamp_min(0.0)).unsqueeze(-1)
-    return barycenters + length * v
+    length = length_mult * torch.sqrt(lam.clamp_min(0.0)).unsqueeze(-1)  # [C, 1]
+
+    landmarks = []
+    for i in range(barycenters.shape[0]):
+        n_cells = int(counts[i].item())
+        n = max(2, int(round(n_cells ** 0.5)))
+        # Evenly spaced scalars in [-1, +1] (includes both extrema).
+        t = torch.linspace(-1.0, 1.0, n, device=barycenters.device, dtype=barycenters.dtype)
+        # [n, D] = bc + t[:, None] * (length * v)
+        landmarks.append(barycenters[i] + t.unsqueeze(-1) * (length[i] * v[i]))
+    return torch.cat(landmarks, dim=0)
 
 
 def procrustes_similarity(
@@ -282,13 +302,19 @@ def local_cell_metrics_batch(points, sigma, tau_frac, pca_scale_factor, eps=1e-8
 def symmetrized_local_kernel_matrix(points, sigma, tau_frac, stretch_power, pca_scale_factor):
     V, ratio = local_cell_metrics_batch(points, sigma, tau_frac, pca_scale_factor)
     stretch = ratio.pow(stretch_power)
-    sc = torch.stack([sigma * stretch, sigma / stretch], dim=-1)
+    # Put bandwidth into the metric once: d2 = ||(V^T diff) / (σ · shape)||²,
+    # then IMQ is K = 1/(1+d2). Equivalent to σ²/(σ² + ||diff_aniso||²), but
+    # keeps d2 O(1) for typical neighbors and avoids DivBackward overflow when
+    # predictions are far from GT (raw c2/(c2+d2) with unscaled d2).
+    sigma_t = torch.as_tensor(sigma, dtype=points.dtype, device=points.device).clamp_min(
+        1e-6
+    )
+    sc = sigma_t * torch.stack([stretch, stretch.reciprocal()], dim=-1)
 
     diff = points.unsqueeze(0) - points.unsqueeze(1)
     proj = torch.einsum("ijc,icd->ijd", diff, V) / sc.unsqueeze(1)
-    d2 = proj.pow(2).sum(-1)
-    c2 = sigma * sigma
-    K = c2 / (c2 + d2)
+    d2 = proj.pow(2).sum(-1).clamp_max(1e8)
+    K = 1.0 / (1.0 + d2)
     K = 0.5 * (K + K.T)
     return K, V, stretch
 
@@ -315,14 +341,15 @@ def precompute_local_gt_cache(G, sigmas, tau_frac, stretch_power, pca_scale_fact
 def cross_kernel_gt_local(X, G, cache: LocalGTCache) -> torch.Tensor:
     diff = X.unsqueeze(1) - G.unsqueeze(0)
     proj = torch.einsum("imc,smcd->simd", diff, cache.V)
-    sc = torch.stack(
-        [cache.sigmas[:, None] * cache.stretch, cache.sigmas[:, None] / cache.stretch],
+    # Same metric as the GT self-kernel: σ · [stretch, 1/stretch], K = 1/(1+d2).
+    sig = cache.sigmas.clamp_min(1e-6)[:, None]
+    sc = sig.unsqueeze(-1) * torch.stack(
+        [cache.stretch, cache.stretch.reciprocal()],
         dim=-1,
     )
     proj = proj / sc.unsqueeze(1)
-    d2 = proj.pow(2).sum(-1)
-    c2 = cache.sigmas.pow(2)
-    K = c2[:, None, None] / (c2[:, None, None] + d2)
+    d2 = proj.pow(2).sum(-1).clamp_max(1e8)
+    K = 1.0 / (1.0 + d2)
     return K.mean(dim=(1, 2))
 
 
@@ -380,15 +407,27 @@ def min_dist_repulsion_loss(X, thresh):
     return torch.relu(thresh - d).pow(2).mean()
 
 
+def _imq_from_sqdist(d2: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:
+    """Stable IMQ ``σ²/(σ²+d²)`` as ``1/(1 + d²/σ²)``.
+
+    ``d2`` is ``(n, m)`` pairwise squared distances; result is ``(S, n, m)``.
+    """
+    c2 = sigmas.pow(2).clamp_min(1e-12)[:, None, None]
+    if d2.ndim == 2:
+        d2 = d2.unsqueeze(0)
+    # Cap the scaled distance so far-away pairs stay in the flat IMQ regime
+    # without float overflow in the backward of the division.
+    return 1.0 / (1.0 + (d2 / c2).clamp_max(1e8))
+
+
 def mmd2_imq_iso(X, G, sigmas: torch.Tensor, ky_offdiag: torch.Tensor) -> torch.Tensor:
     dxx = pairwise_dist(X, X).pow(2)
     dxy = pairwise_dist(X, G).pow(2)
-    c2 = sigmas.pow(2)
-    kxx = c2[:, None, None] / (c2[:, None, None] + dxx)
-    kxx_offdiag = _off_diag_mean(kxx)
-    kxy = c2[:, None, None] / (c2[:, None, None] + dxy)
-    kxy_mean = kxy.mean(dim=(1, 2))
-    return (kxx_offdiag + ky_offdiag - 2.0 * kxy_mean).mean()
+    kxx_offdiag = _off_diag_mean(_imq_from_sqdist(dxx, sigmas))
+    kxy_mean = _imq_from_sqdist(dxy, sigmas).mean(dim=(1, 2))
+    per_band = kxx_offdiag + ky_offdiag - 2.0 * kxy_mean
+    # Per-band σ² scaling: IMQ grads are O(1/σ²); this keeps them O(1).
+    return (per_band * sigmas.pow(2).clamp_min(1e-12)).mean()
 
 
 @dataclass
@@ -405,19 +444,17 @@ def precompute_whole_slice_mmd_cache(G, band_mults) -> Optional[WholeSliceMMDCac
     mults = torch.as_tensor(band_mults, dtype=G.dtype, device=G.device)
     sigmas = mults * med
     dyy = pairwise_dist(G, G).pow(2)
-    c2 = sigmas.pow(2)
-    kyy = c2[:, None, None] / (c2[:, None, None] + dyy)
-    ky_offdiag = _off_diag_mean(kyy).detach()
+    ky_offdiag = _off_diag_mean(_imq_from_sqdist(dyy, sigmas)).detach()
     return WholeSliceMMDCache(G=G, sigmas=sigmas.detach(), ky_offdiag=ky_offdiag)
 
 
 def mmd2_local_gt_iso_pred(X, G, gt_cache: LocalGTCache) -> torch.Tensor:
     dxx = pairwise_dist(X, X).pow(2)
-    c2 = gt_cache.sigmas.pow(2)
-    kxx = c2[:, None, None] / (c2[:, None, None] + dxx)
-    kxx_offdiag = _off_diag_mean(kxx)
+    kxx_offdiag = _off_diag_mean(_imq_from_sqdist(dxx, gt_cache.sigmas))
     kxy_mean = cross_kernel_gt_local(X, G, gt_cache)
-    return (kxx_offdiag + gt_cache.ky_offdiag - 2.0 * kxy_mean).mean()
+    per_band = kxx_offdiag + gt_cache.ky_offdiag - 2.0 * kxy_mean
+    # Per-band σ² scaling: IMQ grads are O(1/σ²); this keeps them O(1).
+    return (per_band * gt_cache.sigmas.pow(2).clamp_min(1e-12)).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +558,7 @@ def class_mmd_loss(
 
 @dataclass
 class MMDConfig:
+    mmd_average_over_cell_types: bool = True
     sigmoid_tau_frac: float = 10e-3
     pca_scale_factor: float = 1.0
     pair_dist_weight: float = 0.0
@@ -573,6 +611,9 @@ def _mmd_config_from_cfg(cfg) -> MMDConfig:
         return tuple(float(x) for x in v)
 
     return MMDConfig(
+        mmd_average_over_cell_types=bool(
+            g("mmd_average_over_cell_types", True)
+        ),
         sigmoid_tau_frac=float(g("sigmoid_tau_frac", 10e-3)),
         pca_scale_factor=float(g("pca_scale_factor", 1.0)),
         pair_dist_weight=float(g("pair_dist_weight", 0.0)),
@@ -616,9 +657,9 @@ class SlideMMDLoss(nn.Module):
     For every slide in the batch and every cell class present, computes the
     same per-class objective as ``script_mmd.py`` (local anisotropic GT IMQ-MMD
     + pair-distance match + min-distance repulsion + pair-distance MMD +
-    support / box penalties), sums the per-class losses, and optionally adds a
-    whole-slice isotropic MMD coherence term coupling all predicted cells
-    against the full GT point cloud.
+    support / box penalties), reduces the per-class losses by configurable
+    mean or sum, and optionally adds a whole-slice isotropic MMD coherence term
+    coupling all predicted cells against the full GT point cloud.
 
     All GT-side quantities are cached per (slide, class) and reused across
     steps; the cache is keyed by the slide's ``cell_ID`` row so it survives
@@ -761,12 +802,13 @@ class SlideMMDLoss(nn.Module):
 
         When ``procrustes_axis_align`` is set, classes with enough GT cells
         (``procrustes_axis_min_cells``) and a sufficiently anisotropic GT
-        shape (``procrustes_axis_min_anisotropy``) also contribute a
-        per-class principal-axis pseudo-landmark (pred vs GT) to the fit,
-        weighted by ``procrustes_axis_weight`` relative to the (unit-weight)
-        barycenter landmarks. Gating on the *GT*-side anisotropy (fixed
-        target, not the still-training prediction) keeps the set of classes
-        used for orientation matching stable across training steps.
+        shape (``procrustes_axis_min_anisotropy``) also contribute
+        ``n ≈ sqrt(n_cells)`` principal-axis pseudo-landmarks per class
+        (evenly spaced on ``[bc - L·PCA1, bc + L·PCA1]``), weighted by
+        ``procrustes_axis_weight`` relative to the (unit-weight) barycenter
+        landmarks. Gating on the *GT*-side anisotropy (fixed target, not the
+        still-training prediction) keeps the set of classes used for
+        orientation matching stable across training steps.
 
         Axis eigenvectors are only defined up to sign, so a cheap
         barycenter-only rotation fit is computed first and used purely as a
@@ -815,13 +857,13 @@ class SlideMMDLoss(nn.Module):
                     # pred axis with the GT axis it is closest to under R0.
                     ref_dirs = G_axis_dir @ R0
                     P_axis = class_axis_landmarks(
-                        P_bc, P_cov, ref_dirs, self.cfg.procrustes_axis_length_mult
+                        P_bc[axis_gate], P_cov[axis_gate], ref_dirs[axis_gate],
+                        counts[axis_gate], self.cfg.procrustes_axis_length_mult,
                     )
                     G_axis = class_axis_landmarks(
-                        G_bc, G_cov, G_axis_dir, self.cfg.procrustes_axis_length_mult
+                        G_bc[axis_gate], G_cov[axis_gate], G_axis_dir[axis_gate],
+                        counts[axis_gate], self.cfg.procrustes_axis_length_mult,
                     )
-                    P_axis = P_axis[axis_gate]
-                    G_axis = G_axis[axis_gate]
                     P_all = torch.cat([P_bc, P_axis], dim=0)
                     G_all = torch.cat([G_bc, G_axis], dim=0)
                     weights = torch.cat([
@@ -854,6 +896,13 @@ class SlideMMDLoss(nn.Module):
         node_mask = masked_true.node_mask
         cell_class = masked_true.cell_class
         cell_id = masked_true.cell_ID
+
+        active_pred = pred_positions[node_mask.bool()]
+        if not torch.isfinite(active_pred).all():
+            nonfinite = int((~torch.isfinite(active_pred)).sum().item())
+            raise FloatingPointError(
+                f"MMD received {nonfinite} non-finite active predicted coordinates"
+            )
 
         device = pred_positions.device
         dtype = pred_positions.dtype
@@ -889,6 +938,12 @@ class SlideMMDLoss(nn.Module):
                     classes_present.append((cint, cmask))
 
             pred_xy = self._aligned_pred_xy(pred_xy, true_xy, labels, mask_b)
+            if not torch.isfinite(pred_xy[mask_b]).all():
+                nonfinite = int((~torch.isfinite(pred_xy[mask_b])).sum().item())
+                raise FloatingPointError(
+                    f"MMD Procrustes alignment produced {nonfinite} non-finite "
+                    f"predicted coordinates"
+                )
 
             per_class_losses = []
             per_class_xy = []
@@ -925,7 +980,14 @@ class SlideMMDLoss(nn.Module):
                         ws_terms.append(ws_loss.detach())
 
             if per_class_losses:
-                slide_loss = torch.stack(per_class_losses).sum() + self.cfg.whole_slice_MMD_weight * ws_loss
+                per_class_stack = torch.stack(per_class_losses)
+                if self.cfg.mmd_average_over_cell_types:
+                    # Keep the slide scale independent of how many cell types
+                    # pass ``mmd_min_cells``.
+                    per_class_loss = per_class_stack.mean()
+                else:
+                    per_class_loss = per_class_stack.sum()
+                slide_loss = per_class_loss + self.cfg.whole_slice_MMD_weight * ws_loss
             else:
                 slide_loss = zero + self.cfg.whole_slice_MMD_weight * ws_loss
             loss_terms.append(slide_loss)

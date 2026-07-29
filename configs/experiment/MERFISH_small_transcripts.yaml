@@ -19,17 +19,17 @@ dataset:
         validation: null
 
 train: # !!!!
-    n_epochs: 3000     # tiny number for a smoke-test; increase for real training
+    n_epochs: 1200     # tiny number for a smoke-test; increase for real training
     batch_size: 4     # keep small on CPU
     lr: 5e-4
 
 test:
     save_dir: '/home/abel/code/code_outputs'
     checkpoint_paths: null
-    #- '/home/abel/code/outputs/2026-07-20/14-51-45-MERFISH_small_transcripts/checkpoints/epoch=895.ckpt'
-   # - '/home/abel/code/outputs/2026-07-20/17-14-27-MERFISH_small_transcripts/checkpoints/epoch=607.ckpt'
-   # - '/home/abel/code/outputs/initial_models/epoch=2999.ckpt'
-    #- '/home/abel/code/outputs/initial_models/epoch=1999.ckpt'
+    #-  '/home/abel/code/outputs/2026-07-29/10-50-45-MERFISH_small_transcripts/checkpoints/epoch=383.ckpt'
+    #- '/home/abel/code/outputs/2026-07-23/14-25-33-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
+    #- '/home/abel/code/outputs/2026-07-23/16-04-16-MERFISH_small_transcripts/checkpoints/epoch=2959.ckpt'
+    #- '/home/abel/code/outputs/2026-07-23/17-30-20-MERFISH_small_transcripts/checkpoints/epoch=2959.ckpt'
     checkpoints_parent_dir: null #'/home/abel/code/outputs/2026-07-20/14-51-45-MERFISH_small_transcripts/checkpoints'
     checkpoints_name_list: 'all'
 
