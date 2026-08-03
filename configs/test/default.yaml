@@ -4,14 +4,14 @@ save_dir: "/home/abel/code/outputs" # only for 'test_only' mode, path to save th
 checkpoint_paths: null
 checkpoints_parent_dir: '/home/abel/code/outputs/2026-07-16/16-22-44-MERFISH_small_transcripts/checkpoints'
 checkpoints_name_list: 'all' # 'all' | ["epoch=14999.ckpt", ...]
-batch_size: 4 # Batch size for testing
+batch_size: 8 # Batch size for testing
 epoch_index: null
 checkpoint_path: null #"/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
 test_save_parent_path: null # only for 'test_only' mode, path to save the test results. 'null' to save to checkpoints_parent_dir.
 
 # Statistical testing pipeline (metrics/testing_pipeline.py)w
 pipeline:
-  num_samples: 8          # denoising runs per cell_section (different seeds)
+  num_samples: 2          # denoising runs per cell_section (different seeds)
   seed_start: 67             # seed for sample i is seed_start + i
   device: cuda                # auto | cpu | cuda
   min_cells_per_class: 10     # skip cell classes with fewer GT cells
@@ -83,3 +83,11 @@ pipeline:
       density_radius_beta: 4.0     # sigmoid sharpness for the density-radius gate
       eps: 1.0e-6
       base_seed: 0                 # +sample_index -> deterministic target subsampling
+  # Grid transcript counts after Procrustes+scale alignment (same as train_mmds)
+  grid_transcript_analysis:
+    grid_sizes: [8, 16, 32]        # n×n lattices; metrics averaged over these
+    margin: 0.05                   # fractional padding of the GT square bbox
+    spearman_tau: 20.0              # soft-rank temperature (same as train soft Spearman)
+    spearman_chunk_size: 4096      # genes×samples soft-rank chunk; raise on large GPUs (~C·G²·4B)
+    procrustes_with_scale: true    # include scale in barycenter Procrustes → GT
+    eps: 1.0e-6

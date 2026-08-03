@@ -4,7 +4,7 @@ general:
     mode : 'train_and_test' # 'train_and_test' # 'test_only' # 
 
 distribute:
-    gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
+    gpus_per_node: 4  # 1 = auto-detect one device (works on CPU-only machines)
 
 dataset:
     dataset_name: 'MERFISH_small_cortex'
@@ -19,14 +19,15 @@ dataset:
         validation: null
 
 train: # !!!!
-    n_epochs: 1200     # tiny number for a smoke-test; increase for real training
+    n_epochs: 5000     # tiny number for a smoke-test; increase for real training
     batch_size: 4     # keep small on CPU
     lr: 5e-4
 
 test:
     save_dir: '/home/abel/code/code_outputs'
     checkpoint_paths: null
-    #-  '/home/abel/code/outputs/2026-07-29/10-50-45-MERFISH_small_transcripts/checkpoints/epoch=383.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-01/13-30-29-MERFISH_small_transcripts/checkpoints/epoch=1823.ckpt'
+    #-  '/home/abel/code/outputs/2026-07-29/18-26-19-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
     #- '/home/abel/code/outputs/2026-07-23/14-25-33-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
     #- '/home/abel/code/outputs/2026-07-23/16-04-16-MERFISH_small_transcripts/checkpoints/epoch=2959.ckpt'
     #- '/home/abel/code/outputs/2026-07-23/17-30-20-MERFISH_small_transcripts/checkpoints/epoch=2959.ckpt'

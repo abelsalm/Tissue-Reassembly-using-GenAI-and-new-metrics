@@ -1,0 +1,24 @@
+{
+  "init": {
+    "total": 0.7885615825653076,
+    "train_combined": 0.7885615825653076,
+    "extra": 0.0,
+    "vanilla": 0.07885615527629852,
+    "transcriptome": -1.0,
+    "ch": -1.0,
+    "pca": -1.0,
+    "directional": -1.0,
+    "mmd": -1.0
+  },
+  "final": {
+    "total": 0.5224134922027588,
+    "train_combined": 0.5224134922027588,
+    "extra": 0.0,
+    "vanilla": 0.05224134773015976,
+    "transcriptome": -1.0,
+    "ch": -1.0,
+    "pca": -1.0,
+    "directional": -1.0,
+    "mmd": -1.0
+  }
+}

@@ -26,6 +26,8 @@ from metrics.gt_cache import cache_key_matches, gt_row_cache_key
 
 COORD_LO, COORD_HI = -0.52, 0.52
 PAIR_DIST_MMD_MAX_SAMPLES = 2000
+# CUDA ``torch.quantile`` rejects inputs above ~2^24 elements; subsample first.
+PAIRWISE_STAT_MAX_SAMPLES = 2_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +49,8 @@ def nn_spacing(G: torch.Tensor) -> torch.Tensor:
 def median_pairwise(G: torch.Tensor) -> torch.Tensor:
     if G.shape[0] < 2:
         return torch.tensor(1e-2, device=G.device)
-    D = pairwise_dist(G, G)
-    iu = torch.triu_indices(D.shape[0], D.shape[1], offset=1)
-    return D[iu[0], iu[1]].median()
+    d = subsample_1d(upper_pairwise_dists(G), PAIRWISE_STAT_MAX_SAMPLES)
+    return d.median() if d.numel() else G.new_tensor(1e-2)
 
 
 def _off_diag_mean(K: torch.Tensor) -> torch.Tensor:
@@ -156,8 +157,10 @@ def class_top_eigvec(cov: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Top (largest-eigenvalue) unit eigenvector and eigenvalue of a batch of
     2x2 symmetric PSD matrices. Sign of the eigenvector is arbitrary (as for
     any eigendecomposition) and must be resolved by the caller."""
-    evals, evecs = torch.linalg.eigh(cov)  # ascending eigenvalues
-    return evecs[..., :, -1], evals[..., -1]
+    # CUDA eigh is not implemented for float16; run in float32 under AMP.
+    out_dtype = cov.dtype
+    evals, evecs = torch.linalg.eigh(cov.float())  # ascending eigenvalues
+    return evecs[..., :, -1].to(out_dtype), evals[..., -1].to(out_dtype)
 
 
 def class_axis_landmarks(
@@ -208,6 +211,7 @@ def procrustes_similarity(
     target: torch.Tensor,
     with_scale: bool = True,
     weights: Optional[torch.Tensor] = None,
+    allow_reflection: bool = False,
 ):
     """Best-fit weighted similarity (R, t, s) aligning ``source`` to ``target``.
 
@@ -222,6 +226,10 @@ def procrustes_similarity(
     point) used for the mean, cross-covariance, and scale terms -- standard
     weighted orthogonal Procrustes. Defaults to uniform weights (equivalent to
     the original unweighted fit).
+
+    When ``allow_reflection`` is False (default), ``det(R)`` is forced to ``+1``
+    (proper rotations only). When True, improper rotations / mirror flips with
+    ``det(R) = -1`` are kept if they reduce the landmark residual.
     """
     X = source.detach().to(torch.float64)
     Y = target.detach().to(torch.float64)
@@ -240,7 +248,7 @@ def procrustes_similarity(
 
     U, _, Vh = torch.linalg.svd(H)
     R = Vh.T @ U.T
-    if torch.det(R) < 0:
+    if (not allow_reflection) and torch.det(R) < 0:
         Vh = Vh.clone()
         Vh[-1] *= -1
         R = Vh.T @ U.T
@@ -286,73 +294,115 @@ def local_cell_metrics_batch(points, sigma, tau_frac, pca_scale_factor, eps=1e-8
     diff = points.unsqueeze(0) - mu.unsqueeze(1)
     cov = torch.einsum("ij,ijc,ijd->icd", w, diff, diff)
 
-    evals, evecs = torch.linalg.eigh(cov)
+    # CUDA eigh is not implemented for float16; run in float32 under AMP.
+    out_dtype = cov.dtype
+    evals, evecs = torch.linalg.eigh(cov.float())
     lam1 = evals[:, 1].clamp_min(eps)
     lam2 = evals[:, 0].clamp_min(eps)
-    ratio = torch.sqrt(lam1 / lam2).clamp(1.0, max_ratio)
-    V = evecs[:, :, [1, 0]]
+    ratio = torch.sqrt(lam1 / lam2).clamp(1.0, max_ratio).to(out_dtype)
+    V = evecs[:, :, [1, 0]].to(out_dtype)
 
-    if degenerate.any():
-        eye = torch.eye(2, device=points.device, dtype=points.dtype).expand(n, 2, 2)
-        V = torch.where(degenerate[:, None, None], eye, V)
-        ratio = torch.where(degenerate, torch.ones_like(ratio), ratio)
+    # Ill-conditioned local covariances can yield non-finite eigendecomps on GPU;
+    # treat those cells as isotropic (same as the empty-neighborhood path).
+    bad = degenerate | (~torch.isfinite(V).all(dim=(-2, -1))) | (~torch.isfinite(ratio))
+    if bad.any():
+        eye = torch.eye(2, device=points.device, dtype=out_dtype).expand(n, 2, 2)
+        V = torch.where(bad[:, None, None], eye, V)
+        ratio = torch.where(bad, torch.ones_like(ratio), ratio)
     return V, ratio
+
+
+def _safe_unit_imq(d2: torch.Tensor) -> torch.Tensor:
+    """IMQ ``1/(1+d²)`` that never feeds NaN/Inf into the reciprocal.
+
+    Non-finite or negative squared distances are mapped into the flat regime
+    (large ``d²`` → ``K≈0``) so ``ReciprocalBackward`` stays finite.
+    """
+    d2 = torch.nan_to_num(d2, nan=1.0e8, posinf=1.0e8, neginf=0.0)
+    d2 = d2.clamp(0.0, 1.0e8)
+    return (1.0 + d2).reciprocal()
+
+
+def _aniso_axis_scales(sigma, stretch: torch.Tensor) -> torch.Tensor:
+    """``σ · [stretch, 1/stretch]`` with finite, strictly positive entries."""
+    stretch = torch.nan_to_num(stretch, nan=1.0, posinf=10.0, neginf=1.0).clamp(1.0, 10.0)
+    if not torch.is_tensor(sigma):
+        sigma_t = torch.full((), float(sigma), dtype=stretch.dtype, device=stretch.device)
+    else:
+        sigma_t = sigma.to(dtype=stretch.dtype, device=stretch.device).reshape(-1)
+    sigma_t = torch.nan_to_num(sigma_t, nan=1e-3, posinf=1.0, neginf=1e-3).clamp_min(1e-6)
+    # sigma is per-band (S,) or scalar; stretch is (n,) or (S, n).
+    while sigma_t.ndim < stretch.ndim:
+        sigma_t = sigma_t.unsqueeze(-1)
+    sigma_t = torch.broadcast_to(sigma_t, stretch.shape)
+    return sigma_t.unsqueeze(-1) * torch.stack([stretch, stretch.reciprocal()], dim=-1)
 
 
 def symmetrized_local_kernel_matrix(points, sigma, tau_frac, stretch_power, pca_scale_factor):
     V, ratio = local_cell_metrics_batch(points, sigma, tau_frac, pca_scale_factor)
     stretch = ratio.pow(stretch_power)
     # Put bandwidth into the metric once: d2 = ||(V^T diff) / (σ · shape)||²,
-    # then IMQ is K = 1/(1+d2). Equivalent to σ²/(σ² + ||diff_aniso||²), but
-    # keeps d2 O(1) for typical neighbors and avoids DivBackward overflow when
-    # predictions are far from GT (raw c2/(c2+d2) with unscaled d2).
-    sigma_t = torch.as_tensor(sigma, dtype=points.dtype, device=points.device).clamp_min(
-        1e-6
-    )
-    sc = sigma_t * torch.stack([stretch, stretch.reciprocal()], dim=-1)
+    # then IMQ is K = 1/(1+d2). Equivalent to σ²/(σ² + ||diff_aniso||²).
+    sc = _aniso_axis_scales(sigma, stretch)
 
     diff = points.unsqueeze(0) - points.unsqueeze(1)
-    proj = torch.einsum("ijc,icd->ijd", diff, V) / sc.unsqueeze(1)
-    d2 = proj.pow(2).sum(-1).clamp_max(1e8)
-    K = 1.0 / (1.0 + d2)
+    proj = torch.einsum("ijc,icd->ijd", diff, V) * sc.unsqueeze(1).reciprocal()
+    d2 = proj.pow(2).sum(-1)
+    K = _safe_unit_imq(d2)
     K = 0.5 * (K + K.T)
     return K, V, stretch
 
 
-def precompute_local_gt_cache(G, sigmas, tau_frac, stretch_power, pca_scale_factor) -> LocalGTCache:
+def precompute_local_gt_cache(
+    G, sigmas, tau_frac, stretch_power, pca_scale_factor
+) -> Optional[LocalGTCache]:
     ky_list, V_list, stretch_list = [], [], []
     with torch.no_grad():
         for s in sigmas:
             Ky, V, stretch = symmetrized_local_kernel_matrix(
                 G, s, tau_frac, stretch_power, pca_scale_factor
             )
+            if (
+                not torch.isfinite(Ky).all()
+                or not torch.isfinite(V).all()
+                or not torch.isfinite(stretch).all()
+            ):
+                return None
             ky_list.append(_off_diag_mean(Ky))
             V_list.append(V)
             stretch_list.append(stretch)
 
+    ky_offdiag = torch.stack(ky_list)
+    if not torch.isfinite(ky_offdiag).all():
+        return None
     return LocalGTCache(
         sigmas=torch.as_tensor(sigmas, dtype=G.dtype, device=G.device),
-        ky_offdiag=torch.stack(ky_list),
+        ky_offdiag=ky_offdiag,
         V=torch.stack(V_list),
         stretch=torch.stack(stretch_list),
     )
 
 
 def cross_kernel_gt_local(X, G, cache: LocalGTCache) -> torch.Tensor:
+    # Soft box on preds keeps projections in a range where IMQ stays well-behaved
+    # without changing the loss for in-domain coordinates.
+    margin = 0.5
+    X = X.clamp(COORD_LO - margin, COORD_HI + margin)
+
     diff = X.unsqueeze(1) - G.unsqueeze(0)
-    proj = torch.einsum("imc,smcd->simd", diff, cache.V)
+    V = cache.V
+    bad_v = ~torch.isfinite(V).all(dim=(-2, -1))
+    if bad_v.any():
+        eye = torch.eye(2, device=X.device, dtype=X.dtype).expand_as(V)
+        V = torch.where(bad_v[..., None, None], eye, torch.nan_to_num(V, nan=0.0))
+
+    proj = torch.einsum("imc,smcd->simd", diff, V)
     # Same metric as the GT self-kernel: σ · [stretch, 1/stretch], K = 1/(1+d2).
-    sig = cache.sigmas.clamp_min(1e-6)[:, None]
-    sc = sig.unsqueeze(-1) * torch.stack(
-        [cache.stretch, cache.stretch.reciprocal()],
-        dim=-1,
-    )
-    proj = proj / sc.unsqueeze(1)
-    d2 = proj.pow(2).sum(-1).clamp_max(1e8)
-    K = 1.0 / (1.0 + d2)
+    sc = _aniso_axis_scales(cache.sigmas, cache.stretch)
+    proj = proj * sc.unsqueeze(1).reciprocal()
+    d2 = proj.pow(2).sum(-1)
+    K = _safe_unit_imq(d2)
     return K.mean(dim=(1, 2))
-
-
 def upper_pairwise_dists(points):
     n = points.shape[0]
     if n < 2:
@@ -371,7 +421,9 @@ def gt_min_dist_threshold(G, quantile):
     d = upper_pairwise_dists(G)
     if d.numel() == 0:
         return G.new_tensor(1e-2)
-    return torch.quantile(d, quantile).detach()
+    # Subsample: CUDA quantile has a hard max input size ("input tensor is too large").
+    d = subsample_1d(d, PAIRWISE_STAT_MAX_SAMPLES)
+    return torch.quantile(d.float(), float(quantile)).to(dtype=G.dtype).detach()
 
 
 def pair_dist_match_loss(X, gt_mean_pd):
@@ -379,7 +431,7 @@ def pair_dist_match_loss(X, gt_mean_pd):
 
 
 def pair_dist_mmd_sigmas(G, band_mults) -> torch.Tensor:
-    d = upper_pairwise_dists(G)
+    d = subsample_1d(upper_pairwise_dists(G), PAIRWISE_STAT_MAX_SAMPLES)
     med = d.median() if d.numel() else G.new_tensor(1e-2)
     mults = torch.as_tensor(band_mults, dtype=G.dtype, device=G.device)
     return (mults * med).detach()
@@ -415,10 +467,8 @@ def _imq_from_sqdist(d2: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:
     c2 = sigmas.pow(2).clamp_min(1e-12)[:, None, None]
     if d2.ndim == 2:
         d2 = d2.unsqueeze(0)
-    # Cap the scaled distance so far-away pairs stay in the flat IMQ regime
-    # without float overflow in the backward of the division.
-    return 1.0 / (1.0 + (d2 / c2).clamp_max(1e8))
-
+    scaled = torch.nan_to_num(d2 / c2, nan=1.0e8, posinf=1.0e8, neginf=0.0)
+    return _safe_unit_imq(scaled)
 
 def mmd2_imq_iso(X, G, sigmas: torch.Tensor, ky_offdiag: torch.Tensor) -> torch.Tensor:
     dxx = pairwise_dist(X, X).pow(2)
@@ -482,16 +532,25 @@ def build_class_gt_cache(
     if G.shape[0] < 2:
         return None
 
-    med = median_pairwise(G).item()
+    med_t = median_pairwise(G)
+    med = float(med_t.item()) if torch.isfinite(med_t) else 1e-2
+    if med <= 0.0:
+        med = 1e-2
     sigmas = [m * med for m in cfg.spatial_band_mults]
     gt_cache = precompute_local_gt_cache(
         G, sigmas, cfg.sigmoid_tau_frac, cfg.local_aniso_stretch_power, cfg.pca_scale_factor
     )
-    md_thresh = (
-        gt_min_dist_threshold(G, cfg.min_dist_quantile)
-        if cfg.min_dist_thresh is None
-        else G.new_tensor(float(cfg.min_dist_thresh)).detach()
-    )
+    if gt_cache is None:
+        return None
+    # Skip unused expensive pairwise stats when the corresponding weights are 0.
+    if cfg.min_dist_weight:
+        md_thresh = (
+            gt_min_dist_threshold(G, cfg.min_dist_quantile)
+            if cfg.min_dist_thresh is None
+            else G.new_tensor(float(cfg.min_dist_thresh)).detach()
+        )
+    else:
+        md_thresh = G.new_tensor(0.0)
     support_margin = (cfg.support_margin_mult * nn_spacing(G)).detach()
     if cfg.pair_dist_mmd_weight:
         dist_sigmas = pair_dist_mmd_sigmas(G, cfg.pair_dist_mmd_band_mults)
@@ -502,10 +561,15 @@ def build_class_gt_cache(
         dist_sigmas = None
         pdm_gt_samples = pdm_gt_self = None
 
+    if cfg.pair_dist_weight:
+        gt_mean_pd = mean_pairwise_dist(G).detach()
+    else:
+        gt_mean_pd = G.new_tensor(0.0)
+
     return ClassMMGTCache(
         G=G,
         gt_cache=gt_cache,
-        gt_mean_pd=mean_pairwise_dist(G).detach(),
+        gt_mean_pd=gt_mean_pd,
         md_thresh=md_thresh,
         support_margin=support_margin,
         dist_sigmas=dist_sigmas,
@@ -574,6 +638,9 @@ class MMDConfig:
     # Procrustes pre-alignment (rotation / translation / scale invariance):
     procrustes_align: bool = True
     procrustes_with_scale: bool = True
+    # If True, keep improper rotations (det R = -1 / mirror flips) when they
+    # better match landmarks; the model then need not learn chirality.
+    procrustes_allow_reflection: bool = True
     # Optional per-class shape/orientation term added to the Procrustes fit
     # (matches per-class covariance "ellipses" via their matrix square roots,
     # which is sign-ambiguity-free unlike raw eigenvector matching). Helps
@@ -628,6 +695,7 @@ def _mmd_config_from_cfg(cfg) -> MMDConfig:
         whole_slice_MMD_band_mults=tup("whole_slice_MMD_band_mults", (1.0, 2.0, 4.0, 8.0)),
         procrustes_align=bool(g("procrustes_align", True)),
         procrustes_with_scale=bool(g("procrustes_with_scale", True)),
+        procrustes_allow_reflection=bool(g("procrustes_allow_reflection", True)),
         procrustes_axis_align=bool(g("procrustes_axis_align", False)),
         procrustes_axis_weight=float(g("procrustes_axis_weight", 1.0)),
         procrustes_axis_min_cells=int(g("procrustes_axis_min_cells", 5)),
@@ -849,7 +917,10 @@ class SlideMMDLoss(nn.Module):
                 axis_gate = axis_gate & (gt_aniso >= self.cfg.procrustes_axis_min_anisotropy)
                 if bool(axis_gate.any()):
                     P_cov = class_covariances(pred_xy, labels, mask_b, classes_t)
-                    R0, _, _ = procrustes_similarity(P_bc, G_bc, with_scale=False)
+                    R0, _, _ = procrustes_similarity(
+                        P_bc, G_bc, with_scale=False,
+                        allow_reflection=self.cfg.procrustes_allow_reflection,
+                    )
                     G_axis_dir, _ = class_top_eigvec(G_cov)
                     # Reference direction for the pred-side axis, expressed in
                     # the pred frame (inverse of R0 applied to the GT axis),
@@ -875,7 +946,9 @@ class SlideMMDLoss(nn.Module):
                     ])
 
         R, t, s = procrustes_similarity(
-            P_all, G_all, with_scale=self.cfg.procrustes_with_scale, weights=weights,
+            P_all, G_all, with_scale=self.cfg.procrustes_with_scale,
+            weights=weights,
+            allow_reflection=self.cfg.procrustes_allow_reflection,
         )
         return apply_similarity(pred_xy, R, t, s)
 

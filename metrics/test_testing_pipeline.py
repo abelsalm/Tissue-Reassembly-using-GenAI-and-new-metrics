@@ -55,6 +55,26 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    are vectorised on GPU (batched SVD + a broadcast ``(S, S, N)`` distance
    tensor).
 
+5. Computes **grid transcript-count metrics** after similarity Procrustes
+   alignment (rotation + translation + scale) of each predicted sample onto
+   the GT — the same barycenter-based fit used in ``metrics/train_mmds.py``.
+   All ``S`` samples are Procrustes-aligned in one batched SVD, bin counts
+   use a single GPU ``scatter_add`` per grid size, and soft Spearman is
+   evaluated on the full ``(S, F, n_squares)`` tensor (chunked over genes).
+   The aligned cloud and the GT are each binned into square grids
+   (``8×8``, ``16×16``, … from config). For every grid cell the per-gene
+   transcript counts are the sum of ``node_features`` over cells that fall
+   in that square. Two scalars are reported per sample (then averaged over
+   samples / sections / grid sizes):
+
+   * ``grid_transcript_diff`` — mean absolute difference (MAE) of gene
+     counts across grid squares and genes.
+   * ``grid_transcript_soft_spearman`` — soft Spearman correlation of the
+     per-square count vectors between pred and GT, computed **per gene**
+     (spatial pattern match), then averaged over genes. Soft ranks reuse
+     ``soft_spearman_distance`` from ``train_spatial_transcriptomics``
+     (reported here as the correlation ``1 - distance``).
+
 Usage
 -----
     python metrics/test_testing_pipeline.py \\
@@ -109,7 +129,10 @@ from metrics.test_ch_and_voronoi import (  # noqa: E402
 )
 from metrics.test_vanilla_loss import LossFunction as PositionMSELoss  # noqa: E402
 from metrics.train_directional_metric import DirectionalMetricLoss  # noqa: E402
-from metrics.train_spatial_transcriptomics import MultiRadiusNeighborhoodLoss  # noqa: E402
+from metrics.train_spatial_transcriptomics import (  # noqa: E402
+    MultiRadiusNeighborhoodLoss,
+    soft_spearman_distance,
+)
 from metrics.train_mmds import (  # noqa: E402
     PAIR_DIST_MMD_MAX_SAMPLES,
     mmd2_imq_iso,
@@ -1384,6 +1407,447 @@ def plot_scalar_losses_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Grid transcript-count metrics (Procrustes+scale → spatial bins → gene counts)
+# Fully batched on GPU over denoising samples (and genes for soft Spearman).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _class_barycenters_batched(
+    positions: torch.Tensor,
+    labels: torch.Tensor,
+    classes: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample per-class means.
+
+    ``positions``: ``(S, N, 2)`` or ``(N, 2)``; ``labels``: ``(N,)``;
+    ``classes``: ``(C,)``. Returns ``(S, C, 2)`` (``S=1`` if positions is 2-D).
+    """
+    if positions.ndim == 2:
+        positions = positions.unsqueeze(0)
+    s, n, d = positions.shape
+    c = int(classes.shape[0])
+    # one-hot (N, C) → broadcast over samples
+    one_hot = (labels.unsqueeze(1) == classes.unsqueeze(0)).to(positions.dtype)  # (N, C)
+    counts = one_hot.sum(dim=0).clamp_min(1.0)  # (C,)
+    # (S, N, 2) x (N, C) → (S, C, 2)
+    sums = torch.einsum("snd,nc->scd", positions, one_hot)
+    return sums / counts.view(1, c, 1)
+
+
+def _procrustes_similarity_batched(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    with_scale: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched uniform-weight Procrustes (same math as ``procrustes_similarity``).
+
+    ``source``: ``(S, M, 2)``, ``target``: ``(M, 2)`` or ``(S, M, 2)``.
+    Returns ``R (S, 2, 2)``, ``t (S, 2)``, ``s (S,)`` in ``source`` dtype.
+    """
+    X = source.detach().to(torch.float64)
+    Y = target.detach().to(torch.float64)
+    if Y.ndim == 2:
+        Y = Y.unsqueeze(0).expand(X.shape[0], -1, -1)
+
+    mu_x = X.mean(dim=1, keepdim=True)  # (S, 1, 2)
+    mu_y = Y.mean(dim=1, keepdim=True)
+    Xc, Yc = X - mu_x, Y - mu_y
+
+    # H = Xc^T @ Yc  → (S, 2, 2)
+    H = torch.matmul(Xc.transpose(1, 2), Yc)
+    U, _, Vh = torch.linalg.svd(H)
+    R = torch.matmul(Vh.transpose(1, 2), U.transpose(1, 2))
+    # Reflection fix per sample
+    det = torch.det(R)
+    flip = det < 0
+    if bool(flip.any()):
+        Vh = Vh.clone()
+        Vh[flip, -1, :] *= -1
+        R = torch.matmul(Vh.transpose(1, 2), U.transpose(1, 2))
+
+    if with_scale:
+        num = (Yc * torch.matmul(Xc, R.transpose(1, 2))).sum(dim=(1, 2))
+        den = Xc.pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
+        s = num / den
+    else:
+        s = torch.ones(X.shape[0], dtype=torch.float64, device=X.device)
+
+    t = mu_y.squeeze(1) - s.unsqueeze(-1) * torch.matmul(
+        R, mu_x.squeeze(1).unsqueeze(-1)
+    ).squeeze(-1)
+
+    out_dtype = source.dtype if source.is_floating_point() else torch.float32
+    return R.to(dtype=out_dtype), t.to(dtype=out_dtype), s.to(dtype=out_dtype)
+
+
+def align_samples_to_gt_procrustes_torch(
+    samples: torch.Tensor,
+    gt: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    with_scale: bool = True,
+) -> torch.Tensor:
+    """Batched similarity-align every sample onto GT (``train_mmds`` style).
+
+    ``samples``: ``(S, N, 2)``, ``gt``: ``(N, 2)``, ``labels``: ``(N,)``.
+    Fits one Procrustes ``(R, t, s)`` per sample on per-class barycenters and
+    applies it with a single batched matmul. Returns ``(S, N, 2)``.
+    """
+    samples = samples.to(dtype=torch.float32)
+    gt = gt.to(dtype=torch.float32)
+    labels = labels.to(dtype=torch.long)
+    if samples.ndim != 3 or samples.shape[-1] != 2:
+        raise ValueError(f"samples must be (S, N, 2); got {tuple(samples.shape)}")
+    if gt.shape != samples.shape[1:]:
+        raise ValueError(
+            f"gt shape {tuple(gt.shape)} must match samples[1:] {tuple(samples.shape[1:])}"
+        )
+
+    classes = torch.unique(labels)
+    # Drop empty (shouldn't happen); need >= 2 classes for a rotation.
+    usable = []
+    for cval in classes:
+        if int((labels == cval).sum().item()) >= 1:
+            usable.append(int(cval.item()))
+    if len(usable) < 2:
+        return samples
+
+    classes_t = torch.tensor(usable, device=samples.device, dtype=labels.dtype)
+    P_bc = _class_barycenters_batched(samples, labels, classes_t)  # (S, C, 2)
+    G_bc = _class_barycenters_batched(gt, labels, classes_t).squeeze(0)  # (C, 2)
+    R, t, s = _procrustes_similarity_batched(P_bc, G_bc, with_scale=with_scale)
+    # aligned = s * (pts @ R.T) + t   → (S, N, 2)
+    return s.view(-1, 1, 1) * torch.matmul(samples, R.transpose(1, 2)) + t.unsqueeze(1)
+
+
+def align_pred_to_gt_procrustes(
+    pred_xy: np.ndarray,
+    gt_xy: np.ndarray,
+    cell_class_int: np.ndarray,
+    *,
+    with_scale: bool = True,
+    device: Any | None = None,
+) -> np.ndarray:
+    """Single-sample wrapper around :func:`align_samples_to_gt_procrustes_torch`."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    samples = torch.as_tensor(
+        np.asarray(pred_xy, dtype=np.float32), device=device
+    ).unsqueeze(0)
+    gt = torch.as_tensor(np.asarray(gt_xy, dtype=np.float32), device=device)
+    labels = torch.as_tensor(np.asarray(cell_class_int), dtype=torch.long, device=device)
+    aligned = align_samples_to_gt_procrustes_torch(
+        samples, gt, labels, with_scale=with_scale
+    )
+    return aligned[0].detach().cpu().numpy().astype(np.float32)
+
+
+def _gt_square_bbox_torch(
+    gt_xy: torch.Tensor,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Square bbox around GT with fractional ``margin``; returns scalars on device."""
+    x0y0 = gt_xy.amin(dim=0)
+    x1y1 = gt_xy.amax(dim=0)
+    span = (x1y1 - x0y0).clamp_min(1e-8)
+    side = span.amax()
+    center = 0.5 * (x0y0 + x1y1)
+    half = 0.5 * side * (1.0 + 2.0 * float(margin))
+    lo = center - half
+    hi = center + half
+    return lo[0], hi[0], lo[1], hi[1]
+
+
+def _grid_bin_indices_torch(
+    xy: torch.Tensor,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    y0: torch.Tensor,
+    y1: torch.Tensor,
+    grid_size: int,
+) -> torch.Tensor:
+    """Map coords to flat grid indices.
+
+    ``xy``: ``(N, 2)`` or ``(S, N, 2)`` → same leading shape ``(...,)`` of
+    long indices in ``[0, grid_size²)``.
+    """
+    n = int(grid_size)
+    span_x = (x1 - x0).clamp_min(1e-8)
+    span_y = (y1 - y0).clamp_min(1e-8)
+    ix = torch.floor((xy[..., 0] - x0) / span_x * n).long().clamp(0, n - 1)
+    iy = torch.floor((xy[..., 1] - y0) / span_y * n).long().clamp(0, n - 1)
+    return iy * n + ix
+
+
+def _transcript_counts_on_grid_torch(
+    xy: torch.Tensor,
+    features: torch.Tensor,
+    *,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    y0: torch.Tensor,
+    y1: torch.Tensor,
+    grid_size: int,
+) -> torch.Tensor:
+    """Batched scatter-sum of gene features into grid squares.
+
+    ``xy``: ``(S, N, 2)`` or ``(N, 2)``; ``features``: ``(N, F)``.
+    Returns ``(S, grid_size², F)`` (``S=1`` if ``xy`` is 2-D).
+    """
+    if xy.ndim == 2:
+        xy = xy.unsqueeze(0)
+    s, n_cells, _ = xy.shape
+    n_genes = int(features.shape[-1])
+    n_bins = int(grid_size) ** 2
+    bins = _grid_bin_indices_torch(xy, x0, x1, y0, y1, grid_size)  # (S, N)
+
+    # scatter_add over the bin axis: expand features to (S, N, F)
+    feat = features.unsqueeze(0).expand(s, -1, -1).contiguous()
+    index = bins.unsqueeze(-1).expand(-1, -1, n_genes)
+    counts = xy.new_zeros(s, n_bins, n_genes)
+    return counts.scatter_add(1, index, feat)
+
+
+def _grid_transcript_metrics_batched(
+    pred_counts: torch.Tensor,
+    gt_counts: torch.Tensor,
+    *,
+    spearman_tau: float,
+    spearman_chunk_size: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MAE and mean soft-Spearman per sample, fully batched on device.
+
+    ``pred_counts``: ``(S, n_squares, F)``, ``gt_counts``: ``(n_squares, F)``
+    or ``(S, n_squares, F)``. Soft Spearman ranks along the square axis for
+    each gene, then averages over genes → ``(S,)`` correlation.
+    """
+    if gt_counts.ndim == 2:
+        gt_counts = gt_counts.unsqueeze(0).expand_as(pred_counts)
+
+    # MAE over squares × genes, per sample
+    mae = (pred_counts - gt_counts).abs().mean(dim=(1, 2))  # (S,)
+
+    # (S, n_squares, F) → (S, F, n_squares) for per-gene spatial Spearman
+    pred_g = pred_counts.transpose(1, 2)
+    gt_g = gt_counts.transpose(1, 2)
+    if pred_g.shape[-1] < 2:
+        return mae, torch.full_like(mae, float("nan"))
+
+    dist = soft_spearman_distance(
+        pred_g,
+        gt_g,
+        float(spearman_tau),
+        eps=float(eps),
+        chunk_size=int(spearman_chunk_size),
+    )  # (S, F)
+    corr = (1.0 - dist).nanmean(dim=-1)  # (S,)
+    return mae, corr
+
+
+def compute_section_grid_transcript_metrics(
+    preds: np.ndarray,
+    batch: "SliceBatch",
+    grid_cfg: Any,
+    device: Any,
+) -> pd.DataFrame:
+    """Per-sample grid transcript MAE + soft Spearman after Procrustes+scale.
+
+    Fully vectorised on ``device``:
+      * one batched Procrustes+scale for all ``S`` samples,
+      * one ``scatter_add`` binning pass per grid size for all samples,
+      * one soft-Spearman pass over ``(S, F, n_squares)`` (chunked over genes).
+
+    Returns one row per sample with ``grid_transcript_diff`` /
+    ``grid_transcript_soft_spearman`` (averaged over configured grid sizes)
+    plus per-resolution columns ``grid_transcript_diff_{n}`` /
+    ``grid_transcript_soft_spearman_{n}``.
+    """
+    grid_sizes = [int(g) for g in grid_cfg.grid_sizes]
+    margin = float(getattr(grid_cfg, "margin", 0.05))
+    spearman_tau = float(getattr(grid_cfg, "spearman_tau", 4.0))
+    spearman_chunk_size = int(getattr(grid_cfg, "spearman_chunk_size", 512))
+    with_scale = bool(getattr(grid_cfg, "procrustes_with_scale", True))
+    eps = float(getattr(grid_cfg, "eps", 1e-6))
+
+    samples = torch.as_tensor(
+        np.asarray(preds, dtype=np.float32), dtype=torch.float32, device=device
+    )
+    gt = torch.as_tensor(
+        np.asarray(batch.gt_positions, dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+    labels = torch.as_tensor(
+        np.asarray(batch.cell_class_int), dtype=torch.long, device=device
+    )
+    features = torch.as_tensor(
+        np.asarray(batch.holder.node_features, dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+    if features.ndim == 3 and features.shape[0] == 1:
+        features = features[0]
+    if features.ndim != 2:
+        raise ValueError(f"node_features must be (N, F); got {tuple(features.shape)}")
+
+    s = int(samples.shape[0])
+    x0, x1, y0, y1 = _gt_square_bbox_torch(gt, margin)
+
+    with torch.no_grad():
+        aligned = align_samples_to_gt_procrustes_torch(
+            samples, gt, labels, with_scale=with_scale
+        )  # (S, N, 2)
+
+        per_size_mae: dict[int, torch.Tensor] = {}
+        per_size_corr: dict[int, torch.Tensor] = {}
+        for n in grid_sizes:
+            gt_counts = _transcript_counts_on_grid_torch(
+                gt, features, x0=x0, x1=x1, y0=y0, y1=y1, grid_size=n
+            )[0]  # (n_bins, F)
+            pred_counts = _transcript_counts_on_grid_torch(
+                aligned, features, x0=x0, x1=x1, y0=y0, y1=y1, grid_size=n
+            )  # (S, n_bins, F)
+            mae_s, corr_s = _grid_transcript_metrics_batched(
+                pred_counts,
+                gt_counts,
+                spearman_tau=spearman_tau,
+                spearman_chunk_size=spearman_chunk_size,
+                eps=eps,
+            )
+            per_size_mae[n] = mae_s
+            per_size_corr[n] = corr_s
+
+        # Stack resolutions → (S, R) then mean over R
+        mae_stack = torch.stack([per_size_mae[n] for n in grid_sizes], dim=1)
+        corr_stack = torch.stack([per_size_corr[n] for n in grid_sizes], dim=1)
+        mae_mean = mae_stack.nanmean(dim=1)
+        corr_mean = corr_stack.nanmean(dim=1)
+
+        mae_np = {n: per_size_mae[n].detach().cpu().numpy() for n in grid_sizes}
+        corr_np = {n: per_size_corr[n].detach().cpu().numpy() for n in grid_sizes}
+        mae_mean_np = mae_mean.detach().cpu().numpy()
+        corr_mean_np = corr_mean.detach().cpu().numpy()
+
+    rows: list[dict[str, Any]] = []
+    for i in range(s):
+        row: dict[str, Any] = {
+            "sample_index": i,
+            "grid_transcript_diff": float(mae_mean_np[i]),
+            "grid_transcript_soft_spearman": float(corr_mean_np[i]),
+        }
+        for n in grid_sizes:
+            row[f"grid_transcript_diff_{n}"] = float(mae_np[n][i])
+            row[f"grid_transcript_soft_spearman_{n}"] = float(corr_np[n][i])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def aggregate_grid_transcript_across_sections(
+    section_tables: list[pd.DataFrame],
+) -> pd.DataFrame:
+    """Average per-sample grid transcript metrics across sections."""
+    if not section_tables:
+        return pd.DataFrame()
+    combined = pd.concat(section_tables, ignore_index=True)
+    if combined.empty:
+        return pd.DataFrame()
+
+    metric_cols = [
+        c for c in combined.columns
+        if c.startswith("grid_transcript_")
+    ]
+    if not metric_cols:
+        return pd.DataFrame()
+
+    grouped = (
+        combined.groupby("cell_section", as_index=False)[metric_cols]
+        .agg(["mean", "std"])
+        .reset_index()
+    )
+    grouped.columns = [
+        "_".join(col).strip("_") if isinstance(col, tuple) else col
+        for col in grouped.columns
+    ]
+    if "index" in grouped.columns:
+        grouped = grouped.drop(columns=["index"])
+
+    overall = {"cell_section": "ALL"}
+    for col in metric_cols:
+        overall[f"{col}_mean"] = float(combined[col].mean())
+        overall[f"{col}_std"] = float(combined[col].std(ddof=0))
+    out = pd.concat([grouped, pd.DataFrame([overall])], ignore_index=True)
+    for col in metric_cols:
+        std_col = f"{col}_std"
+        if std_col in out.columns:
+            out[std_col] = out[std_col].fillna(0.0)
+    return out
+
+
+def plot_grid_transcript_summary(
+    summary_df: pd.DataFrame,
+    save_path: Path,
+) -> None:
+    """Single subplot: count MAE and soft Spearman side-by-side (twin y-axes)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if summary_df.empty:
+        print("[testing_pipeline] No grid-transcript data to plot.")
+        return
+
+    save_path = Path(save_path)
+    plot_df = summary_df.copy()
+    labels = plot_df["cell_section"].tolist()
+    x = np.arange(len(labels))
+    w = 0.36
+
+    diff_means = plot_df["grid_transcript_diff_mean"].to_numpy(dtype=float)
+    diff_stds = plot_df["grid_transcript_diff_std"].to_numpy(dtype=float)
+    corr_means = plot_df["grid_transcript_soft_spearman_mean"].to_numpy(dtype=float)
+    corr_stds = plot_df["grid_transcript_soft_spearman_std"].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.95 * len(labels)), 5.2))
+    ax_r = ax.twinx()
+
+    bars_mae = ax.bar(
+        x - w / 2, diff_means, w, yerr=diff_stds, capsize=3,
+        color="tab:brown", alpha=0.85, label="Count MAE",
+    )
+    bars_spr = ax_r.bar(
+        x + w / 2, corr_means, w, yerr=corr_stds, capsize=3,
+        color="tab:olive", alpha=0.85, label="Soft Spearman",
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right")
+    ax.set_ylabel("Mean |Δ transcript counts| (MAE)", color="tab:brown")
+    ax_r.set_ylabel("Soft Spearman correlation", color="tab:olive")
+    ax.tick_params(axis="y", labelcolor="tab:brown")
+    ax_r.tick_params(axis="y", labelcolor="tab:olive")
+    ax.set_title(
+        "Spatial transcript grid metrics (after Procrustes+scale to GT)\n"
+        "MAE + soft Spearman averaged over squares, genes, grid sizes"
+    )
+    ax.legend(
+        [bars_mae, bars_spr],
+        ["Count MAE", "Soft Spearman"],
+        loc="best",
+        fontsize=8,
+        framealpha=0.85,
+    )
+
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+    print(f"[testing_pipeline] Saved grid-transcript summary plot → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-checkpoint orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1399,6 +1863,7 @@ def run_checkpoint_pipeline(
     mmd_cfg = pipe_cfg.mmd_analysis
     ch_voronoi_cfg = pipe_cfg.ch_voronoi_analysis
     scalar_cfg = pipe_cfg.scalar_losses_analysis
+    grid_tx_cfg = pipe_cfg.grid_transcript_analysis
     num_samples = int(pipe_cfg.num_samples)
     seed_start = int(pipe_cfg.seed_start)
     min_cells = int(pipe_cfg.min_cells_per_class)
@@ -1429,6 +1894,10 @@ def run_checkpoint_pipeline(
     print(f"[testing_pipeline] position_mse: {compute_position_mse}")
     print(f"[testing_pipeline] directional : {compute_directional}")
     print(f"[testing_pipeline] multi_radius: always on")
+    print(
+        f"[testing_pipeline] grid_tx   : sizes={list(grid_tx_cfg.grid_sizes)} "
+        f"procrustes_scale={bool(grid_tx_cfg.procrustes_with_scale)}"
+    )
     print("=" * 78)
 
     load_model_config_from_checkpoint(cfg, checkpoint_path)
@@ -1457,12 +1926,16 @@ def run_checkpoint_pipeline(
     except Exception:
         pass
 
-    print("[testing_pipeline] Phase 2/2: analysis (MMD + CH/Voronoi + spread)…")
+    print(
+        "[testing_pipeline] Phase 2/2: analysis "
+        "(MMD + CH/Voronoi + spread + grid transcripts)…"
+    )
     section_mmd_tables: list[pd.DataFrame] = []
     section_ch_voronoi_tables: list[pd.DataFrame] = []
     section_spread_rows: list[dict] = []
     section_spread_per_cell_tables: list[pd.DataFrame] = []
     section_scalar_losses_tables: list[pd.DataFrame] = []
+    section_grid_tx_tables: list[pd.DataFrame] = []
 
     for cell_section in tqdm(
         cell_sections, desc="Analysis", unit="section",
@@ -1560,6 +2033,19 @@ def run_checkpoint_pipeline(
             )
             section_scalar_losses_tables.append(section_scalar)
 
+        section_grid_tx = compute_section_grid_transcript_metrics(
+            preds=preds,
+            batch=batch,
+            grid_cfg=grid_tx_cfg,
+            device=device,
+        )
+        if not section_grid_tx.empty:
+            section_grid_tx.insert(0, "cell_section", str(cell_section))
+            section_grid_tx.to_csv(
+                section_dir / "grid_transcript_per_sample.csv", index=False
+            )
+            section_grid_tx_tables.append(section_grid_tx)
+
     mmd_summary = aggregate_mmd_across_sections(section_mmd_tables)
     mmd_csv = output_dir / "mmd_summary.csv"
     mmd_plot = output_dir / "mmd_summary.png"
@@ -1638,6 +2124,27 @@ def run_checkpoint_pipeline(
     else:
         print("[testing_pipeline] No scalar-loss summaries produced.")
 
+    grid_tx_summary = aggregate_grid_transcript_across_sections(section_grid_tx_tables)
+    grid_tx_csv = output_dir / "grid_transcript_summary.csv"
+    grid_tx_plot = output_dir / "grid_transcript_summary.png"
+    if not grid_tx_summary.empty:
+        grid_tx_summary.to_csv(grid_tx_csv, index=False)
+        plot_grid_transcript_summary(grid_tx_summary, grid_tx_plot)
+        all_row = grid_tx_summary[grid_tx_summary["cell_section"] == "ALL"]
+        if not all_row.empty:
+            print(
+                f"[testing_pipeline] grid_transcript_diff "
+                f"(avg over samples & sections): "
+                f"{float(all_row['grid_transcript_diff_mean'].iloc[0]):.6g}"
+            )
+            print(
+                f"[testing_pipeline] grid_transcript_soft_spearman "
+                f"(avg over samples & sections): "
+                f"{float(all_row['grid_transcript_soft_spearman_mean'].iloc[0]):.6g}"
+            )
+    else:
+        print("[testing_pipeline] No grid-transcript summaries produced.")
+
     print(f"[testing_pipeline] Finished checkpoint {checkpoint_path.name}.")
     return output_dir
 
@@ -1693,6 +2200,7 @@ def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | Non
         "ch_voronoi": output_dir / "ch_voronoi_summary.csv",
         "spread": output_dir / "cross_sample_spread_summary.csv",
         "scalar_losses": output_dir / "scalar_losses_summary.csv",
+        "grid_transcript": output_dir / "grid_transcript_summary.csv",
     }
     return {
         key: (pd.read_csv(path) if path.exists() else None)
@@ -1722,6 +2230,7 @@ def _collect_checkpoint_comparison(
       * ``mmd_pair_dist_global`` / ``mmd_pair_dist_per_class``
       * ``mmd_spatial_global`` / ``mmd_spatial_per_class``
       * ``cross_sample_spread``
+      * ``grid_transcript_diff`` / ``grid_transcript_soft_spearman``
     """
     order = []
     if include_position_mse:
@@ -1739,6 +2248,8 @@ def _collect_checkpoint_comparison(
         "mmd_spatial_global",
         "mmd_spatial_per_class",
         "cross_sample_spread",
+        "grid_transcript_diff",
+        "grid_transcript_soft_spearman",
     ])
 
     allowed_scalar = {"transcriptome_multi_radius"}
@@ -1803,6 +2314,23 @@ def _collect_checkpoint_comparison(
                 rows.append({"checkpoint": label, "metric": metric_name,
                              "value": float(sub["mean"].mean())})
 
+        gt_tx = loaded.get("grid_transcript")
+        if gt_tx is not None and not gt_tx.empty:
+            if "cell_section" in gt_tx.columns:
+                all_rows = gt_tx[gt_tx["cell_section"] == "ALL"]
+            else:
+                all_rows = gt_tx
+            if all_rows.empty:
+                all_rows = gt_tx
+            for metric in ("grid_transcript_diff", "grid_transcript_soft_spearman"):
+                col = f"{metric}_mean"
+                if col in all_rows.columns:
+                    rows.append({
+                        "checkpoint": label,
+                        "metric": metric,
+                        "value": float(all_rows[col].mean()),
+                    })
+
     df = pd.DataFrame.from_records(rows, columns=["checkpoint", "metric", "value"])
     if df.empty:
         return df
@@ -1831,13 +2359,16 @@ def _save_combined_comparison_csv(
 
     df = comparison.copy()
     df["normalized_score"] = np.nan
+    # Soft Spearman correlation is higher-is-better; everything else is lower-is-better.
+    higher_is_better = {"grid_transcript_soft_spearman"}
     for metric, sub in df.groupby("metric"):
         vals = sub["value"].to_numpy(dtype=float)
         lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
         denom = hi - lo
-        # All benchmarked metrics are "lower is better": invert so 1 = best (min).
         if not np.isfinite(denom) or denom <= 0:
             df.loc[sub.index, "normalized_score"] = 1.0
+        elif str(metric) in higher_is_better:
+            df.loc[sub.index, "normalized_score"] = (vals - lo) / denom
         else:
             df.loc[sub.index, "normalized_score"] = (hi - vals) / denom
     df.to_csv(save_path, index=False)
@@ -1875,6 +2406,10 @@ def _comparison_panels(
             ["ch_energy_curve_loss", "voronoi_phase_pair_ch_energy_loss"],
         ),
         ("Cross-sample spread", ["cross_sample_spread"]),
+        (
+            "Grid transcript",
+            ["grid_transcript_diff", "grid_transcript_soft_spearman"],
+        ),
     ])
     return panels
 
@@ -1888,6 +2423,8 @@ _COMPARISON_METRIC_LABELS: dict[str, str] = {
     "mmd_spatial_per_class": "per-class ICP",
     "ch_energy_curve_loss": "CH energy",
     "voronoi_phase_pair_ch_energy_loss": "Voronoi phase",
+    "grid_transcript_diff": "count MAE",
+    "grid_transcript_soft_spearman": "soft Spearman",
 }
 
 
@@ -1902,7 +2439,7 @@ def plot_checkpoint_comparison(
 
     Subplot count follows the enabled scalar flags: position MSE and/or both
     directional metrics, always-on transcriptome multi-radius, then three MMD
-    panels, Cahn-Hilliard, and cross-sample spread.
+    panels, Cahn-Hilliard, cross-sample spread, and grid transcript metrics.
     """
     import matplotlib
 

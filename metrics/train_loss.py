@@ -15,6 +15,7 @@ from metrics.train_ch_overall import SlideCHLoss
 from metrics.train_pca_overall import SlidePCALoss
 from metrics.train_directional_metric import DirectionalMetricLoss
 from metrics.train_mmds import SlideMMDLoss
+from metrics.train_mmds_hybrid import SlideMMDLossHybrid
 from metrics.test_vanilla_loss import LossFunction as VanillaPositionMSELoss
 
 
@@ -198,7 +199,18 @@ class CombinedTrainLoss(nn.Module):
         # ------------------------------------------------------------------ #
         self.mmd_weight = float(_get("mmd_weight", default=0.0))
         if self.mmd_weight != 0.0:
-            self.mmd: Optional[SlideMMDLoss] = SlideMMDLoss(cfg)
+            mmd_implementation = str(
+                _get("mmd_implementation", default="baseline")
+            ).lower()
+            if mmd_implementation == "baseline":
+                self.mmd: Optional[SlideMMDLoss] = SlideMMDLoss(cfg)
+            elif mmd_implementation == "hybrid":
+                self.mmd = SlideMMDLossHybrid(cfg)
+            else:
+                raise ValueError(
+                    "mmd_implementation must be 'baseline' or 'hybrid', "
+                    f"got {mmd_implementation!r}"
+                )
         else:
             self.mmd = None
 
@@ -228,6 +240,8 @@ class CombinedTrainLoss(nn.Module):
         self._current_epoch = int(epoch)
         if self.neighborhood is not None and hasattr(self.neighborhood, "set_current_epoch"):
             self.neighborhood.set_current_epoch(epoch)
+        if self.mmd is not None and hasattr(self.mmd, "set_current_epoch"):
+            self.mmd.set_current_epoch(epoch)
 
     # ------------------------------------------------------------------ #
     # Forward

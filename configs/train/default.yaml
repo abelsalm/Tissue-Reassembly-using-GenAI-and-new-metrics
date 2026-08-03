@@ -1,23 +1,23 @@
-n_epochs: 1000 # Number of epochs
+n_epochs: 800 # Number of epochs
 batch_size: 2 # Batch size for training
 lr: 5e-5 # Learning rate (also default peak LR when lr_cosine_max is null).
-lr_warmup_epochs: 200 # 100 # near LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
+lr_warmup_epochs: 100 # 100 # near LR warmup over n epochs: lr starts at lr/n and reaches lr at epoch n (0 = disabled).
 # --- Cosine annealing with warm restarts (optional) -------------------------
-lr_cosine_warm_restarts: True # If True, use CosineAnnealingWarmRestarts (after warmup when lr_warmup_epochs > 0).
-lr_cosine_log_scale: True # If True, interpolate log(lr) between max and min (geometric cosine); requires lr_cosine_min > 0.
+lr_cosine_warm_restarts: False # If True, use CosineAnnealingWarmRestarts (after warmup when lr_warmup_epochs > 0).
+lr_cosine_log_scale: False # If True, interpolate log(lr) between max and min (geometric cosine); requires lr_cosine_min > 0.
 lr_cosine_max: null # Peak LR eta_max per cycle; null = use ``lr``.
-lr_cosine_min: 1.0e-4 # Floor LR eta_min at the bottom of each cosine cycle.
-lr_cosine_period_epochs: 600 #irst cosine cycle length T_0 (epochs).
-lr_cosine_subsequent_cycle_mult: 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
+lr_cosine_min: null #1.0e-4 # Floor LR eta_min at the bottom of each cosine cycle.
+lr_cosine_period_epochs: null # 1000 #irst cosine cycle length T_0 (epochs).
+lr_cosine_subsequent_cycle_mult: null # 1 # T_mult: multiply each cycle length after a restart (e.g. 2 → 50, 100, 200, …).
 # After this many cosine epochs (post-warmup), freeze LR at lr_cosine_min for the rest of training.
 # 0 = disabled (cosine / warm-restarts continue for all remaining epochs).
-lr_cosine_constant_at_min_after_epochs: 600
+lr_cosine_constant_at_min_after_epochs: null #1200
 fast_dev_run: False # If True, runs 1 batch of train, test and val to find any bugs
-weight_decay: 2.0e-5
+weight_decay: 1.0e-4
 gradient_clip_val: 10.0 # Clip the global gradient L2 norm before each optimizer step (<= 0 disables clipping).
 gradient_clip_algorithm: norm # PyTorch Lightning clipping algorithm: "norm" or "value".
-detect_anomaly_from_epoch: 300 # Enable autograd anomaly detection from this 0-based epoch onward; -1 disables it.
-rechunk_every_n_epochs: 0 # Re-randomise chunk boundaries every N epochs (0 = disabled)
+detect_anomaly_from_epoch: -1 # Enable autograd anomaly detection from this 0-based epoch onward; -1 disables it.
+rechunk_every_n_epochs: 1 # Re-randomise chunk boundaries every N epochs (0 = disabled)
 # --- Global smooth position warp (training augmentation) ------------
 position_warp_augment: True # If True, apply one smooth warp field per epoch to all train cells.
 position_warp_max_displacement: 0.05 # Max |displacement| in normalised coord units.
@@ -67,10 +67,10 @@ directional_weight: 0 # Transcriptome-weighted local orientation coherence loss.
 multi_radius_radii: [0.02, 0.04, 0.08, 0.16] # Outer radii of annuli (sorted internally); e.g. [0.04, 0.16] -> disk r<=0.04 and ring (0.04, 0.16].
 multi_radius_avg_transcriptome_weight: 0 # Weight of pred-vs-GT neighborhood-averaged transcriptome RMSE (0 = disabled).
 multi_radius_density_weight: 0.0 # Relative weight of the log-density term vs. the transcriptome-RMSE term.
-multi_radius_global_transcriptome_weight: 0.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
+multi_radius_global_transcriptome_weight: 1.0 # Weight of pred-vs-GT neighborhood-sum RMSE (0 = disabled).
 multi_radius_avg_spearman_weight: 0.0 # Weight of soft-Spearman on neighborhood-averaged profiles (0 = disabled).
-multi_radius_global_spearman_weight: 1.0 # Weight of soft-Spearman on neighborhood sums (0 = disabled); set >0 and zero RMSE weights to replace RMSE.
-multi_radius_spearman_tau: 1 # Soft-rank temperature; smaller → closer to hard ranks (sharper, weaker grads).
+multi_radius_global_spearman_weight: 0 # Weight of soft-Spearman on neighborhood sums (0 = disabled); set >0 and zero RMSE weights to replace RMSE.
+multi_radius_spearman_tau: 4 # Soft-rank temperature; smaller → closer to hard ranks (sharper, weaker grads).
 multi_radius_spearman_chunk_size: 512 # Rows (cells×shells flattened) per soft-rank chunk; lower = less peak GPU memory.
 multi_radius_transcriptome_tolerance: [0.02, 0.04, 0.06, 0.08] # Per-shell GT band half-width per gene (same length/order as multi_radius_radii; scalar = same for all shells).
 multi_radius_transcriptome_tolerance_soft_beta: 64.0 # Sigmoid sharpness for the per-gene tolerance gate; null = hard cutoff at band edge.
@@ -123,26 +123,44 @@ directional_density_radius_beta: 32.0 # Sigmoid sharpness for the density-radius
 # frames + isotropic pred), plus optional auxiliary terms. The inner Adam
 # coordinate optimizer of the script is replaced by DDPM training, so the
 # mmd_steps / mmd_lr* / mmd_max_grad keys are unused here (kept for parity).
+mmd_implementation: hybrid # "baseline" preserves train_mmds.py; "hybrid" selects the independently benchmarkable ragged implementation.
+mmd_hybrid_exact_cutoff: 1024 # Keeps common MERFISH classes exact; sampled local MMD is reserved for unusually large classes.
+mmd_hybrid_exact_buckets: [64, 96, 128, 192, 256, 384, 512, 768, 1024] # Tight capacities limit quadratic padding waste.
+mmd_hybrid_tile_size: 128 # Pair rows reduced at once by the exact path (lower = less memory).
+mmd_hybrid_bucket_max_classes: 16 # Maximum class clouds processed together in one exact/sampled launch.
+mmd_hybrid_compile: False # Optional torch.compile on exact buckets; keep False — K/N shapes vary and static compile can CUDA-assert after recompile_limit.
+mmd_hybrid_local_pairs: 32768 # Minimum total sampled local interactions per large class.
+mmd_hybrid_local_pairs_per_cell: 64 # Stratification: every predicted cell receives at least this many XX and XG interactions.
+mmd_hybrid_local_pairs_max: 524288 # Upper bound on sampled local interactions per class.
+mmd_hybrid_gt_kernel_pairs: 131072 # GT-GT local-kernel pairs used for stable large-class cache constants.
+mmd_hybrid_whole_slice_pairs: 131072 # Sampled pairs for each whole-slide isotropic MMD mean.
+mmd_hybrid_pair_dist_pairs: 8192 # Kernel pairs for linear-time pair-distance-distribution MMD.
+mmd_hybrid_pair_dist_samples: 2000 # Direct cell-pair distances retained per class, without constructing n².
+mmd_hybrid_statistic_pairs: 65536 # Direct pairs for medians / optional mean-distance statistics.
+mmd_hybrid_support_queries: 256 # Large-class pred queries; each retains an exact nearest GT search.
+mmd_hybrid_cache_gt: False # Chunks are normally visited once per epoch after rechunk+warp, so persistent keys cost more than they save.
+mmd_hybrid_seed: 17 # Base seed mixed with epoch/step/slide/class for sampled terms.
 mmd_min_cells: 10 # Skip cell classes with fewer GT cells.
 mmd_cache_gt: True # Cache per-(slide,class) GT kernel constants; cleared each epoch.
 mmd_average_over_cell_types: True # True = mean eligible cell-type losses per slide; False = sum them.
 procrustes_align: True # Fit one Procrustes similarity per slide on per-class barycenters and apply it to all pred cells before the MMD (rotation/translation/scale invariance).
 procrustes_with_scale: False # Include the Procrustes scale term (full similarity); False = rotation + translation only (s=1).
+procrustes_allow_reflection: True # Allow mirror flips (det R = -1) in the Procrustes fit; chirality is arbitrary so the model need not learn it.
 procrustes_axis_align: True # Also fit Procrustes using per-class PCA1 landmarks: n≈sqrt(n_cells) points evenly spaced on [bc - L·PCA1, bc + L·PCA1] (plus barycenters); stabilizes rotation when centroid geometry alone is weak.
 procrustes_axis_weight: 1.0 # Weight of each axis landmark relative to a (unit-weight) barycenter landmark in the weighted Procrustes fit, when procrustes_axis_align is True.
 procrustes_axis_min_cells: 64 # Skip a class's axis landmarks if it has fewer than this many GT cells (its covariance would be too noisy to trust).
 procrustes_axis_min_anisotropy: 0.4 # Skip a class's axis landmarks if its GT anisotropy (0=isotropic, 1=perfectly aligned) is below this (a near-round GT shape carries no reliable orientation signal).
 procrustes_axis_length_mult: 1.0 # Half-length of the PCA1 segment = this multiplier * sqrt(class's own principal-axis variance).
 sigmoid_tau_frac: 0.24 # Sigmoid softness (fraction of sigma) for the local PCA neighborhood.
-pca_scale_factor: 16.0 # Divisor applied to sigma before the local PCA neighborhood weighting.
+pca_scale_factor: 8.0 # Divisor applied to sigma before the local PCA neighborhood weighting.
 pair_dist_weight: 0.0 # Weight of the mean-pairwise-distance matching term inside the MMD loss.
 min_dist_weight: 0 # Weight of the min-distance repulsion term (prevents cell collapse).
 min_dist_thresh: null # Absolute min-distance threshold; null = use min_dist_quantile of GT.
 min_dist_quantile: 0.1 # Quantile of GT pairwise distances used as the min-distance threshold.
 pair_dist_mmd_weight: 16.0 # Weight of the pairwise-distance-distribution IMQ-MMD term.
-pair_dist_mmd_band_mults: [0.08, 0.16, 0.64] # 1.28] # Band multipliers (x median GT pairwise distance) for the pair-distance MMD.
-local_aniso_stretch_power: 0.4 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
+pair_dist_mmd_band_mults: [0.08, 0.16, 0.32] # 1.28] # Band multipliers (x median GT pairwise distance) for the pair-distance MMD.
+local_aniso_stretch_power: 0.5 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
 spatial_band_mults: [0.08, 0.16, 0.64] # Band multipliers (x median GT pairwise distance) for the spatial IMQ-MMD.
-whole_slice_MMD_weight: 16.0 # Weight of the whole-slice isotropic MMD coherence term (0 = disabled).
-whole_slice_MMD_band_mults: [0.08, 0.32] # Band multipliers for the whole-slice isotropic MMD.
+whole_slice_MMD_weight: 128.0 # Weight of the whole-slice isotropic MMD coherence term (0 = disabled).
+whole_slice_MMD_band_mults: [0.08, 0.16] # Band multipliers for the whole-slice isotropic MMD.
 support_margin_mult: 3.0 # Support margin in units of GT nearest-neighbor spacing.

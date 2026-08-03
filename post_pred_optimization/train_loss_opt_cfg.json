@@ -1,0 +1,21 @@
+{
+  "csv_dir": "gt_pred_new",
+  "output_dir": "post_pred_optimization/outputs_train_loss",
+  "slice": "mouse2_slice129_0",
+  "train_config": "configs/train/default.yaml",
+  "experiment_config": "configs/experiment/MERFISH_small_transcripts.yaml",
+  "current_epoch": 0,
+  "optimizer": "adam",
+  "lr": 0.001,
+  "steps": 100,
+  "adam_betas": [0.9, 0.999],
+  "mh_n_points_min": 1,
+  "mh_n_points_max": 16,
+  "mh_move_sigma": 0.01,
+  "anchor_weight": 0.0,
+  "box_penalty_weight": 1.0,
+  "device": "cuda",
+  "seed": 0,
+  "log_every": 10,
+  "dpi": 200
+}
