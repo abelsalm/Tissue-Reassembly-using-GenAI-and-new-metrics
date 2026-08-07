@@ -7,7 +7,7 @@
   "current_epoch": 0,
   "optimizer": "adam",
   "lr": 0.001,
-  "steps": 100,
+  "steps": 120,
   "adam_betas": [0.9, 0.999],
   "mh_n_points_min": 1,
   "mh_n_points_max": 16,

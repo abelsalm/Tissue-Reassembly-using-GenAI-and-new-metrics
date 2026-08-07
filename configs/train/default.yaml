@@ -152,14 +152,14 @@ procrustes_axis_min_cells: 64 # Skip a class's axis landmarks if it has fewer th
 procrustes_axis_min_anisotropy: 0.4 # Skip a class's axis landmarks if its GT anisotropy (0=isotropic, 1=perfectly aligned) is below this (a near-round GT shape carries no reliable orientation signal).
 procrustes_axis_length_mult: 1.0 # Half-length of the PCA1 segment = this multiplier * sqrt(class's own principal-axis variance).
 sigmoid_tau_frac: 0.24 # Sigmoid softness (fraction of sigma) for the local PCA neighborhood.
-pca_scale_factor: 8.0 # Divisor applied to sigma before the local PCA neighborhood weighting.
+pca_scale_factor: 1.0 # Divisor applied to sigma before the local PCA neighborhood weighting.
 pair_dist_weight: 0.0 # Weight of the mean-pairwise-distance matching term inside the MMD loss.
 min_dist_weight: 0 # Weight of the min-distance repulsion term (prevents cell collapse).
 min_dist_thresh: null # Absolute min-distance threshold; null = use min_dist_quantile of GT.
 min_dist_quantile: 0.1 # Quantile of GT pairwise distances used as the min-distance threshold.
 pair_dist_mmd_weight: 16.0 # Weight of the pairwise-distance-distribution IMQ-MMD term.
 pair_dist_mmd_band_mults: [0.08, 0.16, 0.32] # 1.28] # Band multipliers (x median GT pairwise distance) for the pair-distance MMD.
-local_aniso_stretch_power: 0.5 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
+local_aniso_stretch_power: 0.6 # Power applied to the local anisotropy ratio to build per-axis kernel scales.
 spatial_band_mults: [0.08, 0.16, 0.64] # Band multipliers (x median GT pairwise distance) for the spatial IMQ-MMD.
 whole_slice_MMD_weight: 128.0 # Weight of the whole-slice isotropic MMD coherence term (0 = disabled).
 whole_slice_MMD_band_mults: [0.08, 0.16] # Band multipliers for the whole-slice isotropic MMD.

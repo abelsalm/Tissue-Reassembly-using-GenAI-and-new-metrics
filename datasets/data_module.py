@@ -104,7 +104,13 @@ class Dataset(InMemoryDataset):
         cell_class, cell_class_decoder = character_to_int(
             list(cell_class.values), unique_class
         )
-        return positions, node_features, torch.tensor(cell_class), cell_class_decoder
+        # Integer class indices 0 … C-1 (not one-hot); CE expects long targets.
+        return (
+            positions,
+            node_features,
+            torch.tensor(cell_class, dtype=torch.long),
+            cell_class_decoder,
+        )
 
     def _clean_data(self, positions, node_features, cell_class, nan_rows):
         clean_positions = positions[~nan_rows]

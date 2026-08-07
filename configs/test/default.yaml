@@ -2,8 +2,12 @@ save_dir: "/home/abel/code/outputs" # only for 'test_only' mode, path to save th
 
 # Optional: list of full .ckpt paths. Leave null to use checkpoints_parent_dir instead.
 checkpoint_paths: null
-checkpoints_parent_dir: '/home/abel/code/outputs/2026-07-16/16-22-44-MERFISH_small_transcripts/checkpoints'
+checkpoints_parent_dir: '/home/abel/code/outputs/2026-07-16/16-22-44-MERFISH_small_transcripts/checkpoints_total'
 checkpoints_name_list: 'all' # 'all' | ["epoch=14999.ckpt", ...]
+# Pretty names for the final comparison violin plot / CSV (same order as the
+# resolved checkpoint list). null → auto short labels from run folder + epoch.
+# Example: ["MMD-only", "MMD+tx", "vanilla", "epoch-1967", "last"]
+checkpoint_display_names: null
 batch_size: 8 # Batch size for testing
 epoch_index: null
 checkpoint_path: null #"/data-master/code/outputs/2026-06-03/23-30-17-MERFISH_small_transcripts/checkpoints/epoch=14999.ckpt" # only for 'test_only' mode, path to the checkpoint to test.
@@ -11,10 +15,32 @@ test_save_parent_path: null # only for 'test_only' mode, path to save the test r
 
 # Statistical testing pipeline (metrics/testing_pipeline.py)w
 pipeline:
-  num_samples: 2          # denoising runs per cell_section (different seeds)
-  seed_start: 67             # seed for sample i is seed_start + i
-  device: cuda                # auto | cpu | cuda
+  num_samples: 16         # denoising runs per cell_section (different seeds)
+  seed_start: 0             # seed for sample i is seed_start + i
+  device: cuda                # auto | cpu | cuda (analysis); inference uses distribute.gpus_per_node
   min_cells_per_class: 10     # skip cell classes with fewer GT cells
+  # After all checkpoints: pick the best seed per model×slice via a weighted
+  # sum of per-sample losses, then save one PNG per slice (GT once + each
+  # model's best pred) under ``testing_pipeline/best_predictions/``.
+  # Higher-is-better metrics (e.g. Spearman) are auto-negated so a positive
+  # weight always means "prefer better values". Set a weight to 0 to ignore.
+  best_prediction_plots:
+    enabled: true
+    cell_sections:                 # typically two slices to showcase
+      - mouse2_slice300
+      - mouse2_slice129
+    loss_weights:
+      position_mse: 0
+      transcriptome_multi_radius: 0
+      mmd_whole_slice: 200.0
+      mmd_pair_dist: 0.0
+      mmd_spatial: 100.0
+      ch_energy_curve_loss: 1.0
+      voronoi_phase_pair_ch_energy_loss: 1.0
+      grid_transcript_diff: 4.0e-2
+      grid_transcript_soft_spearman: 0.0
+      directional_length: 0.0
+      directional_pairwise: 0.0
   spatial_analysis:
     gaussian_sigma: 0.02
     grid_resolution: 256
@@ -23,18 +49,35 @@ pipeline:
     epsilon: 1.0e-12
     overlay_gt_scatter_size: 6.0   # GT dot size on section density grid plots
     section_density_plot_cols: 8    # max columns in the per-section multi-class figure
-  mmd_analysis:                     # isotropic IMQ-MMD (replaces Wasserstein)
+  # Shared Procrustes for every GT-frame metric (same as train MMD loss).
+  # Fit one (R, t, s) on per-class barycenters + PCA1 axis landmarks, apply to
+  # all pred cells. Used by MMD, CH/Voronoi, scalar losses, grid transcript,
+  # and cross-sample spread.
+  procrustes:
+    align: true
+    with_scale: false              # train: procrustes_with_scale
+    allow_reflection: true         # train: procrustes_allow_reflection
+    axis_align: true               # train: procrustes_axis_align (PCA1 landmarks)
+    axis_weight: 1.0               # train: procrustes_axis_weight
+    axis_min_cells: 64             # train: procrustes_axis_min_cells
+    axis_min_anisotropy: 0.4       # train: procrustes_axis_min_anisotropy
+    axis_length_mult: 1.0          # train: procrustes_axis_length_mult
+  mmd_analysis:                     # isotropic IMQ-MMD after shared whole-slice Procrustes
     whole_slice_band_mults: [0.12, 0.25]          # × median pairwise
-    spatial_band_mults: [0.04, 0.16, 0.64, 1.28, 2.56, 5.12]        # × median pairwise (per class)
-    pair_dist_band_mults: [1.0, 2.0, 4.0]           # × median pair-distance
+    spatial_band_mults: [0.08, 0.16, 0.64]        # × median pairwise (per class, then mean)
+    pair_dist_band_mults: [0.08, 0.16, 0.64]      # × median pair-distance (per class, then mean)
     pair_dist_max_samples: 2000      # subsample cap for pair-distance MMD
-  # Multi-radius neighborhood transcriptome loss (always on; mirrors configs/train)
+  # Multi-radius neighborhood transcriptome loss (always on; owned by test cfg)
   multi_radius_analysis:
     radii: [0.02, 0.04, 0.08, 0.16]
     avg_transcriptome_weight: 0
     density_weight: 0.0
     global_transcriptome_weight: 1.0
-    transcriptome_tolerance: [0.02, 0.04, 0.04, 0.02]
+    avg_spearman_weight: 0.0
+    global_spearman_weight: 0
+    spearman_tau: 4
+    spearman_chunk_size: 512
+    transcriptome_tolerance: [0, 0, 0, 0]
     transcriptome_tolerance_soft_beta: 64.0
     transcriptome_tolerance_warmup_epochs: 0
     loss_radius_scale: 512
@@ -83,11 +126,11 @@ pipeline:
       density_radius_beta: 4.0     # sigmoid sharpness for the density-radius gate
       eps: 1.0e-6
       base_seed: 0                 # +sample_index -> deterministic target subsampling
-  # Grid transcript counts after Procrustes+scale alignment (same as train_mmds)
+  # Soft circular spots at grid intersections (preds already Procrustes-aligned)
   grid_transcript_analysis:
-    grid_sizes: [8, 16, 32]        # n×n lattices; metrics averaged over these
+    grid_sizes: [8, 16, 32]        # n×n square tilings → (n+1)² intersections each
     margin: 0.05                   # fractional padding of the GT square bbox
-    spearman_tau: 20.0              # soft-rank temperature (same as train soft Spearman)
-    spearman_chunk_size: 4096      # genes×samples soft-rank chunk; raise on large GPUs (~C·G²·4B)
-    procrustes_with_scale: true    # include scale in barycenter Procrustes → GT
+    soft_beta: 64.0               # sigmoid sharpness: w = σ(β · (½·spacing − dist))
+    spearman_tau: 20.0             # soft-rank temperature for per-gene spatial Spearman
+    spearman_chunk_size: 4096      # genes×samples soft-rank chunk; raise on large GPUs
     eps: 1.0e-6

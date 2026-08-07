@@ -1,24 +1,24 @@
 {
   "init": {
-    "total": 0.7885615825653076,
-    "train_combined": 0.7885615825653076,
+    "total": 2.5439188480377197,
+    "train_combined": 2.5439188480377197,
     "extra": 0.0,
-    "vanilla": 0.07885615527629852,
-    "transcriptome": -1.0,
+    "vanilla": -1.0,
+    "transcriptome": 2.412320137023926,
     "ch": -1.0,
     "pca": -1.0,
     "directional": -1.0,
-    "mmd": -1.0
+    "mmd": 0.0020562305580824614
   },
   "final": {
-    "total": 0.5224134922027588,
-    "train_combined": 0.5224134922027588,
+    "total": 1.6519031524658203,
+    "train_combined": 1.6519031524658203,
     "extra": 0.0,
-    "vanilla": 0.05224134773015976,
-    "transcriptome": -1.0,
+    "vanilla": -1.0,
+    "transcriptome": 1.66217041015625,
     "ch": -1.0,
     "pca": -1.0,
     "directional": -1.0,
-    "mmd": -1.0
+    "mmd": -0.00016042543575167656
   }
 }

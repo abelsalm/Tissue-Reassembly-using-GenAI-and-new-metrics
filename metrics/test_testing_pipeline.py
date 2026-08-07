@@ -7,14 +7,12 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    sections are inferred in batches of ``test.batch_size`` graphs; analysis
    runs only after every seed/section pair has been collected.
 2. Computes **isotropic IMQ-MMD distances** (from ``metrics/train_mmds.py``,
-   no anisotropy) between predicted and GT point clouds, under two ICP
-   registrations:
-
-   * **global ICP** — align the full predicted cloud to the GT slice once.
-   * **per-class ICP** — independently ICP-align each cell-type cloud to its
-     GT class cloud (then stitch class clouds for the whole-slice term).
-
-   For each registration we report three scalars (averaged over denoising
+   no anisotropy) between predicted and GT point clouds after the **same
+   Procrustes similarity** used by the training MMD loss
+   (``test.pipeline.procrustes``): one global ``(R, t, s)`` fit on per-class
+   barycenters **plus** PCA1 axis landmarks
+   (``n ≈ √n_cells`` points on ``[bc ± L·PCA1]``), then applied to every
+   predicted cell. Three scalars are reported (averaged over denoising
    samples, then over sections):
 
    * ``mmd_whole_slice`` — isotropic IMQ-MMD on the full point cloud
@@ -25,6 +23,9 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    * ``mmd_spatial`` — isotropic IMQ-MMD on per-class spatial point clouds
      (bandwidths = median pairwise × ``spatial_band_mults``), averaged
      over cell types.
+
+   All three use the **same whole-slice Procrustes** (no per-class ICP /
+   per-class registration onto GT).
 
 3. Computes **Cahn-Hilliard energy comparison metrics** (see
    ``metrics/test_ch_and_voronoi.py``) per denoising sample, then averages
@@ -47,33 +48,39 @@ For each checkpoint listed in ``configs/test/default.yaml`` the pipeline:
    Both are averaged over the denoising samples of a section, then averaged
    across sections in the final summary.
 
-4. Computes a **cross-sample positional spread** (no GT comparison): for
-   each cell, the average pairwise Euclidean distance between that cell's
-   positions across the denoising samples (after rotation-only Procrustes
-   alignment of every sample onto a reference sample), averaged over cells
-   and then over sections. The alignment and pairwise-distance computation
-   are vectorised on GPU (batched SVD + a broadcast ``(S, S, N)`` distance
-   tensor).
+4. Computes a **cross-sample positional spread** on the same shared
+   train-MMD Procrustes-aligned predictions used by the other GT metrics:
+   for each cell, the average pairwise Euclidean distance between that
+   cell's positions across the denoising samples, then averaged over cells
+   and sections. The pairwise-distance computation is vectorised on GPU
+   (broadcast ``(S, S, N)`` distance tensor).
 
-5. Computes **grid transcript-count metrics** after similarity Procrustes
-   alignment (rotation + translation + scale) of each predicted sample onto
-   the GT — the same barycenter-based fit used in ``metrics/train_mmds.py``.
-   All ``S`` samples are Procrustes-aligned in one batched SVD, bin counts
-   use a single GPU ``scatter_add`` per grid size, and soft Spearman is
-   evaluated on the full ``(S, F, n_squares)`` tensor (chunked over genes).
-   The aligned cloud and the GT are each binned into square grids
-   (``8×8``, ``16×16``, … from config). For every grid cell the per-gene
-   transcript counts are the sum of ``node_features`` over cells that fall
-   in that square. Two scalars are reported per sample (then averaged over
-   samples / sections / grid sizes):
+5. Computes **soft grid-intersection transcript metrics** on the same
+   train-MMD Procrustes-aligned predictions used for MMD / CH / scalar
+   losses. For each configured lattice size ``n`` (``8``, ``16``, …) an
+   ``n×n`` square tiling of the GT bbox defines ``(n+1)²`` grid-line
+   **intersections**. At each intersection a soft circular spatial weight
+   is built with the same sigmoid membership used by the multi-radius
+   transcriptome loss:
 
-   * ``grid_transcript_diff`` — mean absolute difference (MAE) of gene
-     counts across grid squares and genes.
+       ``w_j = sigmoid(soft_beta · (½·spacing − ‖x_j − c‖))``
+
+   where ``spacing`` is the grid step (side / ``n``), the soft radius is
+   half that spacing, and ``c`` is the intersection. Per intersection the
+   **weighted sum** of cell
+   transcriptomes is compared between Procrustes-aligned pred positions
+   and GT positions (features are shared). Soft Spearman is evaluated on
+   the full ``(S, F, n_intersections)`` tensor (chunked over genes).
+   Two scalars are reported per sample (then averaged over samples /
+   sections / grid sizes):
+
+   * ``grid_transcript_diff`` — mean absolute difference (MAE) of the
+     soft weighted transcriptome sums across intersections and genes.
    * ``grid_transcript_soft_spearman`` — soft Spearman correlation of the
-     per-square count vectors between pred and GT, computed **per gene**
-     (spatial pattern match), then averaged over genes. Soft ranks reuse
-     ``soft_spearman_distance`` from ``train_spatial_transcriptomics``
-     (reported here as the correlation ``1 - distance``).
+     per-intersection weighted-sum vectors between pred and GT, computed
+     **per gene** (spatial pattern match), then averaged over genes.
+     Soft ranks reuse ``soft_spearman_distance`` from
+     ``train_spatial_transcriptomics`` (reported as ``1 - distance``).
 
 Usage
 -----
@@ -96,8 +103,9 @@ from __future__ import annotations
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import hydra
 import numpy as np
@@ -115,7 +123,6 @@ from utils.testing.diffusion2spatial_probs import (  # noqa: E402
     REPO_ROOT as _DIFFUSION_REPO_ROOT,
     SliceBatch,
     _resolve_device,
-    _set_seed,
     build_section_batch,
     load_model,
     save_predictions_csv,
@@ -135,11 +142,18 @@ from metrics.train_spatial_transcriptomics import (  # noqa: E402
 )
 from metrics.train_mmds import (  # noqa: E402
     PAIR_DIST_MMD_MAX_SAMPLES,
+    apply_similarity,
+    class_anisotropy,
+    class_axis_landmarks,
+    class_barycenters,
+    class_covariances,
+    class_top_eigvec,
     mmd2_imq_iso,
     pair_dist_mmd_loss,
     pair_dist_mmd_sigmas,
     precompute_pair_dist_mmd_gt,
     precompute_whole_slice_mmd_cache,
+    procrustes_similarity,
 )
 from utils.data.dataholder import DataHolder  # noqa: E402
 
@@ -313,20 +327,58 @@ def split_batched_positions(
     return section_preds
 
 
+def resolve_inference_devices(cfg: DictConfig, pipe_device: str) -> list[Any]:
+    """Devices used for Phase-1 sampling (analysis stays on the first one).
+
+    Uses ``distribute.gpus_per_node`` (same as train) capped by visible CUDA
+    devices when ``pipeline.device`` is CUDA. CPU / single-GPU configs return
+    one device.
+    """
+    resolved = _resolve_device(str(pipe_device))
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return [resolved]
+
+    requested = 1
+    distribute = getattr(cfg, "distribute", None)
+    if distribute is not None:
+        requested = max(1, int(getattr(distribute, "gpus_per_node", 1)))
+    n_gpus = min(requested, int(torch.cuda.device_count()))
+    return [torch.device(f"cuda:{i}") for i in range(n_gpus)]
+
+
+def _set_sampling_seed(seed: int, device: Any) -> None:
+    """Seed Python / NumPy / Torch RNGs for one sampling draw.
+
+    Uses per-device ``cuda.manual_seed`` (not ``manual_seed_all``) so concurrent
+    multi-GPU inference threads do not overwrite each other's CUDA RNG state.
+    """
+    import random
+
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+        with torch.cuda.device(device):
+            torch.cuda.manual_seed(int(seed))
+
+
 def run_all_sampling(
     model: Any,
     section_batches: dict[str, SliceBatch],
     cell_sections: list[str],
-    num_samples: int,
-    seed_start: int,
     batch_size: int,
     device: Any,
+    seeds: Sequence[int],
+    progress_desc: str = "Seeds",
+    progress_position: int = 0,
+    show_progress: bool = True,
 ) -> dict[str, np.ndarray]:
     """Sample every section for each seed, batching sections within a seed.
 
     Returns
     -------
-    dict mapping ``cell_section`` -> ``(num_samples, N, 2)`` predicted positions.
+    dict mapping ``cell_section`` -> ``(len(seeds), N, 2)`` predicted positions,
+    stacked in the same order as ``seeds``.
     """
     section_pred_lists: dict[str, list[np.ndarray]] = {
         cell_section: [] for cell_section in cell_sections
@@ -336,15 +388,19 @@ def run_all_sampling(
         for chunk_start in range(0, len(cell_sections), batch_size)
     ]
 
-    seeds = range(seed_start, seed_start + num_samples)
     for seed in tqdm(
-        seeds, desc="Seeds", unit="seed",
-        disable=False, mininterval=0.5,
+        seeds,
+        desc=progress_desc,
+        unit="seed",
+        position=progress_position,
+        leave=True,
+        disable=not show_progress,
+        mininterval=0.5,
     ):
         for chunk in section_chunks:
             slice_batch_list = [section_batches[cell_section] for cell_section in chunk]
             holder = build_batched_holder(slice_batch_list, device)
-            _set_seed(seed)
+            _set_sampling_seed(int(seed), device)
             positions = sample_from_single_graph(model, test=True, batch=holder)
             split_preds = split_batched_positions(
                 positions, holder.node_mask, slice_batch_list
@@ -356,6 +412,122 @@ def run_all_sampling(
     for cell_section, pred_list in section_pred_lists.items():
         stacked_preds[cell_section] = np.stack(pred_list, axis=0)
     return stacked_preds
+
+
+def _merge_seed_sharded_preds(
+    cell_sections: list[str],
+    all_seeds: Sequence[int],
+    shards: list[tuple[Sequence[int], dict[str, np.ndarray]]],
+) -> dict[str, np.ndarray]:
+    """Reassemble per-GPU seed shards into global ``(num_samples, N, 2)`` stacks."""
+    seed_to_local: dict[int, tuple[int, int]] = {}
+    for shard_idx, (shard_seeds, _) in enumerate(shards):
+        for local_idx, seed in enumerate(shard_seeds):
+            seed_to_local[int(seed)] = (shard_idx, local_idx)
+
+    merged: dict[str, np.ndarray] = {}
+    for cell_section in cell_sections:
+        rows = []
+        for seed in all_seeds:
+            shard_idx, local_idx = seed_to_local[int(seed)]
+            rows.append(shards[shard_idx][1][cell_section][local_idx])
+        merged[cell_section] = np.stack(rows, axis=0)
+    return merged
+
+
+def run_sampling_phase(
+    cfg: DictConfig,
+    checkpoint_path: Path,
+    dataset_infos: Any,
+    section_batches: dict[str, SliceBatch],
+    cell_sections: list[str],
+    num_samples: int,
+    seed_start: int,
+    batch_size: int,
+    devices: Sequence[Any],
+) -> dict[str, np.ndarray]:
+    """Phase-1 inference: shard seeds across GPUs when more than one is available.
+
+    Each device loads its own model copy, runs a disjoint seed subset, then
+    results are merged in seed order. Analysis remains single-device afterward.
+    """
+    all_seeds = list(range(seed_start, seed_start + num_samples))
+    device_list = list(devices)
+    if not device_list:
+        raise ValueError("No inference devices resolved.")
+
+    if len(device_list) == 1 or num_samples <= 1:
+        device = device_list[0]
+        print(f"[testing_pipeline] Sampling on single device: {device}")
+        model = load_model(cfg, dataset_infos, str(checkpoint_path), device)
+        try:
+            return run_all_sampling(
+                model=model,
+                section_batches=section_batches,
+                cell_sections=cell_sections,
+                batch_size=batch_size,
+                device=device,
+                seeds=all_seeds,
+            )
+        finally:
+            del model
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    n_workers = min(len(device_list), num_samples)
+    device_list = device_list[:n_workers]
+    shards = [all_seeds[i::n_workers] for i in range(n_workers)]
+    print(
+        f"[testing_pipeline] Sampling on {n_workers} GPUs "
+        f"(seed-sharded; devices={[str(d) for d in device_list]})"
+    )
+
+    def _worker(worker_idx: int) -> tuple[Sequence[int], dict[str, np.ndarray]]:
+        device = device_list[worker_idx]
+        seeds = shards[worker_idx]
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        model = load_model(cfg, dataset_infos, str(checkpoint_path), device)
+        try:
+            preds = run_all_sampling(
+                model=model,
+                section_batches=section_batches,
+                cell_sections=cell_sections,
+                batch_size=batch_size,
+                device=device,
+                seeds=seeds,
+                progress_desc=f"Seeds[{device}]",
+                progress_position=worker_idx,
+                show_progress=True,
+            )
+            return seeds, preds
+        finally:
+            del model
+            try:
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    shard_results: list[tuple[Sequence[int], dict[str, np.ndarray]] | None] = [
+        None
+    ] * n_workers
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {
+            pool.submit(_worker, worker_idx): worker_idx
+            for worker_idx in range(n_workers)
+        }
+        for fut in as_completed(futures):
+            worker_idx = futures[fut]
+            shard_results[worker_idx] = fut.result()
+
+    assert all(r is not None for r in shard_results)
+    return _merge_seed_sharded_preds(
+        cell_sections, all_seeds, shard_results  # type: ignore[arg-type]
+    )
 
 
 def predictions_to_gt_dataframe(batch: SliceBatch) -> pd.DataFrame:
@@ -565,27 +737,21 @@ def align_samples_to_reference_torch(
 
 def compute_cross_sample_position_spread(
     preds: np.ndarray,
-    gt_positions: np.ndarray,
     device: Any | None = None,
 ) -> tuple[float, np.ndarray]:
     """Mean pairwise position difference across samples, per cell.
 
-    For each cell, computes the average Euclidean distance between that
-    cell's positions across the different denoising samples (after rotation-
-    only Procrustes alignment of **every sample directly onto the GT
-    slice**), then averages over cells. No comparison to ground truth is
-    involved in the distance itself — the GT is only used as the alignment
-    reference frame, which is more robust than aligning onto one of the
-    (noisy) denoising samples.
+    ``preds`` must already be aligned with the shared train-MMD Procrustes
+    (barycenters + PCA1 landmarks → GT), same registration as MMD / CH /
+    grid transcript / scalar losses. For each cell, averages Euclidean
+    distance between that cell's positions across denoising samples, then
+    averages over cells.
 
-    Fully broadcast on GPU: the per-cell pairwise distance matrix is built
-    as ``||(aligned[i] - aligned[j])||`` over the ``S`` samples for every
-    cell at once (shape ``(S, S, N)``); the SVD-based alignment is batched.
+    Fully broadcast on GPU: ``||aligned[i] - aligned[j]||`` over the ``S``
+    samples for every cell at once (shape ``(S, S, N)``).
 
     Args:
-        preds: ``(S, N, 2)`` predicted positions for one section.
-        gt_positions: ``(N, 2)`` ground-truth positions used as the common
-            alignment reference frame.
+        preds: ``(S, N, 2)`` Procrustes-aligned predicted positions.
         device: torch device; defaults to CUDA if available else CPU.
 
     Returns:
@@ -595,30 +761,16 @@ def compute_cross_sample_position_spread(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     samples = torch.as_tensor(np.asarray(preds), dtype=torch.float32, device=device)
-    reference = torch.as_tensor(
-        np.asarray(gt_positions), dtype=torch.float32, device=device
-    )
     if samples.ndim != 3 or samples.shape[-1] != 2:
         raise ValueError(f"preds must have shape (S, N, 2); got {samples.shape}")
-    if reference.ndim != 2 or reference.shape[-1] != 2:
-        raise ValueError(
-            f"gt_positions must have shape (N, 2); got {reference.shape}"
-        )
-    if reference.shape[0] != samples.shape[1]:
-        raise ValueError(
-            f"gt_positions has {reference.shape[0]} cells but preds has "
-            f"{samples.shape[1]}; they must match."
-        )
     s, n, _ = samples.shape
     if s < 2:
         zeros = np.zeros(n, dtype=np.float32)
         return 0.0, zeros
 
-    aligned = align_samples_to_reference_torch(samples, reference)   # (S, N, 2)
-
     # Pairwise distances over the sample axis for every cell at once.
-    # diff[i, j, c] = aligned[i, c] - aligned[j, c]  -> (S, S, N, 2)
-    diff = aligned.unsqueeze(0) - aligned.unsqueeze(1)
+    # diff[i, j, c] = samples[i, c] - samples[j, c]  -> (S, S, N, 2)
+    diff = samples.unsqueeze(0) - samples.unsqueeze(1)
     pair_dist = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-20)           # (S, S, N)
     # Exclude the diagonal (self-pairs, distance 0) and average.
     iu = torch.triu_indices(s, s, offset=1, device=device)
@@ -629,7 +781,7 @@ def compute_cross_sample_position_spread(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Isotropic IMQ-MMD distances (ICP global + ICP per-class)
+# Isotropic IMQ-MMD distances (after shared train-MMD Procrustes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -678,7 +830,7 @@ def _mean_finite(values: list[float]) -> float:
     return float(arr.mean())
 
 
-def _mmd_triplet_on_clouds(
+def _mmd_metrics_on_clouds(
     *,
     pred_full: torch.Tensor,
     gt_full: torch.Tensor,
@@ -688,16 +840,12 @@ def _mmd_triplet_on_clouds(
     pair_dist_band_mults: tuple[float, ...],
     pair_dist_max_samples: int,
 ) -> dict[str, float]:
-    """Compute whole-slice / spatial / pair-dist MMD for one aligned sample.
+    """Whole-slice + per-class spatial/pair-dist MMD on one aligned sample.
 
-    ``class_pairs`` is a list of ``(pred_class_xy, gt_class_xy)`` tensors used
-    for the per-class spatial and pair-distance terms. ``pred_full`` /
-    ``gt_full`` are the clouds used for the whole-slice term (globally
-    aligned full clouds, or the concatenation of independently aligned
-    class clouds).
+    ``class_pairs`` are class subsets of the **same** whole-slice Procrustes
+    alignment (not independently ICP-aligned onto each GT class cloud).
     """
     whole = _iso_mmd(pred_full, gt_full, whole_slice_band_mults)
-
     spatial_vals: list[float] = []
     pair_vals: list[float] = []
     for X, G in class_pairs:
@@ -719,12 +867,11 @@ def compute_section_mmd_metrics(
     mmd_cfg: Any,
     device: Any,
 ) -> pd.DataFrame:
-    """Per-sample isotropic MMDs under global ICP and per-class ICP.
+    """Per-sample isotropic MMDs on already Procrustes-aligned predictions.
 
-    Returns one row per denoising sample with columns:
-    ``sample_index``,
-    ``mmd_whole_slice_global``, ``mmd_pair_dist_global``, ``mmd_spatial_global``,
-    ``mmd_whole_slice_per_class``, ``mmd_pair_dist_per_class``, ``mmd_spatial_per_class``.
+    ``preds`` must already be aligned with the shared train-MMD Procrustes
+    (barycenters + PCA1 landmarks). Returns one row per sample with
+    ``mmd_whole_slice``, ``mmd_pair_dist``, ``mmd_spatial``.
     """
     whole_slice_band_mults = tuple(float(x) for x in mmd_cfg.whole_slice_band_mults)
     spatial_band_mults = tuple(float(x) for x in mmd_cfg.spatial_band_mults)
@@ -736,73 +883,37 @@ def compute_section_mmd_metrics(
     gt_np = batch.gt_positions.astype(np.float32)
     gt_full = _to_torch_xy(gt_np, device)
     class_masks = [_class_mask_for_sample(batch, c) for c in cell_classes]
-    # Drop empty / tiny classes for per-class terms.
-    kept = []
-    for mask in class_masks:
-        if int(mask.sum()) >= 2:
-            kept.append(mask)
+    kept = [mask for mask in class_masks if int(mask.sum()) >= 2]
     class_masks = kept
     if not class_masks:
         return pd.DataFrame()
 
     rows = []
     for s in range(preds.shape[0]):
-        pred_s = preds[s].astype(np.float32)
-
-        # --- Global ICP: one rigid transform on the full cloud ---
-        aligned_global_np = align_point_clouds_icp(gt_np, pred_s)
-        aligned_global = _to_torch_xy(aligned_global_np, device)
-        global_pairs = [
-            (aligned_global[mask], gt_full[mask]) for mask in class_masks
-        ]
-        global_vals = _mmd_triplet_on_clouds(
-            pred_full=aligned_global,
+        aligned = _to_torch_xy(preds[s].astype(np.float32), device)
+        class_pairs = [(aligned[mask], gt_full[mask]) for mask in class_masks]
+        vals = _mmd_metrics_on_clouds(
+            pred_full=aligned,
             gt_full=gt_full,
-            class_pairs=global_pairs,
+            class_pairs=class_pairs,
             whole_slice_band_mults=whole_slice_band_mults,
             spatial_band_mults=spatial_band_mults,
             pair_dist_band_mults=pair_dist_band_mults,
             pair_dist_max_samples=pair_dist_max_samples,
         )
-
-        # --- Per-class ICP: independent rigid transform per cell type ---
-        aligned_classes: list[torch.Tensor] = []
-        gt_classes: list[torch.Tensor] = []
-        for mask in class_masks:
-            class_pred = pred_s[mask]
-            class_gt_np = gt_np[mask]
-            aligned_c = align_point_clouds_icp(class_gt_np, class_pred)
-            aligned_classes.append(_to_torch_xy(aligned_c, device))
-            gt_classes.append(gt_full[mask])
-        stitched = torch.cat(aligned_classes, dim=0)
-        gt_stitched = torch.cat(gt_classes, dim=0)
-        per_class_pairs = list(zip(aligned_classes, gt_classes))
-        per_class_vals = _mmd_triplet_on_clouds(
-            pred_full=stitched,
-            gt_full=gt_stitched,
-            class_pairs=per_class_pairs,
-            whole_slice_band_mults=whole_slice_band_mults,
-            spatial_band_mults=spatial_band_mults,
-            pair_dist_band_mults=pair_dist_band_mults,
-            pair_dist_max_samples=pair_dist_max_samples,
-        )
-
         rows.append({
             "sample_index": s,
-            "mmd_whole_slice_global": global_vals["mmd_whole_slice"],
-            "mmd_pair_dist_global": global_vals["mmd_pair_dist"],
-            "mmd_spatial_global": global_vals["mmd_spatial"],
-            "mmd_whole_slice_per_class": per_class_vals["mmd_whole_slice"],
-            "mmd_pair_dist_per_class": per_class_vals["mmd_pair_dist"],
-            "mmd_spatial_per_class": per_class_vals["mmd_spatial"],
+            "mmd_whole_slice": vals["mmd_whole_slice"],
+            "mmd_pair_dist": vals["mmd_pair_dist"],
+            "mmd_spatial": vals["mmd_spatial"],
         })
     return pd.DataFrame(rows)
 
 
-_MMD_METRIC_PAIRS: list[tuple[str, str, str]] = [
-    ("mmd_whole_slice", "mmd_whole_slice_global", "mmd_whole_slice_per_class"),
-    ("mmd_pair_dist", "mmd_pair_dist_global", "mmd_pair_dist_per_class"),
-    ("mmd_spatial", "mmd_spatial_global", "mmd_spatial_per_class"),
+_MMD_METRIC_COLS: list[str] = [
+    "mmd_whole_slice",
+    "mmd_pair_dist",
+    "mmd_spatial",
 ]
 
 
@@ -816,14 +927,7 @@ def aggregate_mmd_across_sections(
     if combined.empty:
         return pd.DataFrame()
 
-    metric_cols = [
-        "mmd_whole_slice_global",
-        "mmd_pair_dist_global",
-        "mmd_spatial_global",
-        "mmd_whole_slice_per_class",
-        "mmd_pair_dist_per_class",
-        "mmd_spatial_per_class",
-    ]
+    metric_cols = list(_MMD_METRIC_COLS)
     grouped = (
         combined.groupby("cell_section", as_index=False)[metric_cols]
         .agg(["mean", "std"])
@@ -852,10 +956,7 @@ def plot_mmd_summary(
     summary_df: pd.DataFrame,
     save_path: Path,
 ) -> None:
-    """Three-subplot bar chart: whole-slice / pair-dist / spatial MMD.
-
-    Each subplot shows global ICP vs per-class ICP (two bars per section).
-    """
+    """Three-subplot bar chart: whole-slice / pair-dist / spatial MMD."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -871,37 +972,25 @@ def plot_mmd_summary(
         plot_df = summary_df.copy()
     labels = plot_df["cell_section"].tolist()
     x = np.arange(len(labels))
-    w = 0.36
 
     titles = (
-        "Whole-slice MMD\n(isotropic IMQ, multi-bandwidth)",
-        "Pair-distance MMD\n(distance-distribution IMQ, multi-bandwidth)",
-        "Spatial MMD\n(per-class isotropic IMQ, multi-bandwidth)",
+        ("mmd_whole_slice", "Whole-slice MMD\n(isotropic IMQ, multi-bandwidth)"),
+        ("mmd_pair_dist", "Pair-distance MMD\n(distance-distribution IMQ)"),
+        ("mmd_spatial", "Spatial MMD\n(per-class, whole-slice Procrustes)"),
     )
-    pairs = _MMD_METRIC_PAIRS
 
     fig, axes = plt.subplots(1, 3, figsize=(max(12.0, 1.1 * len(labels) * 3), 5.2))
-    for ax, title, (_, global_key, per_class_key) in zip(axes, titles, pairs):
-        g_means = plot_df[f"{global_key}_mean"].to_numpy(dtype=float)
-        g_stds = plot_df[f"{global_key}_std"].to_numpy(dtype=float)
-        p_means = plot_df[f"{per_class_key}_mean"].to_numpy(dtype=float)
-        p_stds = plot_df[f"{per_class_key}_std"].to_numpy(dtype=float)
-        ax.bar(
-            x - w / 2, g_means, w, yerr=g_stds, capsize=3,
-            color="tab:blue", alpha=0.85, label="Global ICP",
-        )
-        ax.bar(
-            x + w / 2, p_means, w, yerr=p_stds, capsize=3,
-            color="tab:orange", alpha=0.85, label="Per-class ICP",
-        )
+    for ax, (key, title) in zip(axes, titles):
+        means = plot_df[f"{key}_mean"].to_numpy(dtype=float)
+        stds = plot_df[f"{key}_std"].to_numpy(dtype=float)
+        ax.bar(x, means, 0.7, yerr=stds, capsize=3, color="tab:blue", alpha=0.85)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=30, ha="right")
         ax.set_ylabel("MMD² (mean over samples)")
         ax.set_title(title, fontsize=10)
-        ax.legend(loc="best", fontsize=8, framealpha=0.85)
 
     fig.suptitle(
-        "Isotropic IMQ-MMD to GT under two ICP registrations",
+        "Isotropic IMQ-MMD to GT after train-MMD Procrustes (barycenters + PCA1)",
         fontsize=12,
         fontweight="semibold",
     )
@@ -971,7 +1060,7 @@ def _build_directional_loss(dir_cfg: Any) -> DirectionalMetricLoss:
 
 
 def _build_multi_radius_loss(mr_cfg: Any) -> MultiRadiusNeighborhoodLoss:
-    """Instantiate the multi-radius neighborhood loss from config (train defaults)."""
+    """Instantiate the multi-radius neighborhood loss from ``test.pipeline.multi_radius_analysis``."""
     soft_beta = getattr(mr_cfg, "soft_beta", None)
     soft_beta = None if soft_beta is None else float(soft_beta)
     tol_beta = getattr(mr_cfg, "transcriptome_tolerance_soft_beta", None)
@@ -990,6 +1079,10 @@ def _build_multi_radius_loss(mr_cfg: Any) -> MultiRadiusNeighborhoodLoss:
         global_transcriptome_weight=float(
             getattr(mr_cfg, "global_transcriptome_weight", 1.0)
         ),
+        avg_spearman_weight=float(getattr(mr_cfg, "avg_spearman_weight", 0.0)),
+        global_spearman_weight=float(getattr(mr_cfg, "global_spearman_weight", 0.0)),
+        spearman_tau=float(getattr(mr_cfg, "spearman_tau", 4.0)),
+        spearman_chunk_size=int(getattr(mr_cfg, "spearman_chunk_size", 512)),
         loss_radius_scale=float(getattr(mr_cfg, "loss_radius_scale", 512.0)),
         transcriptome_tolerance=tol,
         transcriptome_tolerance_gate_beta=tol_beta,
@@ -1407,78 +1500,88 @@ def plot_scalar_losses_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Grid transcript-count metrics (Procrustes+scale → spatial bins → gene counts)
-# Fully batched on GPU over denoising samples (and genes for soft Spearman).
+# Shared train-MMD Procrustes (barycenters + PCA1 axis landmarks)
+# Used for every GT-comparison metric in the testing pipeline.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _class_barycenters_batched(
-    positions: torch.Tensor,
+def align_pred_to_gt_mmd_procrustes(
+    pred_xy: torch.Tensor,
+    true_xy: torch.Tensor,
     labels: torch.Tensor,
-    classes: torch.Tensor,
-) -> torch.Tensor:
-    """Per-sample per-class means.
-
-    ``positions``: ``(S, N, 2)`` or ``(N, 2)``; ``labels``: ``(N,)``;
-    ``classes``: ``(C,)``. Returns ``(S, C, 2)`` (``S=1`` if positions is 2-D).
-    """
-    if positions.ndim == 2:
-        positions = positions.unsqueeze(0)
-    s, n, d = positions.shape
-    c = int(classes.shape[0])
-    # one-hot (N, C) → broadcast over samples
-    one_hot = (labels.unsqueeze(1) == classes.unsqueeze(0)).to(positions.dtype)  # (N, C)
-    counts = one_hot.sum(dim=0).clamp_min(1.0)  # (C,)
-    # (S, N, 2) x (N, C) → (S, C, 2)
-    sums = torch.einsum("snd,nc->scd", positions, one_hot)
-    return sums / counts.view(1, c, 1)
-
-
-def _procrustes_similarity_batched(
-    source: torch.Tensor,
-    target: torch.Tensor,
     *,
-    with_scale: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Batched uniform-weight Procrustes (same math as ``procrustes_similarity``).
+    with_scale: bool = False,
+    allow_reflection: bool = True,
+    axis_align: bool = True,
+    axis_weight: float = 1.0,
+    axis_min_cells: int = 64,
+    axis_min_anisotropy: float = 0.4,
+    axis_length_mult: float = 1.0,
+) -> torch.Tensor:
+    """One-sample Procrustes matching ``SlideMMDLoss._aligned_pred_xy``.
 
-    ``source``: ``(S, M, 2)``, ``target``: ``(M, 2)`` or ``(S, M, 2)``.
-    Returns ``R (S, 2, 2)``, ``t (S, 2)``, ``s (S,)`` in ``source`` dtype.
+    Fits a global similarity on per-class barycenters, optionally augmented
+    with PCA1 axis landmarks (``n ≈ √n_cells`` points on ``[bc ± L·PCA1]``
+    for classes that pass the GT count / anisotropy gates), then applies
+    ``s * (X @ R.T) + t`` to every predicted cell.
     """
-    X = source.detach().to(torch.float64)
-    Y = target.detach().to(torch.float64)
-    if Y.ndim == 2:
-        Y = Y.unsqueeze(0).expand(X.shape[0], -1, -1)
+    mask_b = torch.ones(pred_xy.shape[0], dtype=torch.bool, device=pred_xy.device)
+    usable = []
+    for cval in torch.unique(labels[mask_b]):
+        cint = int(cval.item())
+        if int(((labels == cint) & mask_b).sum().item()) < 1:
+            continue
+        usable.append(cint)
+    if len(usable) < 2:
+        return pred_xy
 
-    mu_x = X.mean(dim=1, keepdim=True)  # (S, 1, 2)
-    mu_y = Y.mean(dim=1, keepdim=True)
-    Xc, Yc = X - mu_x, Y - mu_y
+    classes_t = torch.tensor(usable, device=pred_xy.device, dtype=labels.dtype)
+    P_bc = class_barycenters(pred_xy, labels, mask_b, classes_t)
+    G_bc = class_barycenters(true_xy, labels, mask_b, classes_t)
 
-    # H = Xc^T @ Yc  → (S, 2, 2)
-    H = torch.matmul(Xc.transpose(1, 2), Yc)
-    U, _, Vh = torch.linalg.svd(H)
-    R = torch.matmul(Vh.transpose(1, 2), U.transpose(1, 2))
-    # Reflection fix per sample
-    det = torch.det(R)
-    flip = det < 0
-    if bool(flip.any()):
-        Vh = Vh.clone()
-        Vh[flip, -1, :] *= -1
-        R = torch.matmul(Vh.transpose(1, 2), U.transpose(1, 2))
+    P_all, G_all, weights = P_bc, G_bc, None
+    if axis_align:
+        counts = torch.tensor(
+            [int(((labels == c) & mask_b).sum().item()) for c in usable],
+            device=pred_xy.device,
+        )
+        axis_gate = counts >= int(axis_min_cells)
+        if bool(axis_gate.any()):
+            G_cov = class_covariances(true_xy, labels, mask_b, classes_t)
+            gt_aniso = class_anisotropy(G_cov)
+            axis_gate = axis_gate & (gt_aniso >= float(axis_min_anisotropy))
+            if bool(axis_gate.any()):
+                P_cov = class_covariances(pred_xy, labels, mask_b, classes_t)
+                R0, _, _ = procrustes_similarity(
+                    P_bc, G_bc, with_scale=False,
+                    allow_reflection=bool(allow_reflection),
+                )
+                G_axis_dir, _ = class_top_eigvec(G_cov)
+                ref_dirs = G_axis_dir @ R0
+                P_axis = class_axis_landmarks(
+                    P_bc[axis_gate], P_cov[axis_gate], ref_dirs[axis_gate],
+                    counts[axis_gate], float(axis_length_mult),
+                )
+                G_axis = class_axis_landmarks(
+                    G_bc[axis_gate], G_cov[axis_gate], G_axis_dir[axis_gate],
+                    counts[axis_gate], float(axis_length_mult),
+                )
+                P_all = torch.cat([P_bc, P_axis], dim=0)
+                G_all = torch.cat([G_bc, G_axis], dim=0)
+                weights = torch.cat([
+                    torch.ones(P_bc.shape[0], device=pred_xy.device),
+                    torch.full(
+                        (P_axis.shape[0],), float(axis_weight),
+                        device=pred_xy.device,
+                    ),
+                ])
 
-    if with_scale:
-        num = (Yc * torch.matmul(Xc, R.transpose(1, 2))).sum(dim=(1, 2))
-        den = Xc.pow(2).sum(dim=(1, 2)).clamp_min(1e-12)
-        s = num / den
-    else:
-        s = torch.ones(X.shape[0], dtype=torch.float64, device=X.device)
-
-    t = mu_y.squeeze(1) - s.unsqueeze(-1) * torch.matmul(
-        R, mu_x.squeeze(1).unsqueeze(-1)
-    ).squeeze(-1)
-
-    out_dtype = source.dtype if source.is_floating_point() else torch.float32
-    return R.to(dtype=out_dtype), t.to(dtype=out_dtype), s.to(dtype=out_dtype)
+    R, t, s = procrustes_similarity(
+        P_all, G_all, with_scale=bool(with_scale),
+        weights=weights,
+        allow_reflection=bool(allow_reflection),
+    )
+    return apply_similarity(pred_xy, R, t, s)
 
 
 def align_samples_to_gt_procrustes_torch(
@@ -1486,13 +1589,20 @@ def align_samples_to_gt_procrustes_torch(
     gt: torch.Tensor,
     labels: torch.Tensor,
     *,
-    with_scale: bool = True,
+    procrustes_cfg: Any | None = None,
+    with_scale: bool | None = None,
+    allow_reflection: bool | None = None,
+    axis_align: bool | None = None,
+    axis_weight: float | None = None,
+    axis_min_cells: int | None = None,
+    axis_min_anisotropy: float | None = None,
+    axis_length_mult: float | None = None,
 ) -> torch.Tensor:
-    """Batched similarity-align every sample onto GT (``train_mmds`` style).
+    """Align every sample onto GT with the train-MMD Procrustes (PCA landmarks).
 
     ``samples``: ``(S, N, 2)``, ``gt``: ``(N, 2)``, ``labels``: ``(N,)``.
-    Fits one Procrustes ``(R, t, s)`` per sample on per-class barycenters and
-    applies it with a single batched matmul. Returns ``(S, N, 2)``.
+    Knobs default from ``procrustes_cfg`` (``test.pipeline.procrustes``),
+    matching ``configs/train`` Procrustes keys.
     """
     samples = samples.to(dtype=torch.float32)
     gt = gt.to(dtype=torch.float32)
@@ -1504,43 +1614,58 @@ def align_samples_to_gt_procrustes_torch(
             f"gt shape {tuple(gt.shape)} must match samples[1:] {tuple(samples.shape[1:])}"
         )
 
-    classes = torch.unique(labels)
-    # Drop empty (shouldn't happen); need >= 2 classes for a rotation.
-    usable = []
-    for cval in classes:
-        if int((labels == cval).sum().item()) >= 1:
-            usable.append(int(cval.item()))
-    if len(usable) < 2:
+    def _cfg(name: str, default, override):
+        if override is not None:
+            return override
+        if procrustes_cfg is not None and hasattr(procrustes_cfg, name):
+            return getattr(procrustes_cfg, name)
+        return default
+
+    if not bool(_cfg("align", True, None)):
         return samples
 
-    classes_t = torch.tensor(usable, device=samples.device, dtype=labels.dtype)
-    P_bc = _class_barycenters_batched(samples, labels, classes_t)  # (S, C, 2)
-    G_bc = _class_barycenters_batched(gt, labels, classes_t).squeeze(0)  # (C, 2)
-    R, t, s = _procrustes_similarity_batched(P_bc, G_bc, with_scale=with_scale)
-    # aligned = s * (pts @ R.T) + t   → (S, N, 2)
-    return s.view(-1, 1, 1) * torch.matmul(samples, R.transpose(1, 2)) + t.unsqueeze(1)
-
-
-def align_pred_to_gt_procrustes(
-    pred_xy: np.ndarray,
-    gt_xy: np.ndarray,
-    cell_class_int: np.ndarray,
-    *,
-    with_scale: bool = True,
-    device: Any | None = None,
-) -> np.ndarray:
-    """Single-sample wrapper around :func:`align_samples_to_gt_procrustes_torch`."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    samples = torch.as_tensor(
-        np.asarray(pred_xy, dtype=np.float32), device=device
-    ).unsqueeze(0)
-    gt = torch.as_tensor(np.asarray(gt_xy, dtype=np.float32), device=device)
-    labels = torch.as_tensor(np.asarray(cell_class_int), dtype=torch.long, device=device)
-    aligned = align_samples_to_gt_procrustes_torch(
-        samples, gt, labels, with_scale=with_scale
+    kwargs = dict(
+        with_scale=bool(_cfg("with_scale", False, with_scale)),
+        allow_reflection=bool(_cfg("allow_reflection", True, allow_reflection)),
+        axis_align=bool(_cfg("axis_align", True, axis_align)),
+        axis_weight=float(_cfg("axis_weight", 1.0, axis_weight)),
+        axis_min_cells=int(_cfg("axis_min_cells", 64, axis_min_cells)),
+        axis_min_anisotropy=float(
+            _cfg("axis_min_anisotropy", 0.4, axis_min_anisotropy)
+        ),
+        axis_length_mult=float(_cfg("axis_length_mult", 1.0, axis_length_mult)),
     )
-    return aligned[0].detach().cpu().numpy().astype(np.float32)
+
+    aligned = [
+        align_pred_to_gt_mmd_procrustes(samples[i], gt, labels, **kwargs)
+        for i in range(int(samples.shape[0]))
+    ]
+    return torch.stack(aligned, dim=0)
+
+
+def align_section_preds_to_gt(
+    preds: np.ndarray,
+    batch: "SliceBatch",
+    procrustes_cfg: Any,
+    device: Any,
+) -> np.ndarray:
+    """Numpy convenience wrapper: ``(S, N, 2)`` → train-MMD Procrustes-aligned."""
+    samples = torch.as_tensor(
+        np.asarray(preds, dtype=np.float32), dtype=torch.float32, device=device
+    )
+    gt = torch.as_tensor(
+        np.asarray(batch.gt_positions, dtype=np.float32),
+        dtype=torch.float32,
+        device=device,
+    )
+    labels = torch.as_tensor(
+        np.asarray(batch.cell_class_int), dtype=torch.long, device=device
+    )
+    with torch.no_grad():
+        aligned = align_samples_to_gt_procrustes_torch(
+            samples, gt, labels, procrustes_cfg=procrustes_cfg
+        )
+    return aligned.detach().cpu().numpy().astype(np.float32)
 
 
 def _gt_square_bbox_torch(
@@ -1559,59 +1684,61 @@ def _gt_square_bbox_torch(
     return lo[0], hi[0], lo[1], hi[1]
 
 
-def _grid_bin_indices_torch(
-    xy: torch.Tensor,
+def _grid_intersection_centers_torch(
     x0: torch.Tensor,
     x1: torch.Tensor,
     y0: torch.Tensor,
     y1: torch.Tensor,
     grid_size: int,
-) -> torch.Tensor:
-    """Map coords to flat grid indices.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Corners of an ``n×n`` square tiling → ``(n+1)²`` intersections + spacing.
 
-    ``xy``: ``(N, 2)`` or ``(S, N, 2)`` → same leading shape ``(...,)`` of
-    long indices in ``[0, grid_size²)``.
+    Returns ``centers (K, 2)`` with ``K = (grid_size + 1)²`` and scalar
+    ``spacing = side / grid_size`` (bbox is square by construction).
     """
     n = int(grid_size)
-    span_x = (x1 - x0).clamp_min(1e-8)
-    span_y = (y1 - y0).clamp_min(1e-8)
-    ix = torch.floor((xy[..., 0] - x0) / span_x * n).long().clamp(0, n - 1)
-    iy = torch.floor((xy[..., 1] - y0) / span_y * n).long().clamp(0, n - 1)
-    return iy * n + ix
+    if n < 1:
+        raise ValueError(f"grid_size must be >= 1; got {grid_size}")
+    xs = torch.linspace(x0, x1, n + 1, device=x0.device, dtype=x0.dtype)
+    ys = torch.linspace(y0, y1, n + 1, device=y0.device, dtype=y0.dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    centers = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+    spacing = ((x1 - x0) / float(n)).clamp_min(1e-8)
+    return centers, spacing
 
 
-def _transcript_counts_on_grid_torch(
+def _soft_intersection_transcript_sums_torch(
     xy: torch.Tensor,
     features: torch.Tensor,
+    centers: torch.Tensor,
     *,
-    x0: torch.Tensor,
-    x1: torch.Tensor,
-    y0: torch.Tensor,
-    y1: torch.Tensor,
-    grid_size: int,
+    radius: torch.Tensor | float,
+    soft_beta: float,
 ) -> torch.Tensor:
-    """Batched scatter-sum of gene features into grid squares.
+    """Soft circular weighted transcriptome sums at grid intersections.
 
-    ``xy``: ``(S, N, 2)`` or ``(N, 2)``; ``features``: ``(N, F)``.
-    Returns ``(S, grid_size², F)`` (``S=1`` if ``xy`` is 2-D).
+    At each intersection ``c`` every cell ``j`` gets membership
+    ``w_j = sigmoid(soft_beta · (radius − ‖x_j − c‖))`` (same form as the
+    multi-radius neighborhood soft ball). Returns the **weighted sum**
+    ``Σ_j w_j · features_j`` per intersection.
+
+    ``xy``: ``(S, N, 2)`` or ``(N, 2)``; ``features``: ``(N, F)``;
+    ``centers``: ``(K, 2)``. Returns ``(S, K, F)`` (``S=1`` if ``xy`` is 2-D).
     """
     if xy.ndim == 2:
         xy = xy.unsqueeze(0)
-    s, n_cells, _ = xy.shape
-    n_genes = int(features.shape[-1])
-    n_bins = int(grid_size) ** 2
-    bins = _grid_bin_indices_torch(xy, x0, x1, y0, y1, grid_size)  # (S, N)
-
-    # scatter_add over the bin axis: expand features to (S, N, F)
-    feat = features.unsqueeze(0).expand(s, -1, -1).contiguous()
-    index = bins.unsqueeze(-1).expand(-1, -1, n_genes)
-    counts = xy.new_zeros(s, n_bins, n_genes)
-    return counts.scatter_add(1, index, feat)
+    s = int(xy.shape[0])
+    # (S, K, N) pairwise distances from each intersection to each cell
+    centers_b = centers.unsqueeze(0).expand(s, -1, -1)
+    dists = torch.cdist(centers_b, xy)
+    w = torch.sigmoid(float(soft_beta) * (float(radius) - dists))  # (S, K, N)
+    # (S, K, N) @ (N, F) → (S, K, F)
+    return torch.matmul(w, features)
 
 
 def _grid_transcript_metrics_batched(
-    pred_counts: torch.Tensor,
-    gt_counts: torch.Tensor,
+    pred_sums: torch.Tensor,
+    gt_sums: torch.Tensor,
     *,
     spearman_tau: float,
     spearman_chunk_size: int,
@@ -1619,19 +1746,20 @@ def _grid_transcript_metrics_batched(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MAE and mean soft-Spearman per sample, fully batched on device.
 
-    ``pred_counts``: ``(S, n_squares, F)``, ``gt_counts``: ``(n_squares, F)``
-    or ``(S, n_squares, F)``. Soft Spearman ranks along the square axis for
-    each gene, then averages over genes → ``(S,)`` correlation.
+    ``pred_sums``: ``(S, K, F)``, ``gt_sums``: ``(K, F)`` or ``(S, K, F)``
+    where ``K`` is the number of soft grid intersections. Soft Spearman
+    ranks along the intersection axis for each gene, then averages over
+    genes → ``(S,)`` correlation.
     """
-    if gt_counts.ndim == 2:
-        gt_counts = gt_counts.unsqueeze(0).expand_as(pred_counts)
+    if gt_sums.ndim == 2:
+        gt_sums = gt_sums.unsqueeze(0).expand_as(pred_sums)
 
-    # MAE over squares × genes, per sample
-    mae = (pred_counts - gt_counts).abs().mean(dim=(1, 2))  # (S,)
+    # MAE over intersections × genes, per sample
+    mae = (pred_sums - gt_sums).abs().mean(dim=(1, 2))  # (S,)
 
-    # (S, n_squares, F) → (S, F, n_squares) for per-gene spatial Spearman
-    pred_g = pred_counts.transpose(1, 2)
-    gt_g = gt_counts.transpose(1, 2)
+    # (S, K, F) → (S, F, K) for per-gene spatial Spearman
+    pred_g = pred_sums.transpose(1, 2)
+    gt_g = gt_sums.transpose(1, 2)
     if pred_g.shape[-1] < 2:
         return mae, torch.full_like(mae, float("nan"))
 
@@ -1652,12 +1780,13 @@ def compute_section_grid_transcript_metrics(
     grid_cfg: Any,
     device: Any,
 ) -> pd.DataFrame:
-    """Per-sample grid transcript MAE + soft Spearman after Procrustes+scale.
+    """Per-sample soft grid-intersection MAE + soft Spearman.
 
+    ``preds`` must already be aligned with the shared train-MMD Procrustes.
     Fully vectorised on ``device``:
-      * one batched Procrustes+scale for all ``S`` samples,
-      * one ``scatter_add`` binning pass per grid size for all samples,
-      * one soft-Spearman pass over ``(S, F, n_squares)`` (chunked over genes).
+      * soft circular weighted transcriptome sums at ``(n+1)²`` intersections
+        per lattice size (sigmoid membership, radius = half grid spacing),
+      * one soft-Spearman pass over ``(S, F, K)`` (chunked over genes).
 
     Returns one row per sample with ``grid_transcript_diff`` /
     ``grid_transcript_soft_spearman`` (averaged over configured grid sizes)
@@ -1666,21 +1795,18 @@ def compute_section_grid_transcript_metrics(
     """
     grid_sizes = [int(g) for g in grid_cfg.grid_sizes]
     margin = float(getattr(grid_cfg, "margin", 0.05))
+    soft_beta = float(getattr(grid_cfg, "soft_beta", 128.0))
     spearman_tau = float(getattr(grid_cfg, "spearman_tau", 4.0))
     spearman_chunk_size = int(getattr(grid_cfg, "spearman_chunk_size", 512))
-    with_scale = bool(getattr(grid_cfg, "procrustes_with_scale", True))
     eps = float(getattr(grid_cfg, "eps", 1e-6))
 
-    samples = torch.as_tensor(
+    aligned = torch.as_tensor(
         np.asarray(preds, dtype=np.float32), dtype=torch.float32, device=device
     )
     gt = torch.as_tensor(
         np.asarray(batch.gt_positions, dtype=np.float32),
         dtype=torch.float32,
         device=device,
-    )
-    labels = torch.as_tensor(
-        np.asarray(batch.cell_class_int), dtype=torch.long, device=device
     )
     features = torch.as_tensor(
         np.asarray(batch.holder.node_features, dtype=np.float32),
@@ -1692,26 +1818,34 @@ def compute_section_grid_transcript_metrics(
     if features.ndim != 2:
         raise ValueError(f"node_features must be (N, F); got {tuple(features.shape)}")
 
-    s = int(samples.shape[0])
+    s = int(aligned.shape[0])
     x0, x1, y0, y1 = _gt_square_bbox_torch(gt, margin)
 
     with torch.no_grad():
-        aligned = align_samples_to_gt_procrustes_torch(
-            samples, gt, labels, with_scale=with_scale
-        )  # (S, N, 2)
-
         per_size_mae: dict[int, torch.Tensor] = {}
         per_size_corr: dict[int, torch.Tensor] = {}
         for n in grid_sizes:
-            gt_counts = _transcript_counts_on_grid_torch(
-                gt, features, x0=x0, x1=x1, y0=y0, y1=y1, grid_size=n
-            )[0]  # (n_bins, F)
-            pred_counts = _transcript_counts_on_grid_torch(
-                aligned, features, x0=x0, x1=x1, y0=y0, y1=y1, grid_size=n
-            )  # (S, n_bins, F)
+            centers, spacing = _grid_intersection_centers_torch(
+                x0, x1, y0, y1, n
+            )
+            radius = 0.5 * spacing
+            gt_sums = _soft_intersection_transcript_sums_torch(
+                gt,
+                features,
+                centers,
+                radius=radius,
+                soft_beta=soft_beta,
+            )[0]  # (K, F)
+            pred_sums = _soft_intersection_transcript_sums_torch(
+                aligned,
+                features,
+                centers,
+                radius=radius,
+                soft_beta=soft_beta,
+            )  # (S, K, F)
             mae_s, corr_s = _grid_transcript_metrics_batched(
-                pred_counts,
-                gt_counts,
+                pred_sums,
+                gt_sums,
                 spearman_tau=spearman_tau,
                 spearman_chunk_size=spearman_chunk_size,
                 eps=eps,
@@ -1719,7 +1853,6 @@ def compute_section_grid_transcript_metrics(
             per_size_mae[n] = mae_s
             per_size_corr[n] = corr_s
 
-        # Stack resolutions → (S, R) then mean over R
         mae_stack = torch.stack([per_size_mae[n] for n in grid_sizes], dim=1)
         corr_stack = torch.stack([per_size_corr[n] for n in grid_sizes], dim=1)
         mae_mean = mae_stack.nanmean(dim=1)
@@ -1789,7 +1922,7 @@ def plot_grid_transcript_summary(
     summary_df: pd.DataFrame,
     save_path: Path,
 ) -> None:
-    """Single subplot: count MAE and soft Spearman side-by-side (twin y-axes)."""
+    """Soft intersection MAE and soft Spearman side-by-side (twin y-axes)."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1815,7 +1948,7 @@ def plot_grid_transcript_summary(
 
     bars_mae = ax.bar(
         x - w / 2, diff_means, w, yerr=diff_stds, capsize=3,
-        color="tab:brown", alpha=0.85, label="Count MAE",
+        color="tab:brown", alpha=0.85, label="Weighted-sum MAE",
     )
     bars_spr = ax_r.bar(
         x + w / 2, corr_means, w, yerr=corr_stds, capsize=3,
@@ -1824,17 +1957,18 @@ def plot_grid_transcript_summary(
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right")
-    ax.set_ylabel("Mean |Δ transcript counts| (MAE)", color="tab:brown")
+    ax.set_ylabel("Mean |Δ soft weighted transcriptome sums|", color="tab:brown")
     ax_r.set_ylabel("Soft Spearman correlation", color="tab:olive")
     ax.tick_params(axis="y", labelcolor="tab:brown")
     ax_r.tick_params(axis="y", labelcolor="tab:olive")
     ax.set_title(
-        "Spatial transcript grid metrics (after Procrustes+scale to GT)\n"
-        "MAE + soft Spearman averaged over squares, genes, grid sizes"
+        "Soft grid-intersection transcript metrics "
+        "(after train-MMD Procrustes to GT)\n"
+        "MAE + soft Spearman over circular spots, genes, grid sizes"
     )
     ax.legend(
         [bars_mae, bars_spr],
-        ["Count MAE", "Soft Spearman"],
+        ["Weighted-sum MAE", "Soft Spearman"],
         loc="best",
         fontsize=8,
         framealpha=0.85,
@@ -1864,6 +1998,7 @@ def run_checkpoint_pipeline(
     ch_voronoi_cfg = pipe_cfg.ch_voronoi_analysis
     scalar_cfg = pipe_cfg.scalar_losses_analysis
     grid_tx_cfg = pipe_cfg.grid_transcript_analysis
+    procrustes_cfg = getattr(pipe_cfg, "procrustes", None)
     num_samples = int(pipe_cfg.num_samples)
     seed_start = int(pipe_cfg.seed_start)
     min_cells = int(pipe_cfg.min_cells_per_class)
@@ -1873,7 +2008,8 @@ def run_checkpoint_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, output_dir / "effective_config.yaml")
 
-    device = _resolve_device(str(pipe_cfg.device))
+    inference_devices = resolve_inference_devices(cfg, str(pipe_cfg.device))
+    device = inference_devices[0]  # analysis stays on the first device
     ch_loss = _build_ch_loss(ch_voronoi_cfg.cahn_hilliard)
     voronoi_loss = _build_voronoi_loss(ch_voronoi_cfg.voronoi)
 
@@ -1890,18 +2026,29 @@ def run_checkpoint_pipeline(
     print(f"[testing_pipeline] Output dir  : {output_dir}")
     print(f"[testing_pipeline] num_samples : {num_samples}")
     print(f"[testing_pipeline] batch_size  : {batch_size}")
-    print(f"[testing_pipeline] device      : {device}")
+    print(f"[testing_pipeline] analysis    : {device}")
+    print(
+        f"[testing_pipeline] inference   : "
+        f"{len(inference_devices)} device(s) "
+        f"{[str(d) for d in inference_devices]}"
+    )
     print(f"[testing_pipeline] position_mse: {compute_position_mse}")
     print(f"[testing_pipeline] directional : {compute_directional}")
     print(f"[testing_pipeline] multi_radius: always on")
+    if procrustes_cfg is not None:
+        print(
+            f"[testing_pipeline] procrustes : align={bool(getattr(procrustes_cfg, 'align', True))} "
+            f"scale={bool(getattr(procrustes_cfg, 'with_scale', False))} "
+            f"axis={bool(getattr(procrustes_cfg, 'axis_align', True))} "
+            f"reflect={bool(getattr(procrustes_cfg, 'allow_reflection', True))}"
+        )
     print(
         f"[testing_pipeline] grid_tx   : sizes={list(grid_tx_cfg.grid_sizes)} "
-        f"procrustes_scale={bool(grid_tx_cfg.procrustes_with_scale)}"
+        f"soft_beta={float(getattr(grid_tx_cfg, 'soft_beta', 128.0))}"
     )
     print("=" * 78)
 
     load_model_config_from_checkpoint(cfg, checkpoint_path)
-    model = load_model(cfg, dataset_infos, str(checkpoint_path), device)
 
     cell_sections = list_cell_sections(datamodule.test_dataset)
     print(f"[testing_pipeline] Found {len(cell_sections)} cell sections in test split.")
@@ -1909,22 +2056,17 @@ def run_checkpoint_pipeline(
     section_batches = prepare_section_batches(datamodule, dataset_infos, cell_sections)
 
     print("[testing_pipeline] Phase 1/2: batched sampling (seed-outer, sections-inner)…")
-    all_section_preds = run_all_sampling(
-        model=model,
+    all_section_preds = run_sampling_phase(
+        cfg=cfg,
+        checkpoint_path=checkpoint_path,
+        dataset_infos=dataset_infos,
         section_batches=section_batches,
         cell_sections=cell_sections,
         num_samples=num_samples,
         seed_start=seed_start,
         batch_size=batch_size,
-        device=device,
+        devices=inference_devices,
     )
-
-    del model
-    try:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
 
     print(
         "[testing_pipeline] Phase 2/2: analysis "
@@ -1956,6 +2098,11 @@ def run_checkpoint_pipeline(
             gt_csv=gt_csv,
         )
 
+        # Shared train-MMD Procrustes for every GT-comparison metric.
+        aligned_preds = align_section_preds_to_gt(
+            preds, batch, procrustes_cfg, device
+        )
+
         gt_df = predictions_to_gt_dataframe(batch)
         cell_classes = cell_classes_with_min_cells(gt_df, min_cells)
         if not cell_classes:
@@ -1965,7 +2112,7 @@ def run_checkpoint_pipeline(
             )
         else:
             section_mmd = compute_section_mmd_metrics(
-                preds=preds,
+                preds=aligned_preds,
                 batch=batch,
                 cell_classes=cell_classes,
                 mmd_cfg=mmd_cfg,
@@ -1979,7 +2126,7 @@ def run_checkpoint_pipeline(
                 section_mmd_tables.append(section_mmd)
 
         section_ch_voronoi = compute_section_ch_voronoi_losses(
-            preds=preds,
+            preds=aligned_preds,
             batch=batch,
             ch_loss=ch_loss,
             voronoi_loss=voronoi_loss,
@@ -1992,9 +2139,9 @@ def run_checkpoint_pipeline(
             )
             section_ch_voronoi_tables.append(section_ch_voronoi)
 
+        # Same shared Procrustes as every other GT-frame metric.
         spread_mean, spread_per_cell = compute_cross_sample_position_spread(
-            preds=preds,
-            gt_positions=batch.gt_positions,
+            preds=aligned_preds,
             device=device,
         )
         section_spread_rows.append({
@@ -2016,7 +2163,7 @@ def run_checkpoint_pipeline(
 
         section_scalar = compute_section_scalar_losses(
             batch=batch,
-            pred_positions=preds,
+            pred_positions=aligned_preds,
             gt_positions=batch.gt_positions.astype(np.float32),
             cell_class_int=np.asarray(batch.cell_class_int),
             device=device,
@@ -2034,7 +2181,7 @@ def run_checkpoint_pipeline(
             section_scalar_losses_tables.append(section_scalar)
 
         section_grid_tx = compute_section_grid_transcript_metrics(
-            preds=preds,
+            preds=aligned_preds,
             batch=batch,
             grid_cfg=grid_tx_cfg,
             device=device,
@@ -2055,12 +2202,9 @@ def run_checkpoint_pipeline(
         all_row = mmd_summary[mmd_summary["cell_section"] == "ALL"]
         if not all_row.empty:
             for label, key in (
-                ("whole_slice/global", "mmd_whole_slice_global_mean"),
-                ("whole_slice/per_class", "mmd_whole_slice_per_class_mean"),
-                ("pair_dist/global", "mmd_pair_dist_global_mean"),
-                ("pair_dist/per_class", "mmd_pair_dist_per_class_mean"),
-                ("spatial/global", "mmd_spatial_global_mean"),
-                ("spatial/per_class", "mmd_spatial_per_class_mean"),
+                ("whole_slice", "mmd_whole_slice_mean"),
+                ("pair_dist", "mmd_pair_dist_mean"),
+                ("spatial", "mmd_spatial_mean"),
             ):
                 print(
                     f"[testing_pipeline] MMD {label}: "
@@ -2173,6 +2317,14 @@ def run_testing_pipeline(cfg: DictConfig) -> list[Path]:
             run_checkpoint_pipeline(cfg, checkpoint_path, datamodule, dataset_infos)
         )
 
+    try:
+        plot_best_predictions_for_models(cfg, checkpoint_paths, output_dirs)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[testing_pipeline] Best-prediction plots failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
     if len(output_dirs) > 1:
         try:
             compare_checkpoints(cfg, checkpoint_paths, output_dirs)
@@ -2185,12 +2337,473 @@ def run_testing_pipeline(cfg: DictConfig) -> list[Path]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Best-seed prediction scatter plots (selected slices)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _testing_pipeline_parent_dir(
+    cfg: DictConfig,
+    checkpoint_paths: Sequence[Path],
+) -> Path:
+    base = cfg.test.save_dir
+    if base is None:
+        base = str(checkpoint_paths[0].parent)
+    return Path(base) / cfg.general.name / "testing_pipeline"
+
+
+def _loss_weights_from_cfg(best_cfg: Any) -> dict[str, float]:
+    raw = getattr(best_cfg, "loss_weights", None)
+    if raw is None:
+        return {}
+    if OmegaConf.is_config(raw):
+        raw = OmegaConf.to_container(raw, resolve=True)
+    return {str(k): float(v) for k, v in dict(raw).items()}
+
+
+def _load_section_per_sample_metrics(section_dir: Path) -> pd.DataFrame:
+    """Merge per-sample metric CSVs for one section into a wide table."""
+    frames: list[pd.DataFrame] = []
+
+    mmd_path = section_dir / "mmd_per_sample.csv"
+    if mmd_path.exists():
+        frames.append(pd.read_csv(mmd_path))
+
+    ch_path = section_dir / "ch_voronoi_losses_per_sample.csv"
+    if ch_path.exists():
+        frames.append(pd.read_csv(ch_path))
+
+    grid_path = section_dir / "grid_transcript_per_sample.csv"
+    if grid_path.exists():
+        frames.append(pd.read_csv(grid_path))
+
+    scalar_path = section_dir / "scalar_losses_per_sample.csv"
+    if scalar_path.exists():
+        long_df = pd.read_csv(scalar_path)
+        if not long_df.empty and {"sample_index", "metric", "value"}.issubset(
+            long_df.columns
+        ):
+            wide = (
+                long_df.pivot_table(
+                    index="sample_index",
+                    columns="metric",
+                    values="value",
+                    aggfunc="first",
+                )
+                .reset_index()
+            )
+            wide.columns.name = None
+            frames.append(wide)
+
+    if not frames:
+        return pd.DataFrame()
+
+    out = frames[0].copy()
+    for frame in frames[1:]:
+        overlap = [c for c in frame.columns if c in out.columns and c != "sample_index"]
+        frame = frame.drop(columns=overlap, errors="ignore")
+        out = out.merge(frame, on="sample_index", how="outer")
+    return out.sort_values("sample_index").reset_index(drop=True)
+
+
+def _weighted_seed_scores(
+    metrics_df: pd.DataFrame,
+    weights: dict[str, float],
+) -> pd.DataFrame:
+    """Score each sample; lower is better. Higher-is-better metrics are negated."""
+    active: list[tuple[str, float]] = []
+    for metric, weight in weights.items():
+        w = float(weight)
+        if abs(w) <= 0.0:
+            continue
+        if metric not in metrics_df.columns:
+            print(
+                f"[testing_pipeline] best-prediction weight for {metric!r} "
+                "ignored (metric missing in per-sample CSVs)."
+            )
+            continue
+        active.append((metric, w))
+
+    rows: list[dict[str, Any]] = []
+    for _, row in metrics_df.iterrows():
+        sample_index = int(row["sample_index"])
+        score = 0.0
+        ok = True
+        breakdown: dict[str, float] = {}
+        for metric, weight in active:
+            val = float(row[metric])
+            breakdown[metric] = val
+            if not np.isfinite(val):
+                ok = False
+                continue
+            if metric in _HIGHER_IS_BETTER_METRICS:
+                score += -weight * val
+            else:
+                score += weight * val
+        rows.append({
+            "sample_index": sample_index,
+            "weighted_score": float(score) if ok else float("inf"),
+            "score_valid": bool(ok and bool(active)),
+            **{f"metric__{k}": v for k, v in breakdown.items()},
+        })
+    return pd.DataFrame(rows)
+
+
+def _pick_best_sample_row(score_df: pd.DataFrame) -> Optional[pd.Series]:
+    if score_df.empty:
+        return None
+    valid = score_df[score_df["score_valid"].astype(bool)]
+    if valid.empty:
+        return None
+    return valid.loc[valid["weighted_score"].idxmin()]
+
+
+def _align_single_prediction_np(
+    pred_xy: np.ndarray,
+    gt_xy: np.ndarray,
+    cell_class_int: np.ndarray,
+    procrustes_cfg: Any,
+    device: Any,
+) -> np.ndarray:
+    pred_t = torch.as_tensor(
+        np.asarray(pred_xy, dtype=np.float32), dtype=torch.float32, device=device
+    )
+    gt_t = torch.as_tensor(
+        np.asarray(gt_xy, dtype=np.float32), dtype=torch.float32, device=device
+    )
+    labels_t = torch.as_tensor(
+        np.asarray(cell_class_int), dtype=torch.long, device=device
+    )
+    with torch.no_grad():
+        aligned = align_samples_to_gt_procrustes_torch(
+            pred_t.unsqueeze(0),
+            gt_t,
+            labels_t,
+            procrustes_cfg=procrustes_cfg,
+        )
+    return aligned[0].detach().cpu().numpy().astype(np.float32)
+
+
+def plot_slice_best_predictions_scatter(
+    gt_df: pd.DataFrame,
+    model_panels: list[tuple[str, str, pd.DataFrame]],
+    save_path: Path,
+    *,
+    title: str,
+) -> None:
+    """One figure per slice: GT once, then each model's best prediction.
+
+    ``model_panels`` entries are ``(panel_title, panel_subtitle, pred_df)``.
+    Uses the same glasbey class palette as ``metrics.test_evaluation_plot``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    from metrics.test_evaluation_plot import COLOR_PALETTE
+
+    if not model_panels:
+        raise ValueError("model_panels must be non-empty")
+
+    all_class_vals = list(gt_df["cell_class"].astype(str))
+    for _, _, pred_df in model_panels:
+        all_class_vals.extend(pred_df["cell_class"].astype(str).tolist())
+    classes = sorted(set(all_class_vals))
+    pl_palette = sns.color_palette(COLOR_PALETTE, n_colors=max(len(classes), 1))
+    palette_dict = dict(zip(classes, pl_palette))
+
+    n_panels = 1 + len(model_panels)
+    # Prefer a single row when few models; wrap otherwise.
+    n_cols = min(n_panels, 4)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig_w = 4.2 * n_cols
+    fig_h = 4.4 * n_rows
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(fig_w, fig_h),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    flat_axes = axes.ravel()
+
+    panels: list[tuple[str, str, pd.DataFrame]] = [
+        ("Ground truth", "", gt_df),
+        *model_panels,
+    ]
+
+    xs_parts = [gt_df["coord_X"].to_numpy()]
+    ys_parts = [gt_df["coord_Y"].to_numpy()]
+    for _, _, pred_df in model_panels:
+        xs_parts.append(pred_df["coord_X"].to_numpy())
+        ys_parts.append(pred_df["coord_Y"].to_numpy())
+    xs = np.concatenate(xs_parts)
+    ys = np.concatenate(ys_parts)
+    pad_x = 0.02 * max(float(xs.max() - xs.min()), 1e-6)
+    pad_y = 0.02 * max(float(ys.max() - ys.min()), 1e-6)
+    xlim = (float(xs.min()) - pad_x, float(xs.max()) + pad_x)
+    ylim = (float(ys.min()) - pad_y, float(ys.max()) + pad_y)
+
+    for ax_idx, ax in enumerate(flat_axes):
+        if ax_idx >= n_panels:
+            ax.axis("off")
+            continue
+        panel_title, panel_subtitle, data = panels[ax_idx]
+        sns.scatterplot(
+            data=data,
+            x="coord_X",
+            y="coord_Y",
+            hue="cell_class",
+            hue_order=classes,
+            palette=palette_dict,
+            s=15,
+            linewidth=0,
+            ax=ax,
+            legend=False,
+        )
+        full_title = panel_title if not panel_subtitle else f"{panel_title}\n{panel_subtitle}"
+        ax.set_title(full_title, fontsize=11)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+    legend_handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=palette_dict[c],
+            markersize=7,
+            label=c,
+        )
+        for c in classes
+    ]
+    ncol = max(1, min(6, (len(classes) + 3) // 4))
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=ncol,
+        bbox_to_anchor=(0.5, -0.02),
+        frameon=False,
+        fontsize=8,
+    )
+    fig.suptitle(title, fontsize=14, fontweight="semibold", y=1.02)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, bbox_inches="tight", dpi=200)
+    plt.close(fig)
+
+
+def _load_best_aligned_prediction_for_section(
+    *,
+    section_dir: Path,
+    sample_index: int,
+    procrustes_cfg: Any,
+    device: Any,
+) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[None, None]:
+    """Return ``(gt_plot_df, aligned_pred_plot_df)`` for one sample, or ``(None, None)``."""
+    pred_csv = section_dir / "predictions.csv"
+    gt_csv = section_dir / "ground_truth.csv"
+    if not pred_csv.exists() or not gt_csv.exists():
+        return None, None
+
+    pred_all = pd.read_csv(pred_csv)
+    gt_df = pd.read_csv(gt_csv)
+    pred_s = pred_all[pred_all["sample_index"] == sample_index].copy()
+    if pred_s.empty:
+        return None, None
+
+    if "cell_ID" in gt_df.columns and "cell_ID" in pred_s.columns:
+        gt_ids = gt_df["cell_ID"].astype(str)
+        pred_s["cell_ID"] = pred_s["cell_ID"].astype(str)
+        pred_s = pred_s.set_index("cell_ID").reindex(gt_ids).reset_index()
+        if pred_s[["coord_X", "coord_Y"]].isna().any().any():
+            return None, None
+
+    pred_xy = pred_s[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+    gt_xy = gt_df[["coord_X", "coord_Y"]].to_numpy(dtype=np.float32)
+    labels = gt_df["cell_class_int"].to_numpy()
+    classes = gt_df["cell_class"].astype(str).tolist()
+    aligned_xy = _align_single_prediction_np(
+        pred_xy, gt_xy, labels, procrustes_cfg, device
+    )
+    pred_plot = pd.DataFrame(
+        {
+            "coord_X": aligned_xy[:, 0],
+            "coord_Y": aligned_xy[:, 1],
+            "cell_class": classes,
+        }
+    )
+    gt_plot = gt_df[["coord_X", "coord_Y", "cell_class"]].copy()
+    gt_plot["cell_class"] = gt_plot["cell_class"].astype(str)
+    return gt_plot, pred_plot
+
+
+def plot_best_predictions_for_models(
+    cfg: DictConfig,
+    checkpoint_paths: list[Path],
+    output_dirs: list[Path],
+) -> Optional[Path]:
+    """Select best seed per model×slice; one PNG per slice (GT once + models).
+
+    Writes under ``{testing_pipeline}/best_predictions/``, next to the
+    checkpoint comparison artefacts. No-op when disabled or no slices set.
+    """
+    pipe_cfg = cfg.test.pipeline
+    best_cfg = getattr(pipe_cfg, "best_prediction_plots", None)
+    if best_cfg is None or not bool(getattr(best_cfg, "enabled", False)):
+        return None
+
+    sections_raw = getattr(best_cfg, "cell_sections", None)
+    if not sections_raw:
+        print("[testing_pipeline] best_prediction_plots enabled but no cell_sections.")
+        return None
+    cell_sections = [str(s) for s in list(sections_raw)]
+    weights = _loss_weights_from_cfg(best_cfg)
+    if not any(abs(w) > 0.0 for w in weights.values()):
+        print("[testing_pipeline] best_prediction_plots: all loss_weights are 0; skip.")
+        return None
+
+    parent_dir = _testing_pipeline_parent_dir(cfg, checkpoint_paths)
+    out_dir = parent_dir / "best_predictions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    display_names = resolve_checkpoint_display_names(cfg, checkpoint_paths)
+    procrustes_cfg = getattr(pipe_cfg, "procrustes", None)
+    device = resolve_inference_devices(cfg, str(pipe_cfg.device))[0]
+    seed_start = int(pipe_cfg.seed_start)
+
+    selection_rows: list[dict[str, Any]] = []
+    print(
+        f"[testing_pipeline] Best-prediction plots → {out_dir} "
+        f"(sections={cell_sections})"
+    )
+
+    for cell_section in cell_sections:
+        gt_plot: Optional[pd.DataFrame] = None
+        model_panels: list[tuple[str, str, pd.DataFrame]] = []
+
+        for checkpoint_path, output_dir, model_name in zip(
+            checkpoint_paths, output_dirs, display_names
+        ):
+            section_dir = (
+                Path(output_dir) / "sections" / _safe_section_dirname(cell_section)
+            )
+            metrics_df = _load_section_per_sample_metrics(section_dir)
+            if metrics_df.empty:
+                print(
+                    f"[testing_pipeline] No per-sample metrics for "
+                    f"{model_name!r} / {cell_section!r}; skip."
+                )
+                continue
+
+            score_df = _weighted_seed_scores(metrics_df, weights)
+            best_row = _pick_best_sample_row(score_df)
+            if best_row is None:
+                print(
+                    f"[testing_pipeline] No valid weighted score for "
+                    f"{model_name!r} / {cell_section!r}; skip."
+                )
+                continue
+
+            sample_index = int(best_row["sample_index"])
+            score = float(best_row["weighted_score"])
+            seed = seed_start + sample_index
+
+            gt_i, pred_plot = _load_best_aligned_prediction_for_section(
+                section_dir=section_dir,
+                sample_index=sample_index,
+                procrustes_cfg=procrustes_cfg,
+                device=device,
+            )
+            if gt_i is None or pred_plot is None:
+                print(
+                    f"[testing_pipeline] Could not load/align best sample for "
+                    f"{model_name!r} / {cell_section!r}; skip."
+                )
+                continue
+
+            if gt_plot is None:
+                gt_plot = gt_i
+
+            panel_subtitle = f"seed={seed}  score={score:.4g}"
+            model_panels.append((model_name, panel_subtitle, pred_plot))
+
+            selection_rows.append({
+                "model": model_name,
+                "checkpoint": str(checkpoint_path),
+                "cell_section": cell_section,
+                "sample_index": sample_index,
+                "seed": seed,
+                "weighted_score": score,
+                "png": str(out_dir / f"{_safe_section_dirname(cell_section)}.png"),
+                **{
+                    m: float(best_row[f"metric__{m}"])
+                    if f"metric__{m}" in best_row.index
+                    else float("nan")
+                    for m, w in weights.items()
+                    if abs(float(w)) > 0.0
+                },
+            })
+
+        if gt_plot is None or not model_panels:
+            print(
+                f"[testing_pipeline] No models available for slice "
+                f"{cell_section!r}; skip plot."
+            )
+            continue
+
+        save_path = out_dir / f"{_safe_section_dirname(cell_section)}.png"
+        plot_slice_best_predictions_scatter(
+            gt_plot,
+            model_panels,
+            save_path,
+            title=f"Best predictions  ·  {cell_section}",
+        )
+        print(f"[testing_pipeline] Saved best-prediction plot → {save_path}")
+
+    if selection_rows:
+        sel_csv = out_dir / "best_prediction_selection.csv"
+        pd.DataFrame(selection_rows).to_csv(sel_csv, index=False)
+        print(f"[testing_pipeline] Saved best-prediction selection → {sel_csv}")
+    return out_dir
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Cross-checkpoint comparison
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _checkpoint_label(checkpoint_path: Path) -> str:
     return _checkpoint_output_id(checkpoint_path)
+
+
+def resolve_checkpoint_display_names(
+    cfg: DictConfig,
+    checkpoint_paths: list[Path],
+) -> list[str]:
+    """Pretty model names for comparison plots (parallel to ``checkpoint_paths``).
+
+    Uses ``test.checkpoint_display_names`` when provided (same length/order as
+    the resolved checkpoint list). Falls back to a short auto label built from
+    the run folder + checkpoint stem.
+    """
+    raw = getattr(cfg.test, "checkpoint_display_names", None)
+    if raw is not None:
+        names = [str(x) for x in list(raw)]
+        if len(names) != len(checkpoint_paths):
+            raise ValueError(
+                f"test.checkpoint_display_names has {len(names)} entries but "
+                f"{len(checkpoint_paths)} checkpoints were resolved; "
+                "lists must match in order and length."
+            )
+        return names
+    return [_checkpoint_label(p) for p in checkpoint_paths]
 
 
 def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | None]:
@@ -2208,30 +2821,32 @@ def _load_checkpoint_summaries(output_dir: Path) -> dict[str, pd.DataFrame | Non
     }
 
 
+def _section_rows(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Drop the aggregate ``ALL`` row from a per-section summary table."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "cell_section" not in df.columns:
+        return df.copy()
+    return df[df["cell_section"].astype(str) != "ALL"].copy()
+
+
 def _collect_checkpoint_comparison(
     checkpoint_paths: list[Path],
     output_dirs: list[Path],
+    display_names: list[str],
     *,
     include_directional: bool = True,
     include_position_mse: bool = True,
 ) -> pd.DataFrame:
-    """Collapse every metric to one scalar per checkpoint into a long table.
+    """Long table of per-slice metric values for each model.
 
-    Returns a DataFrame with columns ``checkpoint``, ``metric``, ``value`` where
-    each row is a single benchmark number for one checkpoint (no cell-type / no
-    per-section split). Metrics (in fixed display order):
-
-      * ``position_mse`` (if enabled)
-      * ``directional_length`` / ``directional_pairwise`` (if enabled)
-      * ``transcriptome_multi_radius`` (always)
-      * ``ch_energy_curve_loss``
-      * ``voronoi_phase_pair_ch_energy_loss``
-      * ``mmd_whole_slice_global`` / ``mmd_whole_slice_per_class``
-      * ``mmd_pair_dist_global`` / ``mmd_pair_dist_per_class``
-      * ``mmd_spatial_global`` / ``mmd_spatial_per_class``
-      * ``cross_sample_spread``
-      * ``grid_transcript_diff`` / ``grid_transcript_soft_spearman``
+    Each row is one ``(model, metric, cell_section)`` after averaging over
+    denoising seeds within that slice — **not** collapsed across slices.
+    Columns: ``model``, ``checkpoint``, ``cell_section``, ``metric``, ``value``.
     """
+    if len(display_names) != len(checkpoint_paths):
+        raise ValueError("display_names must match checkpoint_paths length")
+
     order = []
     if include_position_mse:
         order.append("position_mse")
@@ -2241,12 +2856,9 @@ def _collect_checkpoint_comparison(
     order.extend([
         "ch_energy_curve_loss",
         "voronoi_phase_pair_ch_energy_loss",
-        "mmd_whole_slice_global",
-        "mmd_whole_slice_per_class",
-        "mmd_pair_dist_global",
-        "mmd_pair_dist_per_class",
-        "mmd_spatial_global",
-        "mmd_spatial_per_class",
+        "mmd_whole_slice",
+        "mmd_pair_dist",
+        "mmd_spatial",
         "cross_sample_spread",
         "grid_transcript_diff",
         "grid_transcript_soft_spearman",
@@ -2259,97 +2871,125 @@ def _collect_checkpoint_comparison(
         allowed_scalar.update({"directional_length", "directional_pairwise"})
 
     rows: list[dict[str, Any]] = []
-    for ckpt, out_dir in zip(checkpoint_paths, output_dirs):
-        label = _checkpoint_label(ckpt)
+    for ckpt, out_dir, model in zip(checkpoint_paths, output_dirs, display_names):
+        ckpt_id = _checkpoint_label(ckpt)
         loaded = _load_checkpoint_summaries(out_dir)
 
-        m = loaded.get("mmd")
-        if m is not None and not m.empty:
-            if "cell_section" in m.columns:
-                all_rows = m[m["cell_section"] == "ALL"]
-            else:
-                all_rows = m
-            if all_rows.empty:
-                all_rows = m
-            for metric in (
-                "mmd_whole_slice_global",
-                "mmd_whole_slice_per_class",
-                "mmd_pair_dist_global",
-                "mmd_pair_dist_per_class",
-                "mmd_spatial_global",
-                "mmd_spatial_per_class",
-            ):
-                col = f"{metric}_mean"
-                if col in all_rows.columns:
-                    rows.append({
-                        "checkpoint": label,
-                        "metric": metric,
-                        "value": float(all_rows[col].mean()),
-                    })
+        m = _section_rows(loaded.get("mmd"))
+        if not m.empty:
+            for _, r in m.iterrows():
+                section = str(r.get("cell_section", "unknown"))
+                for metric in ("mmd_whole_slice", "mmd_pair_dist", "mmd_spatial"):
+                    col = f"{metric}_mean"
+                    if col in m.columns and pd.notna(r.get(col)):
+                        rows.append({
+                            "model": model,
+                            "checkpoint": ckpt_id,
+                            "cell_section": section,
+                            "metric": metric,
+                            "value": float(r[col]),
+                        })
 
-        cv = loaded.get("ch_voronoi")
-        if cv is not None and not cv.empty:
-            if "cell_section" in cv.columns:
-                all_rows = cv[cv["cell_section"] == "ALL"]
-            else:
-                all_rows = cv
-            if all_rows.empty:
-                all_rows = cv
-            rows.append({"checkpoint": label, "metric": "ch_energy_curve_loss",
-                         "value": float(all_rows["ch_energy_curve_loss_mean"].mean())})
-            rows.append({"checkpoint": label, "metric": "voronoi_phase_pair_ch_energy_loss",
-                         "value": float(all_rows["voronoi_phase_pair_ch_energy_loss_mean"].mean())})
+        cv = _section_rows(loaded.get("ch_voronoi"))
+        if not cv.empty:
+            for _, r in cv.iterrows():
+                section = str(r.get("cell_section", "unknown"))
+                for metric in (
+                    "ch_energy_curve_loss",
+                    "voronoi_phase_pair_ch_energy_loss",
+                ):
+                    col = f"{metric}_mean"
+                    if col in cv.columns and pd.notna(r.get(col)):
+                        rows.append({
+                            "model": model,
+                            "checkpoint": ckpt_id,
+                            "cell_section": section,
+                            "metric": metric,
+                            "value": float(r[col]),
+                        })
 
         sp = loaded.get("spread")
         if sp is not None and not sp.empty:
-            rows.append({"checkpoint": label, "metric": "cross_sample_spread",
-                         "value": float(sp["mean_cross_sample_spread"].mean())})
+            for _, r in sp.iterrows():
+                section = str(r.get("cell_section", "unknown"))
+                if "mean_cross_sample_spread" in sp.columns and pd.notna(
+                    r.get("mean_cross_sample_spread")
+                ):
+                    rows.append({
+                        "model": model,
+                        "checkpoint": ckpt_id,
+                        "cell_section": section,
+                        "metric": "cross_sample_spread",
+                        "value": float(r["mean_cross_sample_spread"]),
+                    })
 
         sl = loaded.get("scalar_losses")
         if sl is not None and not sl.empty:
-            for metric, sub in sl.groupby("metric"):
-                metric_name = str(metric)
+            section_col = (
+                "cell_section" if "cell_section" in sl.columns
+                else ("section" if "section" in sl.columns else None)
+            )
+            for _, r in sl.iterrows():
+                metric_name = str(r["metric"])
                 if metric_name not in allowed_scalar:
                     continue
-                rows.append({"checkpoint": label, "metric": metric_name,
-                             "value": float(sub["mean"].mean())})
-
-        gt_tx = loaded.get("grid_transcript")
-        if gt_tx is not None and not gt_tx.empty:
-            if "cell_section" in gt_tx.columns:
-                all_rows = gt_tx[gt_tx["cell_section"] == "ALL"]
-            else:
-                all_rows = gt_tx
-            if all_rows.empty:
-                all_rows = gt_tx
-            for metric in ("grid_transcript_diff", "grid_transcript_soft_spearman"):
-                col = f"{metric}_mean"
-                if col in all_rows.columns:
+                section = "unknown" if section_col is None else str(r[section_col])
+                if pd.notna(r.get("mean")):
                     rows.append({
-                        "checkpoint": label,
-                        "metric": metric,
-                        "value": float(all_rows[col].mean()),
+                        "model": model,
+                        "checkpoint": ckpt_id,
+                        "cell_section": section,
+                        "metric": metric_name,
+                        "value": float(r["mean"]),
                     })
 
-    df = pd.DataFrame.from_records(rows, columns=["checkpoint", "metric", "value"])
+        gt_tx = _section_rows(loaded.get("grid_transcript"))
+        if not gt_tx.empty:
+            for _, r in gt_tx.iterrows():
+                section = str(r.get("cell_section", "unknown"))
+                for metric in (
+                    "grid_transcript_diff",
+                    "grid_transcript_soft_spearman",
+                ):
+                    col = f"{metric}_mean"
+                    if col in gt_tx.columns and pd.notna(r.get(col)):
+                        rows.append({
+                            "model": model,
+                            "checkpoint": ckpt_id,
+                            "cell_section": section,
+                            "metric": metric,
+                            "value": float(r[col]),
+                        })
+
+    df = pd.DataFrame.from_records(
+        rows,
+        columns=["model", "checkpoint", "cell_section", "metric", "value"],
+    )
     if df.empty:
         return df
-    # Drop any metrics not in the canonical order, then sort by it.
     df = df[df["metric"].isin(order)].copy()
     df["_order"] = df["metric"].map({m: i for i, m in enumerate(order)})
-    df = df.sort_values(["_order", "checkpoint"]).drop(columns=["_order"]).reset_index(drop=True)
+    model_order = {name: i for i, name in enumerate(display_names)}
+    df["_model_order"] = df["model"].map(model_order)
+    df = (
+        df.sort_values(["_order", "_model_order", "cell_section"])
+        .drop(columns=["_order", "_model_order"])
+        .reset_index(drop=True)
+    )
     return df
+
+
+# Metrics where larger values are better; everything else is minimize.
+_HIGHER_IS_BETTER_METRICS: frozenset[str] = frozenset({
+    "grid_transcript_soft_spearman",
+})
 
 
 def _save_combined_comparison_csv(
     comparison: pd.DataFrame,
     save_path: Path,
 ) -> None:
-    """Write the unified long checkpoint-comparison table to CSV.
-
-    Columns: checkpoint, metric, value, normalized (per-metric min-max across
-    checkpoints; kept for convenience in the CSV, not used by the PNG plot).
-    """
+    """Write the per-slice checkpoint-comparison table to CSV."""
     save_path.parent.mkdir(parents=True, exist_ok=True)
     if comparison.empty:
         with save_path.open("w") as fh:
@@ -2359,15 +2999,13 @@ def _save_combined_comparison_csv(
 
     df = comparison.copy()
     df["normalized_score"] = np.nan
-    # Soft Spearman correlation is higher-is-better; everything else is lower-is-better.
-    higher_is_better = {"grid_transcript_soft_spearman"}
     for metric, sub in df.groupby("metric"):
         vals = sub["value"].to_numpy(dtype=float)
         lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
         denom = hi - lo
         if not np.isfinite(denom) or denom <= 0:
             df.loc[sub.index, "normalized_score"] = 1.0
-        elif str(metric) in higher_is_better:
+        elif str(metric) in _HIGHER_IS_BETTER_METRICS:
             df.loc[sub.index, "normalized_score"] = (vals - lo) / denom
         else:
             df.loc[sub.index, "normalized_score"] = (hi - vals) / denom
@@ -2389,43 +3027,46 @@ def _comparison_panels(
         panels.append(("Directional pairwise", ["directional_pairwise"]))
     panels.append(("Transcriptome multi-radius", ["transcriptome_multi_radius"]))
     panels.extend([
-        (
-            "MMD whole-slice",
-            ["mmd_whole_slice_global", "mmd_whole_slice_per_class"],
-        ),
-        (
-            "MMD pair-dist",
-            ["mmd_pair_dist_global", "mmd_pair_dist_per_class"],
-        ),
-        (
-            "MMD spatial",
-            ["mmd_spatial_global", "mmd_spatial_per_class"],
-        ),
+        ("MMD whole-slice", ["mmd_whole_slice"]),
+        ("MMD pair-dist", ["mmd_pair_dist"]),
+        ("MMD spatial (per-class)", ["mmd_spatial"]),
         (
             "Cahn-Hilliard",
             ["ch_energy_curve_loss", "voronoi_phase_pair_ch_energy_loss"],
         ),
         ("Cross-sample spread", ["cross_sample_spread"]),
-        (
-            "Grid transcript",
-            ["grid_transcript_diff", "grid_transcript_soft_spearman"],
-        ),
+        ("Grid transcript MAE", ["grid_transcript_diff"]),
+        ("Grid transcript Spearman", ["grid_transcript_soft_spearman"]),
     ])
     return panels
 
 
 _COMPARISON_METRIC_LABELS: dict[str, str] = {
-    "mmd_whole_slice_global": "global ICP",
-    "mmd_whole_slice_per_class": "per-class ICP",
-    "mmd_pair_dist_global": "global ICP",
-    "mmd_pair_dist_per_class": "per-class ICP",
-    "mmd_spatial_global": "global ICP",
-    "mmd_spatial_per_class": "per-class ICP",
+    "mmd_whole_slice": "whole-slice",
+    "mmd_pair_dist": "pair-dist",
+    "mmd_spatial": "spatial (per-class)",
     "ch_energy_curve_loss": "CH energy",
     "voronoi_phase_pair_ch_energy_loss": "Voronoi phase",
-    "grid_transcript_diff": "count MAE",
+    "grid_transcript_diff": "soft weighted-sum MAE",
     "grid_transcript_soft_spearman": "soft Spearman",
 }
+
+def _metric_direction_arrow(metric: str) -> str:
+    """↑ = maximize, ↓ = minimize."""
+    return "↑" if str(metric) in _HIGHER_IS_BETTER_METRICS else "↓"
+
+
+def _panel_title_with_arrow(title: str, metrics: list[str]) -> str:
+    """Append minimize/maximize arrow(s) to a panel title."""
+    arrows = [_metric_direction_arrow(m) for m in metrics]
+    if len(set(arrows)) == 1:
+        return f"{title}  {arrows[0]}"
+    # Mixed panel: annotate each metric short-label with its own arrow.
+    parts = [
+        f"{_COMPARISON_METRIC_LABELS.get(m, m)} {_metric_direction_arrow(m)}"
+        for m in metrics
+    ]
+    return f"{title}  ({' · '.join(parts)})"
 
 
 def plot_checkpoint_comparison(
@@ -2435,29 +3076,31 @@ def plot_checkpoint_comparison(
     include_directional: bool = True,
     include_position_mse: bool = True,
 ) -> None:
-    """Bar plot comparing metrics across checkpoints (raw scale).
+    """Large 3-column seaborn violin grid across models (distribution over slices).
 
-    Subplot count follows the enabled scalar flags: position MSE and/or both
-    directional metrics, always-on transcriptome multi-radius, then three MMD
-    panels, Cahn-Hilliard, cross-sample spread, and grid transcript metrics.
+    Each violin is the distribution of per-slice values for one model (seeds
+    already averaged within each slice). Panel titles include ↑ (maximize) or
+    ↓ (minimize). Display names come from the ``model`` column
+    (``test.checkpoint_display_names``).
     """
+    import math
+
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from matplotlib.patches import Patch
 
-    sns.set_theme(style="whitegrid", context="notebook", font_scale=0.95)
+    sns.set_theme(style="whitegrid", context="talk", font_scale=1.05)
     plt.rcParams.update({
         "axes.titleweight": "semibold",
         "axes.labelcolor": "#333333",
         "axes.edgecolor": "#cccccc",
         "grid.color": "#e6e6e6",
-        "grid.linewidth": 0.8,
+        "grid.linewidth": 0.9,
         "legend.framealpha": 0.95,
         "legend.edgecolor": "#dddddd",
-        "figure.facecolor": "#f8f9fb",
+        "figure.facecolor": "#f7f8fb",
         "axes.facecolor": "#ffffff",
     })
 
@@ -2474,173 +3117,325 @@ def plot_checkpoint_comparison(
         print("[testing_pipeline] No checkpoint comparison panels to plot.")
         return
 
-    checkpoints = list(dict.fromkeys(comparison["checkpoint"].tolist()))
-    palette = sns.color_palette("deep", n_colors=max(len(checkpoints), 3))
-    ckpt_colors = {ckpt: palette[i % len(palette)] for i, ckpt in enumerate(checkpoints)}
-
-    raw_vals: dict[tuple[str, str], float] = {}
-    for _, row in comparison.iterrows():
-        raw_vals[(str(row["checkpoint"]), str(row["metric"]))] = float(row["value"])
-
-    fig, axes = plt.subplots(
-        1,
-        len(panels),
-        figsize=(max(12.0, 3.2 * len(panels)), 6.2),
-        facecolor=plt.rcParams["figure.facecolor"],
+    models = list(dict.fromkeys(comparison["model"].tolist()))
+    plot_df = comparison.copy()
+    plot_df["metric_label"] = plot_df["metric"].map(
+        lambda m: (
+            f"{_COMPARISON_METRIC_LABELS.get(str(m), str(m))} "
+            f"{_metric_direction_arrow(str(m))}"
+        )
     )
-    if len(panels) == 1:
-        axes = [axes]
+    plot_df["model"] = pd.Categorical(plot_df["model"], categories=models, ordered=True)
 
-    metric_alphas = (0.95, 0.55)
+    n_panels = len(panels)
+    ncols = 3
+    nrows = int(math.ceil(n_panels / ncols))
+    # Very large canvas so each violin has room; 3×3 ≈ 30×28 inches.
+    fig_w = 10.0 * ncols
+    fig_h = 9.0 * nrows
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(fig_w, fig_h),
+        facecolor=plt.rcParams["figure.facecolor"],
+        squeeze=False,
+    )
+    axes_flat = axes.ravel()
 
-    def _style_axis(ax: plt.Axes, *, show_ylabel: bool) -> None:
+    def _style_axis(ax, *, show_ylabel: bool) -> None:
         sns.despine(ax=ax, left=False, bottom=False)
         ax.set_axisbelow(True)
-        ax.yaxis.grid(True, linestyle="-", alpha=0.7)
+        ax.yaxis.grid(True, linestyle="-", alpha=0.65)
         ax.xaxis.grid(False)
-        ax.tick_params(axis="both", labelsize=8, colors="#444444")
+        ax.tick_params(axis="y", labelsize=12, colors="#444444")
+        ax.tick_params(axis="x", labelsize=11, colors="#333333")
+        ax.set_xlabel("")
         if show_ylabel:
-            ax.set_ylabel("Value", fontsize=9, color="#555555")
+            ax.set_ylabel("Value (per slice)", fontsize=13, color="#555555")
         else:
             ax.set_ylabel("")
 
-    def _annotate_bars(
-        ax: plt.Axes,
-        positions: np.ndarray,
-        heights: np.ndarray,
-        *,
-        fontsize: float,
-    ) -> float:
-        max_height = 0.0
-        for pos, height in zip(positions, heights):
-            if not np.isfinite(height):
-                continue
-            max_height = max(max_height, float(height))
-            ax.text(
-                pos,
-                height,
-                f"{height:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=fontsize,
-                color="#333333",
-                fontweight="medium",
-                bbox={
-                    "boxstyle": "round,pad=0.15",
-                    "facecolor": "white",
-                    "edgecolor": "none",
-                    "alpha": 0.75,
-                },
-            )
-        return max_height
+    def _intense_shade(rgba, factor: float = 0.55):
+        """Darker shade of a face color for edges / mean ticks."""
+        from matplotlib.colors import to_rgb
 
-    for ax, (title, metrics) in zip(axes, panels):
-        available_metrics = [
-            m for m in metrics
-            if any((ckpt, m) in raw_vals for ckpt in checkpoints)
-        ]
-        if not available_metrics:
-            ax.set_title(title, fontsize=11, pad=10)
+        r, g, b = to_rgb(rgba[:3])
+        a = float(rgba[3]) if len(rgba) > 3 else 1.0
+        return (r * factor, g * factor, b * factor, a)
+
+    def _lighten_rgb(rgb, amount: float = 0.38):
+        """Mix with white so two hues of the same model stay distinguishable."""
+        from matplotlib.colors import to_rgb
+
+        r, g, b = to_rgb(rgb[:3])
+        return (
+            r + (1.0 - r) * amount,
+            g + (1.0 - g) * amount,
+            b + (1.0 - b) * amount,
+        )
+
+    def _style_violin_bodies(ax, *, edge_factor: float = 0.52, edge_lw: float = 2.4):
+        """Recolor violin outlines to a deeper shade of each fill (not black)."""
+        from matplotlib.collections import PolyCollection
+
+        body_colors: list = []
+        for coll in ax.collections:
+            if not isinstance(coll, PolyCollection):
+                continue
+            fcs = coll.get_facecolors()
+            if fcs is None or len(fcs) == 0:
+                continue
+            edges = [_intense_shade(fc, edge_factor) for fc in fcs]
+            coll.set_edgecolors(edges)
+            coll.set_linewidth(edge_lw)
+            coll.set_zorder(2)
+            body_colors.append(_intense_shade(fcs[0], edge_factor))
+        return body_colors
+
+    def _recolor_paired_metric_violins(
+        ax,
+        models: list,
+        *,
+        shade_amount: float = 0.38,
+        face_alpha: float = 0.92,
+    ) -> None:
+        """Use deep per-model colors; second metric = slightly lighter shade.
+
+        Assumes seaborn drew PolyCollections in (model, hue) order — one body
+        per (model × metric) for the dodged Cahn–Hilliard panel.
+        """
+        from matplotlib.collections import PolyCollection
+
+        polys = [c for c in ax.collections if isinstance(c, PolyCollection)]
+        deep = sns.color_palette("deep", n_colors=max(len(models), 1))
+        expected = len(models) * 2
+        if len(polys) < expected:
+            return
+        idx = 0
+        for i, _model in enumerate(models):
+            base = deep[i % len(deep)]
+            for shade in (base, _lighten_rgb(base, shade_amount)):
+                polys[idx].set_facecolor((*shade, face_alpha))
+                idx += 1
+
+    def _draw_mean_ticks(
+        ax,
+        sub: pd.DataFrame,
+        *,
+        models: list,
+        body_colors: list,
+        hue_col: str | None = None,
+        hue_order: list | None = None,
+        mean_lw: float = 4.0,
+        tick_half_width: float = 0.18,
+    ) -> None:
+        """Thick horizontal mean tick per violin, colored like its outline."""
+        if hue_col is None or not hue_order or len(hue_order) <= 1:
+            for i, model in enumerate(models):
+                vals = sub.loc[sub["model"] == model, "value"]
+                if vals.empty:
+                    continue
+                m = float(vals.mean())
+                color = body_colors[i] if i < len(body_colors) else "#333333"
+                ax.hlines(
+                    m,
+                    i - tick_half_width,
+                    i + tick_half_width,
+                    colors=[color],
+                    linewidth=mean_lw,
+                    zorder=5,
+                )
+            return
+
+        n_hue = len(hue_order)
+        width = 0.8
+        offsets = np.linspace(-(n_hue - 1) / 2, (n_hue - 1) / 2, n_hue) * (
+            width / max(n_hue, 1)
+        )
+        half = 0.5 * (width / n_hue) * 0.75
+        color_idx = 0
+        for i, model in enumerate(models):
+            for j, hue in enumerate(hue_order):
+                vals = sub.loc[
+                    (sub["model"] == model) & (sub[hue_col] == hue), "value"
+                ]
+                if vals.empty:
+                    continue
+                m = float(vals.mean())
+                color = (
+                    body_colors[color_idx]
+                    if color_idx < len(body_colors)
+                    else "#333333"
+                )
+                color_idx += 1
+                x = float(i + offsets[j])
+                ax.hlines(
+                    m,
+                    x - half,
+                    x + half,
+                    colors=[color],
+                    linewidth=mean_lw,
+                    zorder=5,
+                )
+
+    violin_kwargs = dict(
+        inner=None,  # draw our own thick mean ticks instead of thin quartile lines
+        cut=0,
+        linewidth=0.0,  # edges restyled after draw
+    )
+    try:
+        import inspect
+        sig = inspect.signature(sns.violinplot)
+        if "density_norm" in sig.parameters:
+            violin_kwargs["density_norm"] = "width"
+        else:
+            violin_kwargs["scale"] = "width"
+    except Exception:
+        violin_kwargs["scale"] = "width"
+
+    for idx, ax in enumerate(axes_flat):
+        if idx >= n_panels:
+            ax.set_visible(False)
+            continue
+
+        title, metrics = panels[idx]
+        panel_title = _panel_title_with_arrow(title, metrics)
+        sub = plot_df[plot_df["metric"].isin(metrics)].copy()
+        if sub.empty:
+            ax.set_title(panel_title, fontsize=16, pad=14)
             ax.text(
                 0.5, 0.5, "No data",
                 ha="center", va="center",
                 transform=ax.transAxes,
-                fontsize=10, color="#888888",
+                fontsize=14, color="#888888",
             )
             ax.set_axis_off()
             continue
 
-        n_metrics = len(available_metrics)
-        n_ckpt = len(checkpoints)
-        max_height = 0.0
-
+        n_metrics = len([m for m in metrics if m in set(sub["metric"])])
+        row_i, col_i = divmod(idx, ncols)
         if n_metrics == 1:
-            metric = available_metrics[0]
-            x = np.arange(n_ckpt)
-            heights = np.array(
-                [raw_vals.get((ckpt, metric), np.nan) for ckpt in checkpoints],
-                dtype=float,
+            sns.violinplot(
+                data=sub,
+                x="model",
+                y="value",
+                hue="model",
+                palette="deep",
+                legend=False,
+                ax=ax,
+                **violin_kwargs,
             )
-            positions = x.astype(float)
-            ax.bar(
-                positions,
-                heights,
-                width=0.62,
-                color=[ckpt_colors[ckpt] for ckpt in checkpoints],
-                alpha=0.95,
-                edgecolor="white",
-                linewidth=1.0,
+            body_colors = _style_violin_bodies(ax)
+            _draw_mean_ticks(
+                ax, sub, models=models, body_colors=body_colors, mean_lw=4.2
+            )
+            sns.stripplot(
+                data=sub,
+                x="model",
+                y="value",
+                color="#222222",
+                alpha=0.40,
+                size=5.0,
+                jitter=0.15,
+                ax=ax,
                 zorder=3,
             )
-            ax.set_xticks(x)
-            ax.set_xticklabels(checkpoints, rotation=28, ha="right")
-            max_height = _annotate_bars(ax, positions, heights, fontsize=7.5)
         else:
-            group_width = 0.78
-            bar_w = group_width / n_metrics
-            x = np.arange(n_ckpt)
-            for mi, metric in enumerate(available_metrics):
-                offsets = x + (mi - (n_metrics - 1) / 2) * bar_w
-                heights = np.array(
-                    [raw_vals.get((ckpt, metric), np.nan) for ckpt in checkpoints],
-                    dtype=float,
+            hue_order = [
+                (
+                    f"{_COMPARISON_METRIC_LABELS.get(str(m), str(m))} "
+                    f"{_metric_direction_arrow(str(m))}"
                 )
-                ax.bar(
-                    offsets,
-                    heights,
-                    bar_w,
-                    color=[ckpt_colors[ckpt] for ckpt in checkpoints],
-                    alpha=metric_alphas[mi % len(metric_alphas)],
-                    edgecolor="white",
-                    linewidth=1.0,
-                    label=_COMPARISON_METRIC_LABELS.get(metric, metric),
-                    zorder=3,
-                )
-                max_height = max(
-                    max_height,
-                    _annotate_bars(ax, offsets, heights, fontsize=6.8),
-                )
-            ax.set_xticks(x)
-            ax.set_xticklabels(checkpoints, rotation=28, ha="right")
+                for m in metrics
+                if m in set(sub["metric"].astype(str))
+            ]
+            # Draw with any 2-color palette first; faces are recolored to deep
+            # per-model colors (second metric = lighter shade of the same).
+            sns.violinplot(
+                data=sub,
+                x="model",
+                y="value",
+                hue="metric_label",
+                hue_order=hue_order,
+                palette="deep",
+                dodge=True,
+                ax=ax,
+                **violin_kwargs,
+            )
+            _recolor_paired_metric_violins(ax, models)
+            body_colors = _style_violin_bodies(ax)
+            _draw_mean_ticks(
+                ax,
+                sub,
+                models=models,
+                body_colors=body_colors,
+                hue_col="metric_label",
+                hue_order=hue_order,
+                mean_lw=4.0,
+            )
+            sns.stripplot(
+                data=sub,
+                x="model",
+                y="value",
+                hue="metric_label",
+                hue_order=hue_order,
+                dodge=True,
+                palette="dark:#222222",
+                alpha=0.40,
+                size=4.5,
+                jitter=0.10,
+                ax=ax,
+                legend=False,
+                zorder=3,
+            )
+            from matplotlib.patches import Patch
+
+            legend_base = sns.color_palette("deep", n_colors=1)[0]
+            legend_handles = [
+                Patch(
+                    facecolor=legend_base,
+                    edgecolor=_intense_shade(legend_base)[:3],
+                    linewidth=1.5,
+                    label=hue_order[0],
+                ),
+                Patch(
+                    facecolor=_lighten_rgb(legend_base),
+                    edgecolor=_intense_shade(_lighten_rgb(legend_base))[:3],
+                    linewidth=1.5,
+                    label=hue_order[1] if len(hue_order) > 1 else "alt",
+                ),
+            ]
             ax.legend(
-                fontsize=7,
-                loc="upper right",
+                handles=legend_handles[:n_metrics],
+                fontsize=11,
+                loc="best",
                 title="Metric",
-                title_fontsize=7,
+                title_fontsize=11,
                 frameon=True,
-                handlelength=1.2,
-                handleheight=0.9,
             )
 
-        ax.set_title(title, fontsize=11, pad=10)
-        _style_axis(ax, show_ylabel=(ax is axes[0]))
-        if max_height > 0:
-            ax.set_ylim(0, max_height * 1.22)
+        ax.set_title(panel_title, fontsize=16, pad=14, color="#1a1a1a")
+        ax.set_xticks(range(len(models)))
+        ax.set_xticklabels(models, rotation=25, ha="right")
+        _style_axis(ax, show_ylabel=(col_i == 0))
 
-    handles = [
-        Patch(facecolor=ckpt_colors[ckpt], edgecolor="white", linewidth=0.8, label=ckpt)
-        for ckpt in checkpoints
-    ]
-    fig.legend(
-        handles=handles,
-        loc="upper center",
-        ncol=min(len(checkpoints), 6),
-        bbox_to_anchor=(0.5, 1.03),
-        fontsize=9,
-        title="Checkpoint",
-        title_fontsize=9,
-        frameon=True,
-        columnspacing=1.4,
-        handletextpad=0.6,
-    )
     fig.suptitle(
-        "Model benchmark — metrics comparison across checkpoints",
-        y=1.10,
-        fontsize=14,
+        "Model benchmark — per-slice metric distributions\n"
+        "↑ higher is better   ·   ↓ lower is better",
+        y=0.995,
+        fontsize=22,
         fontweight="bold",
         color="#222222",
+        linespacing=1.35,
     )
-    fig.subplots_adjust(top=0.80, wspace=0.30, left=0.04, right=0.99, bottom=0.18)
+    fig.subplots_adjust(
+        top=0.92,
+        bottom=0.07,
+        left=0.06,
+        right=0.98,
+        wspace=0.28,
+        hspace=0.38,
+    )
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, bbox_inches="tight", dpi=220, facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -2652,24 +3447,23 @@ def compare_checkpoints(
     checkpoint_paths: list[Path],
     output_dirs: list[Path],
 ) -> Path:
-    """Load every checkpoint's summaries and write a combined CSV + comparison PNG.
+    """Load every checkpoint's summaries and write a combined CSV + violin PNG.
 
     Artefacts are written into the shared ``testing_pipeline`` parent
     directory (the common ancestor of all per-checkpoint output dirs).
     """
-    base = cfg.test.save_dir
-    if base is None:
-        base = str(checkpoint_paths[0].parent)
-    parent_dir = Path(base) / cfg.general.name / "testing_pipeline"
+    parent_dir = _testing_pipeline_parent_dir(cfg, checkpoint_paths)
     parent_dir.mkdir(parents=True, exist_ok=True)
 
     scalar_cfg = cfg.test.pipeline.scalar_losses_analysis
     include_directional = bool(getattr(scalar_cfg, "compute_directional", True))
     include_position_mse = bool(getattr(scalar_cfg, "compute_position_mse", True))
+    display_names = resolve_checkpoint_display_names(cfg, checkpoint_paths)
 
     combined = _collect_checkpoint_comparison(
         checkpoint_paths,
         output_dirs,
+        display_names,
         include_directional=include_directional,
         include_position_mse=include_position_mse,
     )
