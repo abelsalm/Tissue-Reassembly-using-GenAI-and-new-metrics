@@ -1,0 +1,26 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+wandb: WARNING Symlinked 1 file into the W&B run directory; call wandb.save again to sync new files.
+[ct_train] wandb: project=cell_types name=exp008_xl_capacity mode=online url=https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types/runs/pgw1pscx
+[ct_train] parameters: total=2,398,620 trainable=2,398,620
+  [params] mlp_in_node_features: 65,664
+  [params] transformer_layers: 1,684,992
+  [params] type_stage1: 37,728
+  [params] env_stage1: 123,968
+  [params] type_probe: 2,231
+  [params] env_probe: 7,383
+  [params] fusion_mlp: 305,344
+  [params] type_stage2: 39,959
+  [params] env_stage2: 131,351
+[ct_train] scheduler=cosine_warmup warmup_epochs=10 min_lr=1e-06
+Traceback (most recent call last):
+  File "/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/ct_train.py", line 1128, in <module>
+    main()
+  File "/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/ct_train.py", line 845, in main
+    if use_ema:
+UnboundLocalError: local variable 'use_ema' referenced before assignment
+Traceback (most recent call last):
+  File "/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/ct_train.py", line 1128, in <module>
+    main()
+  File "/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/ct_train.py", line 845, in main
+    if use_ema:
+UnboundLocalError: local variable 'use_ema' referenced before assignment

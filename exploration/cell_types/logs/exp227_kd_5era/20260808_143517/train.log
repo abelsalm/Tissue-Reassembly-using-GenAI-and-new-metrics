@@ -1,0 +1,479 @@
+[ct_train] config=exploration/cell_types/experiments/configs/exp227_kd_5era.json
+[ct_train] device=cuda  checkpoints=/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp227_kd_5era
+[ct_train] logs=/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/logs/exp227_kd_5era/20260808_143517
+[ct_train] Loading data …
+[DataModule] Reading '/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_train.csv' (split=train) with float32 dtype on 254 gene cols + coord cols …
+[DataModule] Loaded 158,379 rows for split=train.
+[DataModule] Reading '/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv' (split=test) with float32 dtype on 254 gene cols + coord cols …
+[DataModule] Loaded 118,036 rows for split=test.
+[DataModule] Reading '/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv' (split=validation) with float32 dtype on 254 gene cols + coord cols …
+[DataModule] Loaded 118,036 rows for split=validation.
+[ct_train] genes=254  classes=23
+[ct_train] model predict_cme=True  params=1,305,308
+[ct_train] initialized student from /home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp196_kd_191_157_159/best.pt
+[ct_train] teacher loaded: /home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp196_kd_191_157_159/best.pt
+[ct_train] teacher loaded: /home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp157_cls_w09/best.pt
+[ct_train] teacher loaded: /home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp135_ls006_aux017/best.pt
+[ct_train] distillation ON: n_teachers=3 hard_w=0.25 kd_cls=2.0 kd_cme=2.5 T=1.75
+[ct_train] soft CME loaded split=train sigma=96.0 n=158379 C=23
+[ct_train] soft CME loaded split=validation sigma=96.0 n=118036 C=23
+[ct_train] soft CME loaded split=train sigma=50.0 n=158379 C=23
+[ct_train] soft CME loaded split=train sigma=64.0 n=158379 C=23
+[ct_train] soft CME loaded split=validation sigma=50.0 n=118036 C=23
+[ct_train] soft CME loaded split=validation sigma=64.0 n=118036 C=23
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/abel/.netrc.
+wandb: Currently logged in as: abel-salmona (abel-salmona-polytechnique-montr-al) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.26.1
+wandb: Run data is saved locally in /home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/logs/exp227_kd_5era/20260808_143517/wandb/run-20260808_143526-u9mn6uw5
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run exp227_kd_5era
+wandb:  View project at https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types
+wandb:  View run at https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types/runs/u9mn6uw5
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+wandb: WARNING Symlinked 1 file into the W&B run directory; call wandb.save again to sync new files.
+[ct_train] wandb: project=cell_types name=exp227_kd_5era mode=online url=https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types/runs/u9mn6uw5
+[ct_train] parameters: total=1,305,308 trainable=1,305,308
+  [params] mlp_in_node_features: 26,720
+  [params] transformer_layers: 633,600
+  [params] type_stage1: 28,320
+  [params] env_stage1: 93,056
+  [params] type_probe: 2,231
+  [params] env_probe: 7,383
+  [params] fusion_mlp: 383,008
+  [params] type_stage2: 30,551
+  [params] env_stage2: 100,439
+[ct_train] EMA enabled decay=0.98
+[ct_train] rechunked train graphs (seed=1)
+
+=== Epoch 1/1000 ===
+[train] loss=6.7619 cls=0.4412 cme=2.1431 acc=0.9877 cells=158379 kd=5.4924
+[ct_train] rechunked train graphs (seed=2)
+
+=== Epoch 2/1000 ===
+[train] loss=6.7428 cls=0.4408 cme=2.1361 acc=0.9875 cells=158379 kd=5.4772
+[val]   loss=5.2221 eval=2.6045 cls=0.4046 cme=2.1999 acc=0.9764 cells=118036
+[ct_train] saved best checkpoint (val_eval_loss=2.6045 val_acc=0.9764)
+[ct_train] rechunked train graphs (seed=3)
+
+=== Epoch 3/1000 ===
+[train] loss=6.7427 cls=0.4412 cme=2.1362 acc=0.9876 cells=158379 kd=5.4770
+[ct_train] rechunked train graphs (seed=4)
+
+=== Epoch 4/1000 ===
+[train] loss=6.7488 cls=0.4410 cme=2.1379 acc=0.9875 cells=158379 kd=5.4822
+[val]   loss=5.2222 eval=2.6046 cls=0.4046 cme=2.2000 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 1/40 val checks
+[ct_train] rechunked train graphs (seed=5)
+
+=== Epoch 5/1000 ===
+[train] loss=6.7612 cls=0.4413 cme=2.1414 acc=0.9877 cells=158379 kd=5.4926
+[ct_train] rechunked train graphs (seed=6)
+
+=== Epoch 6/1000 ===
+[train] loss=6.7558 cls=0.4411 cme=2.1406 acc=0.9876 cells=158379 kd=5.4877
+[val]   loss=5.2225 eval=2.6048 cls=0.4046 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 2/40 val checks
+[ct_train] rechunked train graphs (seed=7)
+
+=== Epoch 7/1000 ===
+[train] loss=6.7404 cls=0.4409 cme=2.1359 acc=0.9875 cells=158379 kd=5.4749
+[ct_train] rechunked train graphs (seed=8)
+
+=== Epoch 8/1000 ===
+[train] loss=6.7449 cls=0.4411 cme=2.1365 acc=0.9876 cells=158379 kd=5.4790
+[val]   loss=5.2225 eval=2.6048 cls=0.4046 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 3/40 val checks
+[ct_train] rechunked train graphs (seed=9)
+
+=== Epoch 9/1000 ===
+[train] loss=6.7488 cls=0.4407 cme=2.1380 acc=0.9875 cells=158379 kd=5.4821
+[ct_train] rechunked train graphs (seed=10)
+
+=== Epoch 10/1000 ===
+[train] loss=6.7630 cls=0.4413 cme=2.1423 acc=0.9874 cells=158379 kd=5.4938
+[val]   loss=5.2225 eval=2.6048 cls=0.4046 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 4/40 val checks
+[ct_train] rechunked train graphs (seed=11)
+
+=== Epoch 11/1000 ===
+[train] loss=6.7455 cls=0.4409 cme=2.1375 acc=0.9874 cells=158379 kd=5.4791
+[ct_train] rechunked train graphs (seed=12)
+
+=== Epoch 12/1000 ===
+[train] loss=6.7466 cls=0.4410 cme=2.1380 acc=0.9875 cells=158379 kd=5.4800
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 5/40 val checks
+[ct_train] rechunked train graphs (seed=13)
+
+=== Epoch 13/1000 ===
+[train] loss=6.7482 cls=0.4413 cme=2.1377 acc=0.9873 cells=158379 kd=5.4816
+[ct_train] rechunked train graphs (seed=14)
+
+=== Epoch 14/1000 ===
+[train] loss=6.7614 cls=0.4410 cme=2.1422 acc=0.9877 cells=158379 kd=5.4924
+[val]   loss=5.2224 eval=2.6048 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 6/40 val checks
+[ct_train] rechunked train graphs (seed=15)
+
+=== Epoch 15/1000 ===
+[train] loss=6.7490 cls=0.4411 cme=2.1386 acc=0.9876 cells=158379 kd=5.4820
+[ct_train] rechunked train graphs (seed=16)
+
+=== Epoch 16/1000 ===
+[train] loss=6.7496 cls=0.4416 cme=2.1387 acc=0.9876 cells=158379 kd=5.4824
+[val]   loss=5.2225 eval=2.6048 cls=0.4047 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 7/40 val checks
+[ct_train] rechunked train graphs (seed=17)
+
+=== Epoch 17/1000 ===
+[train] loss=6.7475 cls=0.4411 cme=2.1381 acc=0.9875 cells=158379 kd=5.4808
+[ct_train] rechunked train graphs (seed=18)
+
+=== Epoch 18/1000 ===
+[train] loss=6.7438 cls=0.4407 cme=2.1363 acc=0.9876 cells=158379 kd=5.4782
+[val]   loss=5.2225 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 8/40 val checks
+[ct_train] rechunked train graphs (seed=19)
+
+=== Epoch 19/1000 ===
+[train] loss=6.7490 cls=0.4408 cme=2.1387 acc=0.9875 cells=158379 kd=5.4820
+[ct_train] rechunked train graphs (seed=20)
+
+=== Epoch 20/1000 ===
+[train] loss=6.7475 cls=0.4411 cme=2.1381 acc=0.9876 cells=158379 kd=5.4807
+[val]   loss=5.2226 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 9/40 val checks
+[ct_train] rechunked train graphs (seed=21)
+
+=== Epoch 21/1000 ===
+[train] loss=6.7462 cls=0.4409 cme=2.1382 acc=0.9877 cells=158379 kd=5.4794
+[ct_train] rechunked train graphs (seed=22)
+
+=== Epoch 22/1000 ===
+[train] loss=6.7640 cls=0.4410 cme=2.1429 acc=0.9878 cells=158379 kd=5.4946
+[val]   loss=5.2225 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 10/40 val checks
+[ct_train] rechunked train graphs (seed=23)
+
+=== Epoch 23/1000 ===
+[train] loss=6.7399 cls=0.4405 cme=2.1350 acc=0.9875 cells=158379 kd=5.4750
+[ct_train] rechunked train graphs (seed=24)
+
+=== Epoch 24/1000 ===
+[train] loss=6.7510 cls=0.4412 cme=2.1388 acc=0.9875 cells=158379 kd=5.4838
+[val]   loss=5.2226 eval=2.6048 cls=0.4046 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 11/40 val checks
+[ct_train] rechunked train graphs (seed=25)
+
+=== Epoch 25/1000 ===
+[train] loss=6.7325 cls=0.4406 cme=2.1335 acc=0.9876 cells=158379 kd=5.4684
+[ct_train] rechunked train graphs (seed=26)
+
+=== Epoch 26/1000 ===
+[train] loss=6.7596 cls=0.4409 cme=2.1409 acc=0.9877 cells=158379 kd=5.4914
+[val]   loss=5.2225 eval=2.6048 cls=0.4046 cme=2.2002 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 12/40 val checks
+[ct_train] rechunked train graphs (seed=27)
+
+=== Epoch 27/1000 ===
+[train] loss=6.7309 cls=0.4410 cme=2.1323 acc=0.9876 cells=158379 kd=5.4674
+[ct_train] rechunked train graphs (seed=28)
+
+=== Epoch 28/1000 ===
+[train] loss=6.7416 cls=0.4408 cme=2.1371 acc=0.9875 cells=158379 kd=5.4754
+[val]   loss=5.2224 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 13/40 val checks
+[ct_train] rechunked train graphs (seed=29)
+
+=== Epoch 29/1000 ===
+[train] loss=6.7453 cls=0.4412 cme=2.1369 acc=0.9875 cells=158379 kd=5.4792
+[ct_train] rechunked train graphs (seed=30)
+
+=== Epoch 30/1000 ===
+[train] loss=6.7443 cls=0.4411 cme=2.1359 acc=0.9875 cells=158379 kd=5.4788
+[val]   loss=5.2224 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 14/40 val checks
+[ct_train] rechunked train graphs (seed=31)
+
+=== Epoch 31/1000 ===
+[train] loss=6.7412 cls=0.4407 cme=2.1353 acc=0.9878 cells=158379 kd=5.4761
+[ct_train] rechunked train graphs (seed=32)
+
+=== Epoch 32/1000 ===
+[train] loss=6.7535 cls=0.4408 cme=2.1400 acc=0.9876 cells=158379 kd=5.4858
+[val]   loss=5.2224 eval=2.6048 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 15/40 val checks
+[ct_train] rechunked train graphs (seed=33)
+
+=== Epoch 33/1000 ===
+[train] loss=6.7499 cls=0.4408 cme=2.1390 acc=0.9876 cells=158379 kd=5.4827
+[ct_train] rechunked train graphs (seed=34)
+
+=== Epoch 34/1000 ===
+[train] loss=6.7393 cls=0.4413 cme=2.1350 acc=0.9875 cells=158379 kd=5.4742
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9765 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 16/40 val checks
+[ct_train] rechunked train graphs (seed=35)
+
+=== Epoch 35/1000 ===
+[train] loss=6.7446 cls=0.4404 cme=2.1362 acc=0.9875 cells=158379 kd=5.4791
+[ct_train] rechunked train graphs (seed=36)
+
+=== Epoch 36/1000 ===
+[train] loss=6.7456 cls=0.4411 cme=2.1369 acc=0.9877 cells=158379 kd=5.4795
+[val]   loss=5.2225 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9765 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 17/40 val checks
+[ct_train] rechunked train graphs (seed=37)
+
+=== Epoch 37/1000 ===
+[train] loss=6.7404 cls=0.4409 cme=2.1349 acc=0.9875 cells=158379 kd=5.4754
+[ct_train] rechunked train graphs (seed=38)
+
+=== Epoch 38/1000 ===
+[train] loss=6.7511 cls=0.4414 cme=2.1393 acc=0.9875 cells=158379 kd=5.4837
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 18/40 val checks
+[ct_train] rechunked train graphs (seed=39)
+
+=== Epoch 39/1000 ===
+[train] loss=6.7420 cls=0.4403 cme=2.1364 acc=0.9876 cells=158379 kd=5.4764
+[ct_train] rechunked train graphs (seed=40)
+
+=== Epoch 40/1000 ===
+[train] loss=6.7447 cls=0.4406 cme=2.1365 acc=0.9876 cells=158379 kd=5.4789
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 19/40 val checks
+[ct_train] rechunked train graphs (seed=41)
+
+=== Epoch 41/1000 ===
+[train] loss=6.7403 cls=0.4407 cme=2.1357 acc=0.9876 cells=158379 kd=5.4750
+[ct_train] rechunked train graphs (seed=42)
+
+=== Epoch 42/1000 ===
+[train] loss=6.7395 cls=0.4407 cme=2.1340 acc=0.9876 cells=158379 kd=5.4751
+[val]   loss=5.2224 eval=2.6047 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 20/40 val checks
+[ct_train] rechunked train graphs (seed=43)
+
+=== Epoch 43/1000 ===
+[train] loss=6.7450 cls=0.4409 cme=2.1369 acc=0.9875 cells=158379 kd=5.4790
+[ct_train] rechunked train graphs (seed=44)
+
+=== Epoch 44/1000 ===
+[train] loss=6.7346 cls=0.4403 cme=2.1338 acc=0.9875 cells=158379 kd=5.4704
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 21/40 val checks
+[ct_train] rechunked train graphs (seed=45)
+
+=== Epoch 45/1000 ===
+[train] loss=6.7473 cls=0.4412 cme=2.1369 acc=0.9876 cells=158379 kd=5.4812
+[ct_train] rechunked train graphs (seed=46)
+
+=== Epoch 46/1000 ===
+[train] loss=6.7535 cls=0.4409 cme=2.1399 acc=0.9876 cells=158379 kd=5.4858
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 22/40 val checks
+[ct_train] rechunked train graphs (seed=47)
+
+=== Epoch 47/1000 ===
+[train] loss=6.7562 cls=0.4414 cme=2.1405 acc=0.9876 cells=158379 kd=5.4881
+[ct_train] rechunked train graphs (seed=48)
+
+=== Epoch 48/1000 ===
+[train] loss=6.7585 cls=0.4411 cme=2.1410 acc=0.9876 cells=158379 kd=5.4902
+[val]   loss=5.2223 eval=2.6047 cls=0.4047 cme=2.2000 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 23/40 val checks
+[ct_train] rechunked train graphs (seed=49)
+
+=== Epoch 49/1000 ===
+[train] loss=6.7352 cls=0.4408 cme=2.1347 acc=0.9875 cells=158379 kd=5.4704
+[ct_train] rechunked train graphs (seed=50)
+
+=== Epoch 50/1000 ===
+[train] loss=6.7423 cls=0.4409 cme=2.1356 acc=0.9877 cells=158379 kd=5.4769
+[val]   loss=5.2223 eval=2.6047 cls=0.4047 cme=2.2000 acc=0.9765 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 24/40 val checks
+[ct_train] rechunked train graphs (seed=51)
+
+=== Epoch 51/1000 ===
+[train] loss=6.7412 cls=0.4411 cme=2.1359 acc=0.9877 cells=158379 kd=5.4757
+[ct_train] rechunked train graphs (seed=52)
+
+=== Epoch 52/1000 ===
+[train] loss=6.7562 cls=0.4410 cme=2.1403 acc=0.9876 cells=158379 kd=5.4883
+[val]   loss=5.2223 eval=2.6047 cls=0.4047 cme=2.2000 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 25/40 val checks
+[ct_train] rechunked train graphs (seed=53)
+
+=== Epoch 53/1000 ===
+[train] loss=6.7383 cls=0.4406 cme=2.1350 acc=0.9877 cells=158379 kd=5.4733
+[ct_train] rechunked train graphs (seed=54)
+
+=== Epoch 54/1000 ===
+[train] loss=6.7510 cls=0.4407 cme=2.1384 acc=0.9878 cells=158379 kd=5.4842
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 26/40 val checks
+[ct_train] rechunked train graphs (seed=55)
+
+=== Epoch 55/1000 ===
+[train] loss=6.7405 cls=0.4408 cme=2.1354 acc=0.9876 cells=158379 kd=5.4754
+[ct_train] rechunked train graphs (seed=56)
+
+=== Epoch 56/1000 ===
+[train] loss=6.7532 cls=0.4410 cme=2.1391 acc=0.9875 cells=158379 kd=5.4859
+[val]   loss=5.2224 eval=2.6047 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 27/40 val checks
+[ct_train] rechunked train graphs (seed=57)
+
+=== Epoch 57/1000 ===
+[train] loss=6.7474 cls=0.4407 cme=2.1378 acc=0.9876 cells=158379 kd=5.4809
+[ct_train] rechunked train graphs (seed=58)
+
+=== Epoch 58/1000 ===
+[train] loss=6.7387 cls=0.4408 cme=2.1351 acc=0.9874 cells=158379 kd=5.4736
+[val]   loss=5.2222 eval=2.6047 cls=0.4047 cme=2.2000 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 28/40 val checks
+[ct_train] rechunked train graphs (seed=59)
+
+=== Epoch 59/1000 ===
+[train] loss=6.7465 cls=0.4411 cme=2.1375 acc=0.9877 cells=158379 kd=5.4801
+[ct_train] rechunked train graphs (seed=60)
+
+=== Epoch 60/1000 ===
+[train] loss=6.7533 cls=0.4411 cme=2.1390 acc=0.9874 cells=158379 kd=5.4861
+[val]   loss=5.2223 eval=2.6047 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 29/40 val checks
+[ct_train] rechunked train graphs (seed=61)
+
+=== Epoch 61/1000 ===
+[train] loss=6.7363 cls=0.4409 cme=2.1330 acc=0.9874 cells=158379 kd=5.4724
+[ct_train] rechunked train graphs (seed=62)
+
+=== Epoch 62/1000 ===
+[train] loss=6.7576 cls=0.4411 cme=2.1404 acc=0.9876 cells=158379 kd=5.4896
+[val]   loss=5.2224 eval=2.6048 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 30/40 val checks
+[ct_train] rechunked train graphs (seed=63)
+
+=== Epoch 63/1000 ===
+[train] loss=6.7456 cls=0.4409 cme=2.1371 acc=0.9876 cells=158379 kd=5.4794
+[ct_train] rechunked train graphs (seed=64)
+
+=== Epoch 64/1000 ===
+[train] loss=6.7464 cls=0.4414 cme=2.1377 acc=0.9876 cells=158379 kd=5.4798
+[val]   loss=5.2224 eval=2.6047 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 31/40 val checks
+[ct_train] rechunked train graphs (seed=65)
+
+=== Epoch 65/1000 ===
+[train] loss=6.7455 cls=0.4414 cme=2.1374 acc=0.9875 cells=158379 kd=5.4791
+[ct_train] rechunked train graphs (seed=66)
+
+=== Epoch 66/1000 ===
+[train] loss=6.7371 cls=0.4411 cme=2.1343 acc=0.9875 cells=158379 kd=5.4725
+[val]   loss=5.2224 eval=2.6047 cls=0.4047 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 32/40 val checks
+[ct_train] rechunked train graphs (seed=67)
+
+=== Epoch 67/1000 ===
+[train] loss=6.7430 cls=0.4409 cme=2.1368 acc=0.9875 cells=158379 kd=5.4771
+[ct_train] rechunked train graphs (seed=68)
+
+=== Epoch 68/1000 ===
+[train] loss=6.7481 cls=0.4410 cme=2.1380 acc=0.9875 cells=158379 kd=5.4815
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9765 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 33/40 val checks
+[ct_train] rechunked train graphs (seed=69)
+
+=== Epoch 69/1000 ===
+[train] loss=6.7614 cls=0.4413 cme=2.1417 acc=0.9876 cells=158379 kd=5.4927
+[ct_train] rechunked train graphs (seed=70)
+
+=== Epoch 70/1000 ===
+[train] loss=6.7467 cls=0.4408 cme=2.1378 acc=0.9876 cells=158379 kd=5.4801
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 34/40 val checks
+[ct_train] rechunked train graphs (seed=71)
+
+=== Epoch 71/1000 ===
+[train] loss=6.7384 cls=0.4407 cme=2.1345 acc=0.9876 cells=158379 kd=5.4737
+[ct_train] rechunked train graphs (seed=72)
+
+=== Epoch 72/1000 ===
+[train] loss=6.7563 cls=0.4411 cme=2.1419 acc=0.9877 cells=158379 kd=5.4875
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 35/40 val checks
+[ct_train] rechunked train graphs (seed=73)
+
+=== Epoch 73/1000 ===
+[train] loss=6.7410 cls=0.4410 cme=2.1363 acc=0.9874 cells=158379 kd=5.4752
+[ct_train] rechunked train graphs (seed=74)
+
+=== Epoch 74/1000 ===
+[train] loss=6.7366 cls=0.4408 cme=2.1345 acc=0.9877 cells=158379 kd=5.4720
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9765 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 36/40 val checks
+[ct_train] rechunked train graphs (seed=75)
+
+=== Epoch 75/1000 ===
+[train] loss=6.7408 cls=0.4407 cme=2.1354 acc=0.9876 cells=158379 kd=5.4756
+[ct_train] rechunked train graphs (seed=76)
+
+=== Epoch 76/1000 ===
+[train] loss=6.7443 cls=0.4404 cme=2.1370 acc=0.9874 cells=158379 kd=5.4784
+[val]   loss=5.2224 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 37/40 val checks
+[ct_train] rechunked train graphs (seed=77)
+
+=== Epoch 77/1000 ===
+[train] loss=6.7533 cls=0.4411 cme=2.1387 acc=0.9875 cells=158379 kd=5.4862
+[ct_train] rechunked train graphs (seed=78)
+
+=== Epoch 78/1000 ===
+[train] loss=6.7489 cls=0.4416 cme=2.1384 acc=0.9874 cells=158379 kd=5.4819
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 38/40 val checks
+[ct_train] rechunked train graphs (seed=79)
+
+=== Epoch 79/1000 ===
+[train] loss=6.7588 cls=0.4409 cme=2.1410 acc=0.9876 cells=158379 kd=5.4905
+[ct_train] rechunked train graphs (seed=80)
+
+=== Epoch 80/1000 ===
+[train] loss=6.7325 cls=0.4407 cme=2.1331 acc=0.9876 cells=158379 kd=5.4685
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 39/40 val checks
+[ct_train] rechunked train graphs (seed=81)
+
+=== Epoch 81/1000 ===
+[train] loss=6.7545 cls=0.4409 cme=2.1403 acc=0.9875 cells=158379 kd=5.4866
+[ct_train] rechunked train graphs (seed=82)
+
+=== Epoch 82/1000 ===
+[train] loss=6.7399 cls=0.4410 cme=2.1348 acc=0.9877 cells=158379 kd=5.4750
+[val]   loss=5.2223 eval=2.6047 cls=0.4046 cme=2.2001 acc=0.9764 cells=118036
+[ct_train] early_stopping: no improve on val/eval_loss for 40/40 val checks
+[ct_train] early stopping at epoch 82 (patience=40, monitor=val/eval_loss)
+
+[ct_train] done. best_val_acc=0.9765  best_val_eval_loss=2.6045  checkpoints=/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/outputs/exp227_kd_5era  logs=/home/abel/code/Tissue-Reassembly-using-GenAI-and-new-metrics/exploration/cell_types/logs/exp227_kd_5era/20260808_143517
+wandb: updating run metadata
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: 
+wandb: Run summary:
+wandb:                      best_epoch 2
+wandb:                    best_val_acc 0.97648
+wandb:              best_val_eval_loss 2.60452
+wandb:                           epoch 82
+wandb:                              lr 2e-05
+wandb:           model/parameter_count 1305308
+wandb: model/trainable_parameter_count 1305308
+wandb:                       train/acc 0.98766
+wandb:       train/acc_per_class/Astro 0.99213
+wandb:        train/acc_per_class/Endo 0.98222
+wandb:                             +54 ...
+wandb: 
+wandb:  View run exp227_kd_5era at: https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types/runs/u9mn6uw5
+wandb:  View project at: https://wandb.ai/abel-salmona-polytechnique-montr-al/cell_types
+wandb: Synced 5 W&B file(s), 1 media file(s), 2 artifact file(s) and 1 other file(s)
+wandb: Find logs at: ./exploration/cell_types/logs/exp227_kd_5era/20260808_143517/wandb/run-20260808_143526-u9mn6uw5/logs

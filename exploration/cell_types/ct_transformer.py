@@ -67,17 +67,43 @@ def build_activation(name: str) -> nn.Module:
 
 def _resolve_gene_mlp_activations(
     gene_mlp_activation: Union[str, Sequence[str]],
-) -> tuple[str, str]:
-    """Normalize to a pair ``(act_after_first_linear, act_after_second_linear)``."""
+    depth: int = 2,
+) -> tuple[str, ...]:
+    """Normalize to one activation name per gene-MLP linear (length ``depth``)."""
     if isinstance(gene_mlp_activation, (list, tuple)):
-        if len(gene_mlp_activation) != 2:
-            raise ValueError(
-                "gene_mlp_activation list must have length 2 "
-                f"(got {len(gene_mlp_activation)}): {gene_mlp_activation}"
-            )
-        return str(gene_mlp_activation[0]), str(gene_mlp_activation[1])
+        if len(gene_mlp_activation) == depth:
+            return tuple(str(a) for a in gene_mlp_activation)
+        if len(gene_mlp_activation) == 2 and depth == 2:
+            return str(gene_mlp_activation[0]), str(gene_mlp_activation[1])
+        raise ValueError(
+            f"gene_mlp_activation list must have length {depth} "
+            f"(got {len(gene_mlp_activation)}): {gene_mlp_activation}"
+        )
     name = str(gene_mlp_activation)
-    return name, name
+    return tuple(name for _ in range(depth))
+
+
+def _build_gene_mlp(
+    gene_dim: int,
+    gene_hidden_dim: int,
+    dx: int,
+    depth: int,
+    activation_names: Sequence[str],
+) -> nn.Sequential:
+    """Stack ``depth`` linears: G → [gene_hidden]* → dx with activations after each."""
+    if depth < 2:
+        raise ValueError(f"gene_mlp_depth must be >= 2 (got {depth})")
+    if len(activation_names) != depth:
+        raise ValueError(
+            f"Expected {depth} activation names, got {len(activation_names)}"
+        )
+    in_dims = [gene_dim] + [gene_hidden_dim] * (depth - 1)
+    out_dims = [gene_hidden_dim] * (depth - 1) + [dx]
+    layers: list[nn.Module] = []
+    for in_d, out_d, act_name in zip(in_dims, out_dims, activation_names):
+        layers.append(nn.Linear(in_d, out_d))
+        layers.append(build_activation(act_name))
+    return nn.Sequential(*layers)
 
 
 class GeneSelfAttention(nn.Module):
@@ -87,7 +113,12 @@ class GeneSelfAttention(nn.Module):
     Here: Linear(X) → linear-attn (no concat, no pos/time heads).
     """
 
-    def __init__(self, node_features_dimensions: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        node_features_dimensions: int,
+        num_heads: int,
+        use_node_mask: bool = False,
+    ) -> None:
         super().__init__()
         assert node_features_dimensions % num_heads == 0, (
             f"dx={node_features_dimensions} must be divisible by "
@@ -95,6 +126,7 @@ class GeneSelfAttention(nn.Module):
         )
         self.node_features_dimensions = node_features_dimensions
         self.num_heads = num_heads
+        self.use_node_mask = bool(use_node_mask)
 
         self.lin_node_features = nn.Linear(
             node_features_dimensions, node_features_dimensions
@@ -111,7 +143,11 @@ class GeneSelfAttention(nn.Module):
     ) -> torch.Tensor:
         # node_features: (B, N, dx); node_mask: (B, N)
         x = self.lin_node_features(node_features)
-        x = self.attention(x)
+        if self.use_node_mask:
+            x = x * node_mask.unsqueeze(-1).to(x.dtype)
+            x = self.attention(x, input_mask=node_mask.bool())
+        else:
+            x = self.attention(x)
         x = x * node_mask.unsqueeze(-1).to(x.dtype)
         return x
 
@@ -128,11 +164,16 @@ class GeneTransformerLayer(nn.Module):
         dim_ff_node_features: int = 384,
         dropout: float = 0.1,
         layer_norm_eps: float = 1e-5,
+        ffn_activation: str = "relu",
+        attention_use_node_mask: bool = False,
+        pre_norm: bool = False,
     ) -> None:
         super().__init__()
+        self.pre_norm = bool(pre_norm)
         self.self_attn = GeneSelfAttention(
             node_features_dimensions=node_features_dimensions,
             num_heads=num_heads,
+            use_node_mask=attention_use_node_mask,
         )
 
         self.lin_node_features_1 = Linear(
@@ -150,24 +191,35 @@ class GeneTransformerLayer(nn.Module):
         self.dropout_node_features_1 = Dropout(dropout)
         self.dropout_node_features_2 = Dropout(dropout)
         self.dropout_node_features_3 = Dropout(dropout)
-        self.activation = F.relu
+        self.activation = build_activation(ffn_activation)
 
     def forward(
         self, node_features: torch.Tensor, node_mask: torch.Tensor
     ) -> torch.Tensor:
-        attn_out = self.self_attn(node_features, node_mask)
-
-        x = self.dropout_node_features_1(attn_out)
-        x = self.norm_node_features_1(node_features + x)
-
-        ff = self.lin_node_features_2(
-            self.dropout_node_features_2(self.activation(self.lin_node_features_1(x)))
-        )
-        ff = self.dropout_node_features_3(ff)
-        x = self.norm_node_features_2(x + ff)
+        if self.pre_norm:
+            x_n = self.norm_node_features_1(node_features)
+            attn_out = self.self_attn(x_n, node_mask)
+            x = node_features + self.dropout_node_features_1(attn_out)
+            x_n2 = self.norm_node_features_2(x)
+            ff = self.lin_node_features_2(
+                self.dropout_node_features_2(
+                    self.activation(self.lin_node_features_1(x_n2))
+                )
+            )
+            x = x + self.dropout_node_features_3(ff)
+        else:
+            attn_out = self.self_attn(node_features, node_mask)
+            x = self.dropout_node_features_1(attn_out)
+            x = self.norm_node_features_1(node_features + x)
+            ff = self.lin_node_features_2(
+                self.dropout_node_features_2(
+                    self.activation(self.lin_node_features_1(x))
+                )
+            )
+            ff = self.dropout_node_features_3(ff)
+            x = self.norm_node_features_2(x + ff)
         x = x * node_mask.unsqueeze(-1).to(x.dtype)
         return x
-
 
 def _normalize_global_skip(global_skip: Optional[str]) -> Optional[str]:
     """Return ``'concat'``, ``'add'``, or ``None`` (disabled)."""
@@ -193,6 +245,76 @@ def masked_mean_pool(
     mask = node_mask.unsqueeze(-1).to(dtype=x.dtype)  # (B, N, 1)
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
     return (x * mask).sum(dim=1, keepdim=True) / denom
+
+
+def masked_max_pool(
+    x: torch.Tensor, node_mask: torch.Tensor
+) -> torch.Tensor:
+    """Max over real cells only → ``(B, 1, D)`` (pads filled with large negative)."""
+    mask = node_mask.unsqueeze(-1).to(dtype=x.dtype)  # (B, N, 1)
+    fill = torch.finfo(x.dtype).min
+    return x.masked_fill(mask == 0, fill).max(dim=1, keepdim=True).values
+
+
+def gene_knn_mean_pool(
+    e_raw: torch.Tensor,
+    e_mixed: torch.Tensor,
+    node_mask: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """Per-cell mean of gene-KNN neighbors' mixed embeddings ``(B, N, D)``.
+
+    Similarity from L2-normalized ``e_raw`` (gene MLP output); values from
+    ``e_mixed``. Pads are ignored. Self is excluded from the neighbor set.
+    """
+    if k <= 0:
+        raise ValueError(f"gene_knn_k must be > 0 (got {k})")
+    bsz, n_cells, dim = e_mixed.shape
+    mask = node_mask.bool()
+    # Cosine sim in gene-embedding space.
+    q = F.normalize(e_raw, dim=-1)
+    sim = torch.bmm(q, q.transpose(1, 2))  # (B, N, N)
+    sim = sim.masked_fill(~mask.unsqueeze(1), float("-inf"))
+    sim = sim.masked_fill(~mask.unsqueeze(2), float("-inf"))
+    # Exclude self.
+    eye = torch.eye(n_cells, device=sim.device, dtype=torch.bool).unsqueeze(0)
+    sim = sim.masked_fill(eye, float("-inf"))
+    # Cap k by number of real neighbors available (approx via N-1).
+    kk = min(k, max(1, n_cells - 1))
+    idx = sim.topk(kk, dim=-1).indices  # (B, N, k)
+    batch_ix = torch.arange(bsz, device=e_mixed.device).view(bsz, 1, 1).expand(
+        bsz, n_cells, kk
+    )
+    neigh = e_mixed[batch_ix, idx]  # (B, N, k, D)
+    # Invalidate pads / non-finite similarity slots (empty neighborhoods).
+    valid = mask.unsqueeze(1).expand(-1, n_cells, -1).gather(2, idx)
+    sim_vals = sim.gather(2, idx)
+    valid = valid & torch.isfinite(sim_vals)
+    weights = valid.to(dtype=e_mixed.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=2).clamp_min(1.0)
+    out = (neigh * weights).sum(dim=2) / denom
+    return out * mask.unsqueeze(-1).to(dtype=out.dtype)
+
+
+class MaskedAttentionPool(nn.Module):
+    """Learned attention pool over real cells → ``(B, 1, D)``."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.score = nn.Linear(dim, 1)
+
+    def forward(
+        self, x: torch.Tensor, node_mask: torch.Tensor
+    ) -> torch.Tensor:
+        # x: (B, N, D); node_mask: (B, N)
+        scores = self.score(x).squeeze(-1)  # (B, N)
+        mask = node_mask.to(dtype=x.dtype)
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+        weights = torch.softmax(scores, dim=-1).unsqueeze(-1)  # (B, N, 1)
+        weights = weights * mask.unsqueeze(-1)
+        denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        weights = weights / denom
+        return (x * weights).sum(dim=1, keepdim=True)
 
 
 def _mlp_head(
@@ -234,12 +356,16 @@ class CellTypeTransformer(nn.Module):
       * ``global_skip``: ``None`` | ``\"concat\"`` | ``\"add\"`` — bridge the
         unmixed gene-MLP embedding ``E_raw`` past the transformer so the
         classifier always sees intrinsic identity (anti over-smoothing).
-      * ``subgraph_summary``: if True, masked mean-pool of ``E_mixed`` is
-        broadcast and concatenated as a bag-level neighborhood descriptor.
+      * ``subgraph_summary``: if True, pool ``E_mixed`` (``subgraph_pool``:
+        ``\"mean\"`` | ``\"mean_max\"`` | ``\"attn\"``) and broadcast-concatenate
+        as a bag-level neighborhood descriptor.
       * ``feature_cross``: if True (requires ``predict_cme``), stage-1 type/env
         towers produce intermediates ``t_i``, ``e_i``; fuse with optional ``h_i``
         via LN+MLP; stage-2 heads read the fused features for final logits.
         Stage-1 linear probes are also returned for ablation.
+      * ``gene_mlp_depth``: number of gene-MLP linears (2 = G→gene_hidden→dx;
+        3 adds an extra gene_hidden block).
+      * ``layer_activation``: FFN nonlinearity inside each ``GeneTransformerLayer``.
 
     Only ``node_features`` and ``node_mask`` are used; positions / time ignored.
     """
@@ -256,14 +382,26 @@ class CellTypeTransformer(nn.Module):
         dropout_cme: float = 0.1,
         dropout_fusion: float = 0.1,
         gene_mlp_activation: Union[str, Sequence[str]] = "relu",
+        gene_mlp_depth: int = 2,
+        layer_activation: str = "relu",
         cls_activation: str = "relu",
         cme_activation: str = "relu",
         fusion_activation: Optional[str] = None,
         global_skip: Optional[str] = None,
         subgraph_summary: bool = False,
+        subgraph_pool: str = "mean",
+        subgraph_pool_source: str = "mixed",
+        attention_use_node_mask: bool = False,
+        cme_detach_type_in_fusion: bool = False,
+        dual_fusion: bool = False,
+        gene_knn_k: int = 0,
+        pre_norm: bool = False,
+        cme_condition_on_cls: bool = False,
         predict_cme: bool = False,
         feature_cross: bool = False,
         feature_cross_include_h: bool = True,
+        cme_entropy_temp_t0: float = 1.0,
+        cme_entropy_temp_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         if hidden_mlp_dims is None:
@@ -301,15 +439,46 @@ class CellTypeTransformer(nn.Module):
         self.cme_hidden_dim = int(hidden_mlp_dims["cme"])
         self.global_skip = _normalize_global_skip(global_skip)
         self.subgraph_summary = bool(subgraph_summary)
+        pool_key = str(subgraph_pool).strip().lower()
+        if pool_key not in ("mean", "mean_max", "attn"):
+            raise ValueError(
+                f"subgraph_pool must be 'mean', 'mean_max', or 'attn' "
+                f"(got {subgraph_pool!r})"
+            )
+        self.subgraph_pool = pool_key
+        src_key = str(subgraph_pool_source).strip().lower()
+        if src_key not in ("mixed", "raw"):
+            raise ValueError(
+                f"subgraph_pool_source must be 'mixed' or 'raw' "
+                f"(got {subgraph_pool_source!r})"
+            )
+        self.subgraph_pool_source = src_key
+        self.attention_use_node_mask = bool(attention_use_node_mask)
+        self.subgraph_attn_pool: Optional[MaskedAttentionPool] = None
+        if self.subgraph_summary and self.subgraph_pool == "attn":
+            self.subgraph_attn_pool = MaskedAttentionPool(self.dx)
         self.predict_cme = bool(predict_cme)
         self.feature_cross = bool(feature_cross)
         self.feature_cross_include_h = bool(feature_cross_include_h)
+        self.cme_detach_type_in_fusion = bool(cme_detach_type_in_fusion)
+        self.dual_fusion = bool(dual_fusion)
+        self.gene_knn_k = int(gene_knn_k)
+        if self.gene_knn_k < 0:
+            raise ValueError(f"gene_knn_k must be >= 0 (got {gene_knn_k})")
+        self.pre_norm = bool(pre_norm)
+        self.cme_condition_on_cls = bool(cme_condition_on_cls)
+        self.cme_entropy_temp_t0 = float(cme_entropy_temp_t0)
+        self.cme_entropy_temp_alpha = float(cme_entropy_temp_alpha)
 
         if self.feature_cross and not self.predict_cme:
             raise ValueError("feature_cross=True requires predict_cme=True")
 
-        act1_name, act2_name = _resolve_gene_mlp_activations(gene_mlp_activation)
-        self.gene_mlp_activation = (act1_name, act2_name)
+        self.gene_mlp_depth = int(gene_mlp_depth)
+        gene_act_names = _resolve_gene_mlp_activations(
+            gene_mlp_activation, depth=self.gene_mlp_depth
+        )
+        self.gene_mlp_activation = gene_act_names
+        self.layer_activation = str(layer_activation)
         self.cls_activation = str(cls_activation)
         self.cme_activation = str(cme_activation)
         fus_act_name = (
@@ -318,18 +487,17 @@ class CellTypeTransformer(nn.Module):
             else str(cls_activation)
         )
         self.fusion_activation = fus_act_name
-        act1 = build_activation(act1_name)
-        act2 = build_activation(act2_name)
         cls_act = build_activation(cls_activation)
         cme_act = build_activation(cme_activation)
         fus_act = build_activation(fus_act_name)
 
-        # Gene embedder: G → gene_hidden → dx
-        self.mlp_in_node_features = nn.Sequential(
-            nn.Linear(gene_dim, self.gene_hidden_dim),
-            act1,
-            nn.Linear(self.gene_hidden_dim, self.dx),
-            act2,
+        # Gene embedder: G → [gene_hidden]* → dx (depth configurable)
+        self.mlp_in_node_features = _build_gene_mlp(
+            gene_dim,
+            self.gene_hidden_dim,
+            self.dx,
+            self.gene_mlp_depth,
+            gene_act_names,
         )
 
         self.transformer_layers = nn.ModuleList(
@@ -339,6 +507,9 @@ class CellTypeTransformer(nn.Module):
                     num_heads=int(hidden_dims["num_heads"]),
                     dim_ff_node_features=int(hidden_dims["dim_ffX"]),
                     dropout=dropout_layer,
+                    ffn_activation=layer_activation,
+                    attention_use_node_mask=self.attention_use_node_mask,
+                    pre_norm=self.pre_norm,
                 )
                 for _ in range(n_layers)
             ]
@@ -417,6 +588,15 @@ class CellTypeTransformer(nn.Module):
                 nn.Dropout(dropout_fusion),
                 nn.Linear(fusion_hidden, self.fusion_out_dim),
             )
+            self.fusion_mlp_cme = None
+            if self.dual_fusion:
+                self.fusion_mlp_cme = nn.Sequential(
+                    nn.LayerNorm(fusion_in),
+                    nn.Linear(fusion_in, fusion_hidden),
+                    build_activation(fus_act_name),
+                    nn.Dropout(dropout_fusion),
+                    nn.Linear(fusion_hidden, self.fusion_out_dim),
+                )
             self.type_stage2 = _mlp_head(
                 self.fusion_out_dim,
                 self.cls_hidden_dim,
@@ -424,8 +604,11 @@ class CellTypeTransformer(nn.Module):
                 build_activation(cls_activation),
                 dropout_cls,
             )
+            cme_in = self.fusion_out_dim + (
+                num_classes if self.cme_condition_on_cls else 0
+            )
             self.env_stage2 = _mlp_head(
-                self.fusion_out_dim,
+                cme_in,
                 self.cme_hidden_dim,
                 num_classes,
                 build_activation(cme_activation),
@@ -440,6 +623,11 @@ class CellTypeTransformer(nn.Module):
             # ``add`` or disabled: cell stream stays ``dx``.
             dim = self.dx
         if self.subgraph_summary:
+            if self.subgraph_pool == "mean_max":
+                dim += 2 * self.dx
+            else:
+                dim += self.dx
+        if self.gene_knn_k > 0:
             dim += self.dx
         return dim
 
@@ -471,10 +659,24 @@ class CellTypeTransformer(nn.Module):
             cell_feat = e_mixed
 
         if self.subgraph_summary:
-            # Bag-level mean of transformer states (pads ignored), broadcast.
-            summary = masked_mean_pool(e_mixed, node_mask)  # (B, 1, dx)
+            pool_src = e_raw if self.subgraph_pool_source == "raw" else e_mixed
+            if self.subgraph_pool == "attn":
+                assert self.subgraph_attn_pool is not None
+                summary = self.subgraph_attn_pool(pool_src, node_mask)
+            elif self.subgraph_pool == "mean_max":
+                mean_summary = masked_mean_pool(pool_src, node_mask)
+                max_summary = masked_max_pool(pool_src, node_mask)
+                summary = torch.cat([mean_summary, max_summary], dim=-1)
+            else:
+                summary = masked_mean_pool(pool_src, node_mask)
             summary = summary.expand(-1, cell_feat.size(1), -1)
             cell_feat = torch.cat([cell_feat, summary], dim=-1)
+
+        if self.gene_knn_k > 0:
+            knn_summary = gene_knn_mean_pool(
+                e_raw, e_mixed, node_mask, k=self.gene_knn_k
+            )
+            cell_feat = torch.cat([cell_feat, knn_summary], dim=-1)
 
         cell_feat = cell_feat * node_mask.unsqueeze(-1).to(cell_feat.dtype)
         return cell_feat
@@ -513,9 +715,41 @@ class CellTypeTransformer(nn.Module):
         f = self.fusion_mlp(fused_in)
         f = f * mask  # pads stay zero into stage-2
 
+        if self.dual_fusion and self.fusion_mlp_cme is not None:
+            f_cme = self.fusion_mlp_cme(fused_in) * mask
+        elif self.cme_detach_type_in_fusion:
+            t_cme = t.detach()
+            if self.feature_cross_include_h:
+                fused_in_cme = torch.cat([t_cme, e, h], dim=-1)
+            else:
+                fused_in_cme = torch.cat([t_cme, e], dim=-1)
+            f_cme = self.fusion_mlp(fused_in_cme) * mask
+        else:
+            f_cme = f
+
+        cls_logits = self.type_stage2(f) * mask
+        if self.cme_condition_on_cls:
+            # Detached self-type signal for type-conditional microenvironment.
+            t_probs = F.softmax(self.type_probe(t).detach(), dim=-1)
+            f_cme_in = torch.cat([f_cme, t_probs], dim=-1)
+        else:
+            f_cme_in = f_cme
+        cme_logits = self.env_stage2(f_cme_in) * mask
+        if abs(self.cme_entropy_temp_alpha) > 1e-12 or abs(
+            self.cme_entropy_temp_t0 - 1.0
+        ) > 1e-12:
+            # Per-cell temperature from predictive entropy (eval/calib).
+            logp = F.log_softmax(cme_logits, dim=-1)
+            p = logp.exp()
+            H = -(p * logp).sum(dim=-1, keepdim=True)
+            T = (
+                self.cme_entropy_temp_t0
+                + self.cme_entropy_temp_alpha * (H - H.mean())
+            ).clamp(0.7, 1.4)
+            cme_logits = (cme_logits / T) * mask
         out = {
-            "cls_logits": self.type_stage2(f) * mask,
-            "cme_logits": self.env_stage2(f) * mask,
+            "cls_logits": cls_logits,
+            "cme_logits": cme_logits,
             "cls_logits_stage1": self.type_probe(t) * mask,
             "cme_logits_stage1": self.env_probe(e) * mask,
         }
