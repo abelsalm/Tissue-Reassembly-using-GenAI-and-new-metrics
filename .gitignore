@@ -38,3 +38,14 @@ lightning_logs/*
 outputs
 outputs/*
 ./outputs/*
+
+
+./exploration/cell_types/outputs
+./exploration/cell_types/outputs/*
+./exploration/cell_types/logs
+./exploration/cell_types/logs/*
+./exploration/cell_types/experiments/notes
+./exploration/cell_types/experiments/notes/*
+
+*.json
+**/*.json
