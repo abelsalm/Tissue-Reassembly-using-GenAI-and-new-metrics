@@ -11,7 +11,6 @@
     "mode": "online",
     "tags": [
       "best_recipe",
-      "exp135",
       "no_calib"
     ],
     "log_every_steps": true,
@@ -51,6 +50,7 @@
     "predict_cme": true,
     "feature_cross": true,
     "feature_cross_include_h": true,
+    "cme_presence_gate": true,
     "dropout_cls": 0.3,
     "dropout_cme": 0.0,
     "dropout_fusion": 0.0,
@@ -82,11 +82,13 @@
     "label_smoothing": 0.06,
     "cls_weight": 1.0,
     "cme_weight": 2.0,
+    "presence_weight": 0.5,
+    "presence_saturation": 1.0,
     "stage1_cls_weight": 0.0,
     "stage1_cme_weight": 0.0,
     "aux_cme_weight": 0.17,
-    "cme_spearman_weight": 0.0,
-    "cme_spearman_tau": 0.1,
+    "cme_spearman_weight": 0,
+    "cme_spearman_tau": 0.01,
     "cme_spearman_chunk_size": 64
   },
   "train": {

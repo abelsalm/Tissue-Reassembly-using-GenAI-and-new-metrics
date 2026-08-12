@@ -47,6 +47,7 @@ from exploration.cell_types.ct_losses import (  # noqa: E402
     class_indices_from_batch,
     get_loss,
     soft_cross_entropy,
+    soft_spearman_cme_loss,
 )
 from exploration.cell_types.ct_soft_cme import (  # noqa: E402
     DEFAULT_OUT_DIR,
@@ -59,9 +60,15 @@ from utils.data.misc import to_batch  # noqa: E402
 
 
 class SoftCMELookup:
-    """Dense ``cell_id → soft_cme`` table for fast batch gathering."""
+    """Dense ``cell_id → soft_cme`` (and optional ``cme_mass``) table."""
 
-    def __init__(self, cell_ids: np.ndarray, soft_cme: np.ndarray):
+    def __init__(
+        self,
+        cell_ids: np.ndarray,
+        soft_cme: np.ndarray,
+        cme_mass: Optional[np.ndarray] = None,
+        presence_scale: Optional[float] = None,
+    ):
         cell_ids = np.asarray(cell_ids)
         soft_cme = np.asarray(soft_cme, dtype=np.float32)
         if cell_ids.shape[0] != soft_cme.shape[0]:
@@ -74,6 +81,31 @@ class SoftCMELookup:
         self.table[cell_ids.astype(np.int64)] = soft_cme
         self.max_id = max_id
 
+        self.mass_table: Optional[np.ndarray] = None
+        self.presence_scale: Optional[np.ndarray] = None
+        if cme_mass is not None:
+            cme_mass = np.asarray(cme_mass, dtype=np.float32)
+            if cme_mass.shape != soft_cme.shape:
+                raise ValueError(
+                    f"cme_mass shape {cme_mass.shape} != soft_cme {soft_cme.shape}"
+                )
+            self.mass_table = np.zeros_like(self.table)
+            self.mass_table[cell_ids.astype(np.int64)] = cme_mass
+            if presence_scale is None:
+                from exploration.cell_types.ct_soft_cme import (
+                    presence_scale_from_mass,
+                )
+
+                presence_scale = presence_scale_from_mass(cme_mass)
+            scale_arr = np.asarray(presence_scale, dtype=np.float64).reshape(-1)
+            if scale_arr.size == 1:
+                scale_arr = np.full(self.num_classes, float(scale_arr[0]))
+            if scale_arr.size != self.num_classes:
+                raise ValueError(
+                    f"presence_scale length {scale_arr.size} != C={self.num_classes}"
+                )
+            self.presence_scale = scale_arr
+
     def gather(
         self, cell_ids: torch.Tensor, device: torch.device
     ) -> torch.Tensor:
@@ -85,14 +117,29 @@ class SoftCMELookup:
         out = self.table[ids]  # (B, N, C)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
 
+    def gather_mass(
+        self, cell_ids: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        """Map ``cell_ids`` → unnormalized CME mass ``(B, N, C)``."""
+        if self.mass_table is None:
+            raise RuntimeError("SoftCMELookup has no cme_mass table")
+        if cell_ids.dim() == 3:
+            cell_ids = cell_ids.squeeze(-1)
+        ids = cell_ids.detach().cpu().long().numpy()
+        ids = np.clip(ids, 0, self.max_id)
+        out = self.mass_table[ids]
+        return torch.from_numpy(out).to(device=device, dtype=torch.float32)
+
 
 def attach_soft_cme(
     batch, lookup: SoftCMELookup, device: torch.device
 ):
-    """Set ``batch.soft_cme`` from ``batch.cell_ID`` via precomputed table."""
+    """Set ``batch.soft_cme`` (and ``batch.cme_mass`` if available)."""
     if batch.cell_ID is None:
         raise ValueError("batch.cell_ID is required to attach soft CME targets")
     batch.soft_cme = lookup.gather(batch.cell_ID, device)
+    if lookup.mass_table is not None:
+        batch.cme_mass = lookup.gather_mass(batch.cell_ID, device)
     return batch
 
 
@@ -136,8 +183,29 @@ def soft_cme_is_needed(cfg: Dict[str, Any]) -> bool:
         or float(lcfg.get("cme_weight", 0.0) or 0.0) != 0.0
         or float(lcfg.get("aux_cme_weight", 0.0) or 0.0) != 0.0
         or float(lcfg.get("cme_spearman_weight", 0.0) or 0.0) != 0.0
+        or float(lcfg.get("presence_weight", 0.0) or 0.0) != 0.0
+        or bool(mcfg.get("cme_presence_gate", False))
         or bool(scfg.get("aux_sigmas"))
     )
+
+
+def soft_cme_mass_needed(cfg: Dict[str, Any]) -> bool:
+    """Unnormalized CME mass required for presence-gate supervision."""
+    mcfg = cfg.get("model") or {}
+    lcfg = cfg.get("loss") or {}
+    return bool(mcfg.get("cme_presence_gate", False)) or (
+        float(lcfg.get("presence_weight", 0.0) or 0.0) != 0.0
+    )
+
+
+def _npz_has_cme_mass(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return "cme_mass" in data.files
+    except OSError:
+        return False
 
 
 def soft_cme_out_dir(cfg: Dict[str, Any]) -> Path:
@@ -169,11 +237,25 @@ def ensure_soft_cme_precomputed(
     out_dir = soft_cme_out_dir(cfg)
     splits = ["train", "validation", "test"]
     sigmas = soft_cme_sigmas(cfg)
+    need_mass = soft_cme_mass_needed(cfg)
+    # Primary sigma must carry mass when presence gate / presence loss is on.
+    primary_sigma = float((cfg.get("soft_cme") or {}).get("sigma", 96.0))
     missing_by_sigma: Dict[float, List[str]] = {}
     for sigma in sigmas:
-        missing = [
-            s for s in splits if not soft_cme_npz_path(out_dir, s, sigma).exists()
-        ]
+        missing: List[str] = []
+        for s in splits:
+            path = soft_cme_npz_path(out_dir, s, sigma)
+            if not path.exists():
+                missing.append(s)
+            elif need_mass and float(sigma) == primary_sigma and not _npz_has_cme_mass(
+                path
+            ):
+                missing.append(s)
+                print(
+                    f"[ct_train] soft CME {path.name} lacks cme_mass — "
+                    "will re-precompute for presence gating",
+                    flush=True,
+                )
         if missing:
             missing_by_sigma[sigma] = missing
     if not missing_by_sigma:
@@ -183,6 +265,12 @@ def ensure_soft_cme_precomputed(
     cutoff = scfg.get("cutoff_radius", None)
     cutoff = float(cutoff) if cutoff is not None else None
     for sigma, missing in missing_by_sigma.items():
+        # Drop stale npz without mass so precompute overwrites cleanly.
+        if need_mass and float(sigma) == primary_sigma:
+            for s in missing:
+                path = soft_cme_npz_path(out_dir, s, sigma)
+                if path.exists() and not _npz_has_cme_mass(path):
+                    path.unlink()
         print(
             f"[ct_train] soft CME missing for sigma={sigma}: {missing} "
             f"(out_dir={out_dir}) — auto-precomputing …",
@@ -229,10 +317,20 @@ def load_soft_cme_lookup(
     print(
         f"[ct_train] soft CME loaded split={file_split} "
         f"sigma={sigma} n={len(loaded['cell_id'])} "
-        f"C={loaded['soft_cme'].shape[1]}",
+        f"C={loaded['soft_cme'].shape[1]}"
+        + (
+            f" mass={'yes' if loaded.get('cme_mass') is not None else 'no'}"
+            if soft_cme_mass_needed(cfg)
+            else ""
+        ),
         flush=True,
     )
-    return SoftCMELookup(loaded["cell_id"], loaded["soft_cme"])
+    return SoftCMELookup(
+        loaded["cell_id"],
+        loaded["soft_cme"],
+        cme_mass=loaded.get("cme_mass"),
+        presence_scale=loaded.get("presence_scale"),
+    )
 
 
 def load_soft_cme_aux_lookups(
@@ -404,6 +502,7 @@ def build_model(cfg: Dict[str, Any], gene_dim: int, num_classes: int) -> CellTyp
         predict_cme=predict_cme,
         feature_cross=bool(mcfg.get("feature_cross", False)),
         feature_cross_include_h=bool(mcfg.get("feature_cross_include_h", True)),
+        cme_presence_gate=bool(mcfg.get("cme_presence_gate", False)),
     )
 
 
@@ -874,6 +973,8 @@ def run_epoch(
     ema: Optional[ModelEMA] = None,
     teachers: Optional[List[CellTypeTransformer]] = None,
     distill_cfg: Optional[Dict[str, Any]] = None,
+    cme_spearman_tau: float = 0.1,
+    cme_spearman_chunk_size: int = 64,
 ) -> Dict[str, Any]:
     train = optimizer is not None
     model.train(train)
@@ -941,6 +1042,29 @@ def run_epoch(
             cme_loss_val = 0.0
             cme_aux_loss_val = 0.0
             cme_spearman_loss_val = 0.0
+
+        # Always report soft-Spearman on validation when CME is available,
+        # even if loss.cme_spearman_weight == 0 (train placeholder is zero).
+        # Uses raw logits/targets (no train tempering) for a stable diagnostic.
+        if (
+            not train
+            and ("cme_logits" in outputs or "cme_probs" in outputs)
+            and getattr(batch, "soft_cme", None) is not None
+            and batch.node_mask is not None
+        ):
+            with torch.no_grad():
+                cme_spearman_loss_val = float(
+                    soft_spearman_cme_loss(
+                        outputs.get(
+                            "cme_logits", outputs.get("cme_probs")
+                        ),
+                        batch.soft_cme,
+                        batch.node_mask,
+                        tau=float(cme_spearman_tau),
+                        chunk_size=int(cme_spearman_chunk_size),
+                        probs=outputs.get("cme_probs"),
+                    ).item()
+                )
 
         kd_loss_val = 0.0
         if use_distill:
@@ -1180,6 +1304,19 @@ def main() -> None:
             "model.predict_cme=True but soft CME tables could not be loaded "
             "(check soft_cme.out_dir / sigma)"
         )
+    if soft_cme_mass_needed(cfg):
+        if train_cme is None or train_cme.mass_table is None:
+            raise ValueError(
+                "cme_presence_gate / presence_weight requires soft CME npz "
+                "with cme_mass (enable soft_cme.auto_precompute to rebuild)"
+            )
+        if getattr(model, "cme_presence_gate", False) is False:
+            print(
+                "[ct_train] WARNING: presence_weight>0 but "
+                "model.cme_presence_gate=False — presence loss will fail "
+                "without presence_logits",
+                flush=True,
+            )
 
     use_wandb = setup_wandb_run(
         cfg,
@@ -1201,8 +1338,28 @@ def main() -> None:
     loss_kwargs = {
         k: v for k, v in dict(cfg.get("loss", {})).items() if k != "name"
     }
+    # Fill presence_scale from train soft-CME per-type positive-mass medians.
+    if (
+        float(loss_kwargs.get("presence_weight", 0.0) or 0.0) != 0.0
+        and loss_kwargs.get("presence_scale") is None
+        and train_cme is not None
+        and train_cme.presence_scale is not None
+    ):
+        loss_kwargs["presence_scale"] = [
+            float(x) for x in np.asarray(train_cme.presence_scale).tolist()
+        ]
+        scales = np.asarray(loss_kwargs["presence_scale"], dtype=np.float64)
+        print(
+            f"[ct_train] presence_scale per-type "
+            f"median={float(np.median(scales)):.6g} "
+            f"min={float(scales.min()):.6g} max={float(scales.max()):.6g} "
+            f"(C={len(scales)})",
+            flush=True,
+        )
     loss_fn = get_loss(str(cfg["loss"]["name"]), **loss_kwargs)
     eval_loss_fn = build_canonical_eval_loss(cfg)
+    cme_spearman_tau = float(loss_kwargs.get("cme_spearman_tau", 0.1))
+    cme_spearman_chunk_size = int(loss_kwargs.get("cme_spearman_chunk_size", 64))
     tcfg = cfg["train"]
     optimizer = AdamW(
         model.parameters(),
@@ -1313,6 +1470,8 @@ def main() -> None:
                         soft_cme_lookup=val_cme,
                         soft_cme_aux_lookups=val_cme_aux or None,
                         canonical_eval_fn=eval_loss_fn,
+                        cme_spearman_tau=cme_spearman_tau,
+                        cme_spearman_chunk_size=cme_spearman_chunk_size,
                     )
                 finally:
                     if ema is not None:
@@ -1322,6 +1481,7 @@ def main() -> None:
                     f"eval={val_metrics.get('eval_loss', val_metrics['loss']):.4f} "
                     f"cls={val_metrics['cls_loss']:.4f} "
                     f"cme={val_metrics['cme_loss']:.4f} "
+                    f"spr={val_metrics['cme_spearman_loss']:.4f} "
                     f"acc={val_metrics['acc']:.4f} "
                     f"cells={int(val_metrics['n_cells'])}",
                     flush=True,

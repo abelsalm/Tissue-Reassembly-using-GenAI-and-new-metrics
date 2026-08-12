@@ -5,11 +5,13 @@ For each cell ``i`` in a real ``cell_section`` (not training subgraph chunks):
     w_{ij} = exp( -||x_i - x_j||^2 / (2 σ^2) )   for neighbors j ≠ i
             (optionally truncated at ``cutoff_radius``)
 
-    soft_cme[i, c] = Σ_{j: class(j)=c} w_{ij}  /  Σ_j w_{ij}
+    cme_mass[i, c] = Σ_{j: class(j)=c} w_{ij}          (unnormalized)
+    soft_cme[i, c] = cme_mass[i, c] / Σ_j w_{ij}       (proportion)
 
-The result is a probability distribution over cell types describing the
-Gaussian-weighted neighborhood composition. Arrays are keyed by the CSV
-cell index so training can look them up after graph chunking/rechunking.
+``soft_cme`` is the soft neighborhood composition (simplex). ``cme_mass`` is
+the raw Gaussian type mass used for soft-presence targets (independent per
+type). Arrays are keyed by the CSV cell index so training can look them up
+after graph chunking/rechunking.
 
 Save layout (default)::
 
@@ -87,8 +89,8 @@ def soft_cme_gaussian_section(
     *,
     exclude_self: bool = True,
     cutoff_radius: Optional[float] = None,
-) -> np.ndarray:
-    """Soft CME for all cells in one section.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Soft CME proportion + unnormalized type mass for all cells in one section.
 
     Args:
         positions: ``(N, 2)`` coordinates (same units as ``sigma``).
@@ -99,7 +101,9 @@ def soft_cme_gaussian_section(
         cutoff_radius: Neighbor radius; default ``3 * sigma``.
 
     Returns:
-        ``(N, C)`` float32 rows that sum to 1 (uniform if no neighbors).
+        ``soft``: ``(N, C)`` float32 rows that sum to 1 (uniform if no neighbors).
+        ``mass``: ``(N, C)`` float32 unnormalized Gaussian weight sums ``m_c``
+        (zeros if no neighbors). Presence targets use ``mass``, not ``soft``.
     """
     positions = np.asarray(positions, dtype=np.float64)
     class_ids = np.asarray(class_ids, dtype=np.int64)
@@ -111,9 +115,10 @@ def soft_cme_gaussian_section(
         raise ValueError(f"sigma must be > 0, got {sigma}")
 
     n = positions.shape[0]
-    out = np.zeros((n, num_classes), dtype=np.float64)
+    mass = np.zeros((n, num_classes), dtype=np.float64)
+    soft = np.zeros((n, num_classes), dtype=np.float64)
     if n == 0:
-        return out.astype(np.float32)
+        return soft.astype(np.float32), mass.astype(np.float32)
 
     if cutoff_radius is None:
         cutoff_radius = float(3.0 * sigma)
@@ -127,7 +132,7 @@ def soft_cme_gaussian_section(
         if exclude_self:
             neigh = [j for j in neigh if j != i]
         if not neigh:
-            out[i] = 1.0 / float(num_classes)
+            soft[i] = 1.0 / float(num_classes)
             continue
 
         neigh_arr = np.asarray(neigh, dtype=np.int64)
@@ -136,14 +141,37 @@ def soft_cme_gaussian_section(
         w = np.exp(-d2 * inv_two_sigma2)
         w_sum = float(w.sum())
         if w_sum <= 0.0 or not np.isfinite(w_sum):
-            out[i] = 1.0 / float(num_classes)
+            soft[i] = 1.0 / float(num_classes)
             continue
 
         for j_idx, weight in zip(neigh_arr, w):
-            out[i, class_ids[j_idx]] += float(weight)
-        out[i] /= w_sum
+            mass[i, class_ids[j_idx]] += float(weight)
+        soft[i] = mass[i] / w_sum
 
-    return out.astype(np.float32)
+    return soft.astype(np.float32), mass.astype(np.float32)
+
+
+def presence_scale_from_mass(
+    cme_mass: np.ndarray, *, eps: float = 1e-12
+) -> np.ndarray:
+    """Per-type median of strictly positive unnormalized masses ``(C,)``.
+
+    Rare types typically have smaller positive ``m_c``; a per-type scale lets
+    them saturate soft presence at lower absolute mass than abundant types.
+    Types with no positive mass fall back to the global positive median (or 1).
+    """
+    mass = np.asarray(cme_mass, dtype=np.float64)
+    if mass.ndim != 2:
+        raise ValueError(f"cme_mass must be (N, C), got {mass.shape}")
+    n_classes = mass.shape[1]
+    scales = np.ones(n_classes, dtype=np.float64)
+    all_pos = mass[mass > eps]
+    global_med = float(np.median(all_pos)) if all_pos.size else 1.0
+    for c in range(n_classes):
+        pos = mass[:, c]
+        pos = pos[pos > eps]
+        scales[c] = float(np.median(pos)) if pos.size else global_med
+    return scales.astype(np.float64)
 
 
 def compute_soft_cme_dataframe(
@@ -180,6 +208,7 @@ def compute_soft_cme_dataframe(
     num_classes = len(vocab)
 
     soft = np.zeros((len(data), num_classes), dtype=np.float32)
+    mass = np.zeros((len(data), num_classes), dtype=np.float32)
     sections = data["cell_section"].astype(str).to_numpy()
     n_empty = 0
 
@@ -187,7 +216,7 @@ def compute_soft_cme_dataframe(
         mask = sections == section
         idx = np.flatnonzero(mask)
         pos = data.loc[mask, ["coord_X", "coord_Y"]].to_numpy(dtype=np.float64)
-        soft[idx] = soft_cme_gaussian_section(
+        soft[idx], mass[idx] = soft_cme_gaussian_section(
             pos,
             class_ids_arr[idx],
             num_classes=num_classes,
@@ -217,8 +246,11 @@ def compute_soft_cme_dataframe(
             flush=True,
         )
 
+    scale = presence_scale_from_mass(mass)
     return {
         "soft_cme": soft,
+        "cme_mass": mass,
+        "presence_scale": np.asarray(scale, dtype=np.float64),
         "cell_id": cell_ids,
         "cell_section": sections,
         "class_id": class_ids_arr,
@@ -245,12 +277,21 @@ def save_soft_cme(
     npz_path = out_dir / f"{split}_sigma{tag}.npz"
     meta_path = out_dir / f"meta_sigma{tag}.json"
 
+    cme_mass = np.asarray(result["cme_mass"], dtype=np.float32)
+    presence_scale = np.asarray(
+        result.get("presence_scale")
+        if result.get("presence_scale") is not None
+        else presence_scale_from_mass(cme_mass),
+        dtype=np.float64,
+    ).reshape(-1)
     np.savez_compressed(
         npz_path,
         soft_cme=np.asarray(result["soft_cme"], dtype=np.float32),
+        cme_mass=cme_mass,
         cell_id=np.asarray(result["cell_id"]),
         cell_section=np.asarray(result["cell_section"]).astype(str),
         class_id=np.asarray(result["class_id"], dtype=np.int64),
+        presence_scale=presence_scale.astype(np.float64),
     )
 
     meta = {
@@ -262,6 +303,7 @@ def save_soft_cme(
         "int_to_class": {
             str(k): v for k, v in dict(result["int_to_class"]).items()
         },
+        "presence_scale": [float(x) for x in presence_scale.tolist()],
         "splits": {},
     }
     if meta_path.exists():
@@ -269,6 +311,10 @@ def save_soft_cme(
             prev = json.loads(meta_path.read_text())
             if prev.get("class_names") == meta["class_names"]:
                 meta["splits"] = dict(prev.get("splits") or {})
+                # Keep train-derived per-type scale if already set and this
+                # is not train.
+                if split != "train" and prev.get("presence_scale") is not None:
+                    meta["presence_scale"] = prev["presence_scale"]
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -276,6 +322,7 @@ def save_soft_cme(
         "npz": npz_path.name,
         "n_cells": int(len(result["soft_cme"])),
         "n_sections": int(len(set(map(str, result["cell_section"])))),
+        "presence_scale": [float(x) for x in presence_scale.tolist()],
     }
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"[soft_cme] wrote {npz_path}  ({meta['splits'][split]['n_cells']} cells)")
@@ -302,6 +349,7 @@ def load_soft_cme(
 
     data = np.load(npz_path, allow_pickle=False)
     soft = data["soft_cme"]
+    cme_mass = data["cme_mass"] if "cme_mass" in data.files else None
     cell_id = data["cell_id"]
     if np.issubdtype(cell_id.dtype, np.integer):
         by_cell_id = {int(cell_id[i]): soft[i] for i in range(len(cell_id))}
@@ -312,8 +360,22 @@ def load_soft_cme(
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
 
+    presence_scale = meta.get("presence_scale")
+    if "presence_scale" in data.files:
+        presence_scale = np.asarray(data["presence_scale"], dtype=np.float64)
+    elif presence_scale is None and cme_mass is not None:
+        presence_scale = presence_scale_from_mass(cme_mass)
+    elif presence_scale is not None:
+        presence_scale = np.asarray(presence_scale, dtype=np.float64).reshape(-1)
+
     return {
         "soft_cme": soft,
+        "cme_mass": cme_mass,
+        "presence_scale": (
+            np.asarray(presence_scale, dtype=np.float64).reshape(-1)
+            if presence_scale is not None
+            else None
+        ),
         "cell_id": cell_id,
         "cell_section": data["cell_section"],
         "class_id": data["class_id"],

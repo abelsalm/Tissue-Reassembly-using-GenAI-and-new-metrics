@@ -363,6 +363,11 @@ class CellTypeTransformer(nn.Module):
         towers produce intermediates ``t_i``, ``e_i``; fuse with optional ``h_i``
         via LN+MLP; stage-2 heads read the fused features for final logits.
         Stage-1 linear probes are also returned for ablation.
+      * ``cme_presence_gate``: if True (requires ``predict_cme``), the CME head
+        splits into presence (sigmoid) and composition (softmax); the final
+        mix is ``normalize(π ⊙ q)`` returned as ``cme_probs`` (and log-probs
+        as ``cme_logits`` for SoftCE-compatible callers that already softmax —
+        prefer ``cme_probs`` in the loss).
       * ``gene_mlp_depth``: number of gene-MLP linears (2 = G→gene_hidden→dx;
         3 adds an extra gene_hidden block).
       * ``layer_activation``: FFN nonlinearity inside each ``GeneTransformerLayer``.
@@ -400,6 +405,7 @@ class CellTypeTransformer(nn.Module):
         predict_cme: bool = False,
         feature_cross: bool = False,
         feature_cross_include_h: bool = True,
+        cme_presence_gate: bool = False,
         cme_entropy_temp_t0: float = 1.0,
         cme_entropy_temp_alpha: float = 0.0,
     ) -> None:
@@ -460,6 +466,7 @@ class CellTypeTransformer(nn.Module):
         self.predict_cme = bool(predict_cme)
         self.feature_cross = bool(feature_cross)
         self.feature_cross_include_h = bool(feature_cross_include_h)
+        self.cme_presence_gate = bool(cme_presence_gate)
         self.cme_detach_type_in_fusion = bool(cme_detach_type_in_fusion)
         self.dual_fusion = bool(dual_fusion)
         self.gene_knn_k = int(gene_knn_k)
@@ -472,6 +479,8 @@ class CellTypeTransformer(nn.Module):
 
         if self.feature_cross and not self.predict_cme:
             raise ValueError("feature_cross=True requires predict_cme=True")
+        if self.cme_presence_gate and not self.predict_cme:
+            raise ValueError("cme_presence_gate=True requires predict_cme=True")
 
         self.gene_mlp_depth = int(gene_mlp_depth)
         gene_act_names = _resolve_gene_mlp_activations(
@@ -521,6 +530,8 @@ class CellTypeTransformer(nn.Module):
         # Parallel heads (no cross) — kept when feature_cross is off.
         self.cls_head = None
         self.cme_head = None
+        self.presence_head = None
+        self.comp_head = None
         # Cross pathway modules (None when feature_cross is off).
         self.type_stage1 = None
         self.env_stage1 = None
@@ -529,6 +540,8 @@ class CellTypeTransformer(nn.Module):
         self.fusion_mlp = None
         self.type_stage2 = None
         self.env_stage2 = None
+        self.presence_stage2 = None
+        self.comp_stage2 = None
 
         if not self.feature_cross:
             self.cls_head = _mlp_head(
@@ -539,13 +552,29 @@ class CellTypeTransformer(nn.Module):
                 dropout_cls,
             )
             if self.predict_cme:
-                self.cme_head = _mlp_head(
-                    head_in,
-                    self.cme_hidden_dim,
-                    num_classes,
-                    build_activation(cme_activation),
-                    dropout_cme,
-                )
+                if self.cme_presence_gate:
+                    self.presence_head = _mlp_head(
+                        head_in,
+                        self.cme_hidden_dim,
+                        num_classes,
+                        build_activation(cme_activation),
+                        dropout_cme,
+                    )
+                    self.comp_head = _mlp_head(
+                        head_in,
+                        self.cme_hidden_dim,
+                        num_classes,
+                        build_activation(cme_activation),
+                        dropout_cme,
+                    )
+                else:
+                    self.cme_head = _mlp_head(
+                        head_in,
+                        self.cme_hidden_dim,
+                        num_classes,
+                        build_activation(cme_activation),
+                        dropout_cme,
+                    )
         else:
             # Intermediate dims for stage-1 towers.
             self.type_stage1_dim = int(
@@ -607,13 +636,49 @@ class CellTypeTransformer(nn.Module):
             cme_in = self.fusion_out_dim + (
                 num_classes if self.cme_condition_on_cls else 0
             )
-            self.env_stage2 = _mlp_head(
-                cme_in,
-                self.cme_hidden_dim,
-                num_classes,
-                build_activation(cme_activation),
-                dropout_cme,
-            )
+            if self.cme_presence_gate:
+                self.presence_stage2 = _mlp_head(
+                    cme_in,
+                    self.cme_hidden_dim,
+                    num_classes,
+                    build_activation(cme_activation),
+                    dropout_cme,
+                )
+                self.comp_stage2 = _mlp_head(
+                    cme_in,
+                    self.cme_hidden_dim,
+                    num_classes,
+                    build_activation(cme_activation),
+                    dropout_cme,
+                )
+                # Keep env_stage2 as an alias of composition for stage-1-style
+                # tooling that still looks for a single CME stage-2 module.
+                self.env_stage2 = self.comp_stage2
+            else:
+                self.env_stage2 = _mlp_head(
+                    cme_in,
+                    self.cme_hidden_dim,
+                    num_classes,
+                    build_activation(cme_activation),
+                    dropout_cme,
+                )
+
+    @staticmethod
+    def compose_gated_cme(
+        presence_logits: torch.Tensor,
+        comp_logits: torch.Tensor,
+        *,
+        eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """π = σ(presence), q = softmax(comp), p = normalize(π ⊙ q).
+
+        Returns ``(presence_probs, comp_probs, cme_probs)``.
+        """
+        presence = torch.sigmoid(presence_logits)
+        comp = F.softmax(comp_logits, dim=-1)
+        gated = presence * comp
+        cme_probs = gated / gated.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return presence, comp, cme_probs
 
     def _head_input_dim(self) -> int:
         """Channel count into task heads given skip / summary options."""
@@ -694,6 +759,8 @@ class CellTypeTransformer(nn.Module):
         Returns:
             dict with:
               * ``cls_logits`` / ``cme_logits`` — final scores used for training
+              * if ``cme_presence_gate``: also ``presence_logits``, ``comp_logits``,
+                ``cme_probs`` (composed mix; prefer this over softmaxing logits)
               * if ``feature_cross``: also ``cls_logits_stage1``,
                 ``cme_logits_stage1`` (probes from stage-1 features)
         """
@@ -702,8 +769,27 @@ class CellTypeTransformer(nn.Module):
 
         if not self.feature_cross:
             out = {"cls_logits": self.cls_head(h) * mask}
-            if self.predict_cme and self.cme_head is not None:
-                out["cme_logits"] = self.cme_head(h) * mask
+            if self.predict_cme:
+                if self.cme_presence_gate:
+                    presence_logits = self.presence_head(h) * mask
+                    comp_logits = self.comp_head(h) * mask
+                    _, _, cme_probs = self.compose_gated_cme(
+                        presence_logits, comp_logits
+                    )
+                    cme_probs = cme_probs * mask
+                    out.update(
+                        {
+                            "presence_logits": presence_logits,
+                            "comp_logits": comp_logits,
+                            "cme_probs": cme_probs,
+                            # Log-space probs for SoftCE paths that still
+                            # apply log_softmax: use ``cme_probs`` in loss.
+                            "cme_logits": torch.log(cme_probs.clamp_min(1e-8))
+                            * mask,
+                        }
+                    )
+                elif self.cme_head is not None:
+                    out["cme_logits"] = self.cme_head(h) * mask
             return out
 
         t = self.type_stage1(h)
@@ -734,23 +820,42 @@ class CellTypeTransformer(nn.Module):
             f_cme_in = torch.cat([f_cme, t_probs], dim=-1)
         else:
             f_cme_in = f_cme
-        cme_logits = self.env_stage2(f_cme_in) * mask
-        if abs(self.cme_entropy_temp_alpha) > 1e-12 or abs(
-            self.cme_entropy_temp_t0 - 1.0
-        ) > 1e-12:
-            # Per-cell temperature from predictive entropy (eval/calib).
-            logp = F.log_softmax(cme_logits, dim=-1)
-            p = logp.exp()
-            H = -(p * logp).sum(dim=-1, keepdim=True)
-            T = (
-                self.cme_entropy_temp_t0
-                + self.cme_entropy_temp_alpha * (H - H.mean())
-            ).clamp(0.7, 1.4)
-            cme_logits = (cme_logits / T) * mask
+
         out = {
             "cls_logits": cls_logits,
-            "cme_logits": cme_logits,
             "cls_logits_stage1": self.type_probe(t) * mask,
             "cme_logits_stage1": self.env_probe(e) * mask,
         }
+
+        if self.cme_presence_gate:
+            presence_logits = self.presence_stage2(f_cme_in) * mask
+            comp_logits = self.comp_stage2(f_cme_in) * mask
+            _, _, cme_probs = self.compose_gated_cme(
+                presence_logits, comp_logits
+            )
+            cme_probs = cme_probs * mask
+            cme_logits = torch.log(cme_probs.clamp_min(1e-8)) * mask
+            out.update(
+                {
+                    "presence_logits": presence_logits,
+                    "comp_logits": comp_logits,
+                    "cme_probs": cme_probs,
+                    "cme_logits": cme_logits,
+                }
+            )
+        else:
+            cme_logits = self.env_stage2(f_cme_in) * mask
+            if abs(self.cme_entropy_temp_alpha) > 1e-12 or abs(
+                self.cme_entropy_temp_t0 - 1.0
+            ) > 1e-12:
+                # Per-cell temperature from predictive entropy (eval/calib).
+                logp = F.log_softmax(cme_logits, dim=-1)
+                p = logp.exp()
+                H = -(p * logp).sum(dim=-1, keepdim=True)
+                T = (
+                    self.cme_entropy_temp_t0
+                    + self.cme_entropy_temp_alpha * (H - H.mean())
+                ).clamp(0.7, 1.4)
+                cme_logits = (cme_logits / T) * mask
+            out["cme_logits"] = cme_logits
         return out
