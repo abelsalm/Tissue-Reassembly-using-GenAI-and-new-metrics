@@ -48,5 +48,17 @@ outputs/*
 ./exploration/cell_types/experiments/notes
 ./exploration/cell_types/experiments/notes/*
 
-*.jso
+*.json
 **/*.json
+*.log
+**/*.log
+*.log.*
+**/*.log.*
+*.log.*.*
+**/*.log.*.*
+*.log.*.*.*
+**/*.log.*.*.*
+*.log.*.*.*.*
+**/*.log.*.*.*.*
+*.log.*.*.*.*.*
+**/*.log.*.*.*.*.*
