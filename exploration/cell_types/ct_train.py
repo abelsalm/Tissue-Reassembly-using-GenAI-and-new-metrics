@@ -190,11 +190,15 @@ def soft_cme_is_needed(cfg: Dict[str, Any]) -> bool:
 
 
 def soft_cme_mass_needed(cfg: Dict[str, Any]) -> bool:
-    """Unnormalized CME mass required for presence-gate supervision."""
+    """Unnormalized CME mass required for legacy mass-based presence targets."""
     mcfg = cfg.get("model") or {}
     lcfg = cfg.get("loss") or {}
-    return bool(mcfg.get("cme_presence_gate", False)) or (
-        float(lcfg.get("presence_weight", 0.0) or 0.0) != 0.0
+    if float(lcfg.get("presence_weight", 0.0) or 0.0) == 0.0:
+        return False
+    target = str(lcfg.get("presence_target", "soft_cme")).strip().lower()
+    return target == "mass" and (
+        bool(mcfg.get("cme_presence_gate", False))
+        or float(lcfg.get("presence_weight", 0.0) or 0.0) != 0.0
     )
 
 
@@ -503,6 +507,8 @@ def build_model(cfg: Dict[str, Any], gene_dim: int, num_classes: int) -> CellTyp
         feature_cross=bool(mcfg.get("feature_cross", False)),
         feature_cross_include_h=bool(mcfg.get("feature_cross_include_h", True)),
         cme_presence_gate=bool(mcfg.get("cme_presence_gate", False)),
+        presence_bias_init=float(mcfg.get("presence_bias_init", 0.0)),
+        presence_topk=int(mcfg.get("presence_topk", 0) or 0),
     )
 
 
@@ -513,15 +519,21 @@ def build_canonical_eval_loss(cfg: Dict[str, Any]):
     comparable. ``label_smoothing`` is hardcoded to 0.05 for cls CE even when
     training uses a different value (e.g. exp012 trains with ls=0). CME uses
     raw logits (``cme_temperature=1``) regardless of training temperature.
+
+    When ``model.cme_presence_gate`` is on, SoftCE is applied to the **final
+    gated mix** ``normalize(π ⊙ q)`` (not composition alone), so the metric
+    scores the model's actual CME prediction.
     """
-    return get_loss(
-        "combined",
+    kwargs: Dict[str, Any] = dict(
         label_smoothing=0.05,
         cls_weight=1.0,
         cme_weight=1.0,
         stage1_cls_weight=0.0,
         stage1_cme_weight=0.0,
     )
+    if bool((cfg.get("model") or {}).get("cme_presence_gate", False)):
+        kwargs["cme_softce_source"] = "gated"
+    return get_loss("combined", **kwargs)
 
 
 def load_ema_weights_into_model(
@@ -1003,6 +1015,7 @@ def run_epoch(
     total_cme_loss = 0.0
     total_cme_aux_loss = 0.0
     total_cme_spearman_loss = 0.0
+    total_presence_loss = 0.0
     total_kd_loss = 0.0
     total_canon_cls = 0.0
     total_canon_cme = 0.0
@@ -1035,6 +1048,9 @@ def run_epoch(
             cme_spearman_loss_val = float(
                 parts.get("cme_spearman", parts["cls"] * 0).detach().item()
             )
+            presence_loss_val = float(
+                parts.get("presence", parts["cls"] * 0).detach().item()
+            )
         else:
             # Hard-CE-only path still expects logits tensor historically.
             loss = loss_out
@@ -1042,6 +1058,7 @@ def run_epoch(
             cme_loss_val = 0.0
             cme_aux_loss_val = 0.0
             cme_spearman_loss_val = 0.0
+            presence_loss_val = 0.0
 
         # Always report soft-Spearman on validation when CME is available,
         # even if loss.cme_spearman_weight == 0 (train placeholder is zero).
@@ -1129,6 +1146,7 @@ def run_epoch(
         total_cme_loss += cme_loss_val
         total_cme_aux_loss += cme_aux_loss_val
         total_cme_spearman_loss += cme_spearman_loss_val
+        total_presence_loss += presence_loss_val
         total_kd_loss += kd_loss_val
         total_correct += int(acc * n)
         total_cells += n
@@ -1136,6 +1154,8 @@ def run_epoch(
 
         if log_every and train and (step + 1) % log_every == 0:
             extra = f" kd={kd_loss_val:.4f}" if use_distill else ""
+            if presence_loss_val != 0.0:
+                extra += f" pres={presence_loss_val:.4f}"
             if cme_spearman_loss_val != 0.0:
                 extra += f" spr={cme_spearman_loss_val:.4f}"
             print(
@@ -1149,6 +1169,7 @@ def run_epoch(
                     f"{split}/step_loss": loss_val,
                     f"{split}/step_cls_loss": cls_loss_val,
                     f"{split}/step_cme_loss": cme_loss_val,
+                    f"{split}/step_presence": presence_loss_val,
                     f"{split}/step_cme_spearman": cme_spearman_loss_val,
                     f"{split}/step_acc": acc,
                     "epoch": epoch,
@@ -1166,6 +1187,7 @@ def run_epoch(
     mean_cme = total_cme_loss / max(n_batches, 1)
     mean_cme_aux = total_cme_aux_loss / max(n_batches, 1)
     mean_cme_spearman = total_cme_spearman_loss / max(n_batches, 1)
+    mean_presence = total_presence_loss / max(n_batches, 1)
     mean_kd = total_kd_loss / max(n_batches, 1)
     if use_canon and not train:
         mean_cls = total_canon_cls / max(n_batches, 1)
@@ -1176,6 +1198,7 @@ def run_epoch(
         "cme_loss": mean_cme,
         "cme_aux_loss": mean_cme_aux,
         "cme_spearman_loss": mean_cme_spearman,
+        "presence_loss": mean_presence,
         "kd_loss": mean_kd,
         "acc": mean_acc,
         "n_cells": float(total_cells),
@@ -1338,9 +1361,11 @@ def main() -> None:
     loss_kwargs = {
         k: v for k, v in dict(cfg.get("loss", {})).items() if k != "name"
     }
-    # Fill presence_scale from train soft-CME per-type positive-mass medians.
+    # Fill presence_scale from train soft-CME per-type positive-mass medians
+    # (only needed for legacy presence_target='mass').
     if (
         float(loss_kwargs.get("presence_weight", 0.0) or 0.0) != 0.0
+        and str(loss_kwargs.get("presence_target", "soft_cme")).lower() == "mass"
         and loss_kwargs.get("presence_scale") is None
         and train_cme is not None
         and train_cme.presence_scale is not None
@@ -1448,6 +1473,7 @@ def main() -> None:
                 f"[train] loss={train_metrics['loss']:.4f} "
                 f"cls={train_metrics['cls_loss']:.4f} "
                 f"cme={train_metrics['cme_loss']:.4f} "
+                f"pres={train_metrics['presence_loss']:.4f} "
                 f"acc={train_metrics['acc']:.4f} "
                 f"cells={int(train_metrics['n_cells'])}{kd_msg}",
                 flush=True,
@@ -1481,6 +1507,7 @@ def main() -> None:
                     f"eval={val_metrics.get('eval_loss', val_metrics['loss']):.4f} "
                     f"cls={val_metrics['cls_loss']:.4f} "
                     f"cme={val_metrics['cme_loss']:.4f} "
+                    f"pres={val_metrics['presence_loss']:.4f} "
                     f"spr={val_metrics['cme_spearman_loss']:.4f} "
                     f"acc={val_metrics['acc']:.4f} "
                     f"cells={int(val_metrics['n_cells'])}",
@@ -1556,6 +1583,7 @@ def main() -> None:
                 "train/loss": train_metrics["loss"],
                 "train/cls_loss": train_metrics["cls_loss"],
                 "train/cme_loss": train_metrics["cme_loss"],
+                "train/presence": train_metrics["presence_loss"],
                 "train/cme_spearman": train_metrics["cme_spearman_loss"],
                 "train/acc": train_metrics["acc"],
                 "train/n_cells": train_metrics["n_cells"],
@@ -1566,6 +1594,7 @@ def main() -> None:
                         "val/loss": val_metrics["loss"],
                         "val/cls_loss": val_metrics["cls_loss"],
                         "val/cme_loss": val_metrics["cme_loss"],
+                        "val/presence": val_metrics["presence_loss"],
                         "val/cme_spearman": val_metrics["cme_spearman_loss"],
                         "val/eval_loss": val_metrics["eval_loss"],
                         "val/acc": val_metrics["acc"],
@@ -1591,6 +1620,7 @@ def main() -> None:
                 "loss",
                 "cls_loss",
                 "cme_loss",
+                "presence_loss",
                 "cme_spearman_loss",
                 "eval_loss",
                 "acc",

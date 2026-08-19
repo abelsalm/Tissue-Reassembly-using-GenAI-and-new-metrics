@@ -3,18 +3,18 @@
   "device": "cuda",
   "output_dir": "exploration/cell_types/outputs",
   "log_dir": "exploration/cell_types/logs",
-  "run_name": "ct_transformer_best",
+  "run_name": "ct_transformer_gate_best",
   "wandb": {
     "enabled": true,
     "project": "cell_types",
     "entity": null,
     "mode": "online",
     "tags": [
-      "best_recipe",
-      "no_calib"
+      "gate_best",
+      "bag2_joint"
     ],
-    "log_every_steps": true,
-    "log_per_class_acc": true
+    "log_every_steps": false,
+    "log_per_class_acc": false
   },
   "soft_cme": {
     "enabled": true,
@@ -67,6 +67,7 @@
       "gene": 64,
       "cls": 96,
       "cme": 320,
+      "presence": 128,
       "type_stage1": 96,
       "env_stage1": 320,
       "fusion": 384
@@ -82,14 +83,19 @@
     "label_smoothing": 0.06,
     "cls_weight": 1.0,
     "cme_weight": 2.0,
-    "presence_weight": 0.5,
+    "cme_softce_source": "gated_joint",
+    "cme_gated_weight": 0.0,
+    "presence_weight": 0.0,
+    "presence_target": "mass",
+    "presence_pos_weight": "auto",
     "presence_saturation": 1.0,
     "stage1_cls_weight": 0.0,
     "stage1_cme_weight": 0.0,
     "aux_cme_weight": 0.17,
     "cme_spearman_weight": 0,
     "cme_spearman_tau": 0.01,
-    "cme_spearman_chunk_size": 64
+    "cme_spearman_chunk_size": 64,
+    "bag_cme_weight": 2.0
   },
   "train": {
     "n_epochs": 1000,

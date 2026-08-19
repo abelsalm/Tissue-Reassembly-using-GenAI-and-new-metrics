@@ -406,6 +406,8 @@ class CellTypeTransformer(nn.Module):
         feature_cross: bool = False,
         feature_cross_include_h: bool = True,
         cme_presence_gate: bool = False,
+        presence_bias_init: float = 0.0,
+        presence_topk: int = 0,
         cme_entropy_temp_t0: float = 1.0,
         cme_entropy_temp_alpha: float = 0.0,
     ) -> None:
@@ -443,6 +445,10 @@ class CellTypeTransformer(nn.Module):
         self.gene_hidden_dim = int(hidden_mlp_dims["gene"])
         self.cls_hidden_dim = int(hidden_mlp_dims["cls"])
         self.cme_hidden_dim = int(hidden_mlp_dims["cme"])
+        # Presence gate is a lighter twin of the CME composition head by default.
+        self.presence_hidden_dim = int(
+            hidden_mlp_dims.get("presence", min(128, self.cme_hidden_dim))
+        )
         self.global_skip = _normalize_global_skip(global_skip)
         self.subgraph_summary = bool(subgraph_summary)
         pool_key = str(subgraph_pool).strip().lower()
@@ -467,6 +473,8 @@ class CellTypeTransformer(nn.Module):
         self.feature_cross = bool(feature_cross)
         self.feature_cross_include_h = bool(feature_cross_include_h)
         self.cme_presence_gate = bool(cme_presence_gate)
+        self.presence_bias_init = float(presence_bias_init)
+        self.presence_topk = int(presence_topk)
         self.cme_detach_type_in_fusion = bool(cme_detach_type_in_fusion)
         self.dual_fusion = bool(dual_fusion)
         self.gene_knn_k = int(gene_knn_k)
@@ -555,7 +563,7 @@ class CellTypeTransformer(nn.Module):
                 if self.cme_presence_gate:
                     self.presence_head = _mlp_head(
                         head_in,
-                        self.cme_hidden_dim,
+                        self.presence_hidden_dim,
                         num_classes,
                         build_activation(cme_activation),
                         dropout_cme,
@@ -639,7 +647,7 @@ class CellTypeTransformer(nn.Module):
             if self.cme_presence_gate:
                 self.presence_stage2 = _mlp_head(
                     cme_in,
-                    self.cme_hidden_dim,
+                    self.presence_hidden_dim,
                     num_classes,
                     build_activation(cme_activation),
                     dropout_cme,
@@ -663,18 +671,45 @@ class CellTypeTransformer(nn.Module):
                     dropout_cme,
                 )
 
+        self._init_presence_bias()
+
+    def _init_presence_bias(self) -> None:
+        """Optionally bias presence logits so π starts near-saturated (gate≈id)."""
+        if not self.cme_presence_gate or abs(self.presence_bias_init) < 1e-12:
+            return
+        for head in (self.presence_head, self.presence_stage2):
+            if head is None:
+                continue
+            # Last Linear in Sequential MLP head.
+            last = None
+            for mod in head.modules():
+                if isinstance(mod, nn.Linear):
+                    last = mod
+            if last is not None and last.bias is not None:
+                nn.init.constant_(last.bias, float(self.presence_bias_init))
+
     @staticmethod
     def compose_gated_cme(
         presence_logits: torch.Tensor,
         comp_logits: torch.Tensor,
         *,
         eps: float = 1e-8,
+        presence_topk: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """π = σ(presence), q = softmax(comp), p = normalize(π ⊙ q).
 
         Returns ``(presence_probs, comp_probs, cme_probs)``.
+        If ``presence_topk > 0``, zero all but the top-k presence values per
+        cell before the product (hard sparse support).
         """
         presence = torch.sigmoid(presence_logits)
+        k = int(presence_topk)
+        if k > 0:
+            k = min(k, presence.size(-1))
+            topv, topi = torch.topk(presence, k, dim=-1)
+            mask = torch.zeros_like(presence)
+            mask.scatter_(-1, topi, 1.0)
+            presence = presence * mask
         comp = F.softmax(comp_logits, dim=-1)
         gated = presence * comp
         cme_probs = gated / gated.sum(dim=-1, keepdim=True).clamp_min(eps)
@@ -774,7 +809,9 @@ class CellTypeTransformer(nn.Module):
                     presence_logits = self.presence_head(h) * mask
                     comp_logits = self.comp_head(h) * mask
                     _, _, cme_probs = self.compose_gated_cme(
-                        presence_logits, comp_logits
+                        presence_logits,
+                        comp_logits,
+                        presence_topk=self.presence_topk,
                     )
                     cme_probs = cme_probs * mask
                     out.update(
@@ -831,7 +868,9 @@ class CellTypeTransformer(nn.Module):
             presence_logits = self.presence_stage2(f_cme_in) * mask
             comp_logits = self.comp_stage2(f_cme_in) * mask
             _, _, cme_probs = self.compose_gated_cme(
-                presence_logits, comp_logits
+                presence_logits,
+                comp_logits,
+                presence_topk=self.presence_topk,
             )
             cme_probs = cme_probs * mask
             cme_logits = torch.log(cme_probs.clamp_min(1e-8)) * mask

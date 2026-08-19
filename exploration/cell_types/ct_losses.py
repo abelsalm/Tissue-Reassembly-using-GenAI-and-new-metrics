@@ -76,11 +76,13 @@ def soft_cross_entropy(
     target: torch.Tensor,
     node_mask: torch.Tensor,
     eps: float = 1e-8,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Masked soft CE between logits and a probability target.
 
     ``loss = -Σ_c target_c · log_softmax(logits)_c``, averaged over real cells.
     Softmax is applied here (logits must be raw scores).
+    Optional ``class_weights`` ``(C,)`` reweights the per-class CE terms.
     """
     if logits.shape != target.shape:
         raise ValueError(
@@ -96,7 +98,13 @@ def soft_cross_entropy(
     target = target / target.sum(dim=-1, keepdim=True).clamp_min(eps)
 
     log_probs = F.log_softmax(logits, dim=-1)
-    per_cell = -(target * log_probs).sum(dim=-1)  # (B, N)
+    if class_weights is not None:
+        w = class_weights.to(device=target.device, dtype=target.dtype)
+        while w.ndim < target.ndim:
+            w = w.unsqueeze(0)
+        per_cell = -(target * log_probs * w).sum(dim=-1)  # (B, N)
+    else:
+        per_cell = -(target * log_probs).sum(dim=-1)  # (B, N)
     per_cell_m = per_cell[mask]
     if per_cell_m.numel() == 0:
         return logits.sum() * 0.0
@@ -108,6 +116,7 @@ def soft_cross_entropy_probs(
     target: torch.Tensor,
     node_mask: torch.Tensor,
     eps: float = 1e-8,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Masked soft CE when predictions are already a simplex (gated CME)."""
     if probs.shape != target.shape:
@@ -122,7 +131,13 @@ def soft_cross_entropy_probs(
     target = target.clamp_min(0.0)
     target = target / target.sum(dim=-1, keepdim=True).clamp_min(eps)
     log_probs = probs.clamp_min(eps).log()
-    per_cell = -(target * log_probs).sum(dim=-1)
+    if class_weights is not None:
+        w = class_weights.to(device=target.device, dtype=target.dtype)
+        while w.ndim < target.ndim:
+            w = w.unsqueeze(0)
+        per_cell = -(target * log_probs * w).sum(dim=-1)
+    else:
+        per_cell = -(target * log_probs).sum(dim=-1)
     per_cell_m = per_cell[mask]
     if per_cell_m.numel() == 0:
         return probs.sum() * 0.0
@@ -162,25 +177,141 @@ def soft_presence_from_mass(
     return 1.0 - torch.exp(-(mass / scale))
 
 
+def soft_presence_from_soft_cme(
+    soft_cme: torch.Tensor,
+    *,
+    mode: str = "soft_cme",
+    power: float = 1.0,
+    eps: float = 1e-3,
+    renorm_eps: float = 1e-8,
+) -> torch.Tensor:
+    """Presence targets aligned with SoftCE composition ``soft_cme``.
+
+    Modes:
+      * ``soft_cme`` — π*_c = soft_cme_c (soft multi-label on the simplex)
+      * ``soft_cme_thresh`` — π*_c = 1[soft_cme_c > eps]
+      * ``soft_cme_power`` — π*_c = 1 - (1 - soft_cme_c)^power
+    """
+    if mode not in ("soft_cme", "soft_cme_thresh", "soft_cme_power"):
+        raise ValueError(
+            f"unknown soft_cme presence mode {mode!r}; expected "
+            "'soft_cme', 'soft_cme_thresh', or 'soft_cme_power'"
+        )
+    soft = soft_cme.clamp_min(0.0)
+    soft = soft / soft.sum(dim=-1, keepdim=True).clamp_min(renorm_eps)
+    if mode == "soft_cme":
+        return soft
+    if mode == "soft_cme_thresh":
+        return (soft > float(eps)).to(dtype=soft.dtype)
+    p = float(power)
+    if p <= 0:
+        raise ValueError(f"presence_target_power must be > 0 (got {p})")
+    return 1.0 - (1.0 - soft).clamp(0.0, 1.0).pow(p)
+
+
 def masked_bce_presence(
     presence_logits: torch.Tensor,
     presence_target: torch.Tensor,
     node_mask: torch.Tensor,
+    *,
+    pos_weight: Optional[Union[float, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Masked BCE-with-logits between predicted π and soft presence target."""
+    """Masked BCE-with-logits between predicted π and soft presence target.
+
+    ``pos_weight`` (scalar or ``(C,)``) upweights positives to counter the
+    many near-zero presence targets in a neighborhood. When ``None``, plain BCE.
+    """
     if presence_logits.shape != presence_target.shape:
         raise ValueError(
             f"presence logits/target shape mismatch: "
             f"{tuple(presence_logits.shape)} vs {tuple(presence_target.shape)}"
         )
+    pw = None
+    if pos_weight is not None:
+        if not torch.is_tensor(pos_weight):
+            pw = torch.as_tensor(
+                float(pos_weight),
+                device=presence_logits.device,
+                dtype=presence_logits.dtype,
+            )
+        else:
+            pw = pos_weight.to(
+                device=presence_logits.device, dtype=presence_logits.dtype
+            )
+        if pw.ndim == 0:
+            pw = pw.expand(presence_logits.size(-1))
+        elif pw.numel() == 1:
+            pw = pw.reshape(-1).expand(presence_logits.size(-1))
+        elif pw.numel() != presence_logits.size(-1):
+            raise ValueError(
+                f"presence pos_weight length {pw.numel()} != "
+                f"C={presence_logits.size(-1)}"
+            )
     per_elem = F.binary_cross_entropy_with_logits(
-        presence_logits, presence_target, reduction="none"
+        presence_logits,
+        presence_target,
+        pos_weight=pw,
+        reduction="none",
     )
     per_cell = per_elem.mean(dim=-1)
     mask = node_mask.bool()
     if mask.any():
         return per_cell[mask].mean()
     return per_cell.mean() * 0.0
+
+
+def _auto_presence_pos_weight(
+    presence_target: torch.Tensor,
+    node_mask: torch.Tensor,
+    *,
+    eps: float = 1e-4,
+    max_weight: float = 50.0,
+) -> torch.Tensor:
+    """Per-class ``n_neg / n_pos`` on masked cells (clamped)."""
+    mask = node_mask.bool()
+    if not mask.any():
+        return torch.ones(
+            presence_target.size(-1),
+            device=presence_target.device,
+            dtype=presence_target.dtype,
+        )
+    tgt = presence_target[mask]  # (M, C)
+    pos = tgt.sum(dim=0).clamp_min(eps)
+    neg = (1.0 - tgt).sum(dim=0).clamp_min(eps)
+    return (neg / pos).clamp(1.0, float(max_weight))
+
+
+def reverse_kl_probs(
+    probs: torch.Tensor,
+    target: torch.Tensor,
+    node_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Masked reverse KL ``KL(pred || target)`` on simplex predictions."""
+    if probs.shape != target.shape:
+        raise ValueError(
+            f"probs/target shape mismatch: {tuple(probs.shape)} vs "
+            f"{tuple(target.shape)}"
+        )
+    mask = node_mask.bool()
+    target = target.clamp_min(0.0)
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(eps)
+    p = probs.clamp_min(eps)
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(eps)
+    per_cell = (p * (p.log() - target.clamp_min(eps).log())).sum(dim=-1)
+    per_cell_m = per_cell[mask]
+    if per_cell_m.numel() == 0:
+        return probs.sum() * 0.0
+    return per_cell_m.mean()
+
+
+def reverse_kl_from_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    node_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    return reverse_kl_probs(F.softmax(logits, dim=-1), target, node_mask, eps=eps)
 
 
 def soft_js_divergence(
@@ -397,6 +528,16 @@ def make_combined_loss(
     presence_weight: float = 0.0,
     presence_scale: Optional[Union[float, list, tuple]] = None,
     presence_saturation: float = 1.0,
+    presence_target: str = "soft_cme",
+    presence_target_power: float = 1.0,
+    presence_target_eps: float = 1e-3,
+    presence_pos_weight: Optional[Union[float, str, list, tuple]] = "auto",
+    cme_softce_source: str = "comp",
+    cme_gated_weight: float = 0.0,
+    cme_target_support_eps: float = 0.0,
+    presence_sparsity_weight: float = 0.0,
+    cme_class_balance: bool = False,
+    cme_train_sigma: Optional[float] = None,
     eps: float = 1e-8,
 ) -> LossFn:
     """Weighted final-head losses + optional stage-1 probe aux losses.
@@ -405,15 +546,23 @@ def make_combined_loss(
     and, if present / weights > 0:
     ``stage1_*_weight`` on ``cls_logits_stage1`` / ``cme_logits_stage1``.
 
-    When the model returns ``cme_probs`` (presence gate), the main / aux CME
-    SoftCE terms use those probs directly instead of ``softmax(cme_logits)``.
+    When the model returns a presence gate, ``cme_softce_source`` selects what
+    SoftCE trains (default ``\"comp\"`` = composition logits only, so SoftCE
+    does not fight the presence BCE). ``\"gated\"`` uses renormalized
+    ``π.detach() ⊙ q`` (SoftCE updates composition only). ``\"gated_joint\"``
+    SoftCEs the live ``cme_probs = normalize(π ⊙ q)`` so gradients flow into
+    both presence and composition. ``\"both\"`` adds
+    ``cme_gated_weight * SoftCE(gated)`` on top of composition SoftCE
+    (gated π is detached so SoftCE does not update π).
 
-    Optional presence loss (``presence_weight > 0``, train-only): BCE between
-    ``presence_logits`` and soft presence
-    ``π*_c = 1 - exp(-m_c / (scale_c * sat))`` from ``batch.cme_mass``
-    (unnormalized Gaussian type mass). ``presence_scale`` is usually a
-    per-type vector (median of positive ``m_c`` per class). Canonical eval
-    ignores this term.
+    Optional presence loss (``presence_weight > 0``): BCE on ``presence_logits``
+    vs a soft presence target. ``presence_target``:
+      * ``soft_cme`` (default) — π* = soft_cme (aligned with SoftCE)
+      * ``soft_cme_thresh`` / ``soft_cme_power`` — threshold / power transforms
+      * ``mass`` — legacy ``1 - exp(-m / (scale * sat))`` from ``cme_mass``
+    ``presence_pos_weight``: ``\"auto\"`` (per-class n_neg/n_pos), a float,
+    a length-C list, or ``null`` for unweighted BCE. Canonical eval ignores
+    the presence term.
 
     Optional multi-sigma CME aux (``aux_cme_weight > 0``): for each target in
     ``batch.soft_cme_aux`` (sigma → tensor), adds
@@ -431,6 +580,21 @@ def make_combined_loss(
     predicted class-importance ranks match GT soft ranks (temperature
     ``cme_spearman_tau``). Training-only; canonical eval ignores it.
 
+    ``cme_target_support_eps`` (training only): if > 0, zero soft-CME mass
+    below this threshold and renormalize before SoftCE / JS — sharpens the
+    training target onto its support while canonical eval keeps the full soft.
+
+    ``presence_sparsity_weight``: L1 on mean ``σ(presence)`` (encourages sparse
+    gates). Canonical eval ignores it.
+
+    ``cme_class_balance``: if True, SoftCE/JS class terms are reweighted by
+    inverse mean soft-mass on the batch (rare microenvironment types upweighted).
+    Canonical eval ignores it (unweighted SoftCE).
+
+    ``cme_train_sigma``: if set, training SoftCE/JS uses ``batch.soft_cme_aux[σ]``
+    instead of primary ``batch.soft_cme`` (which stays σ=96 for canonical eval).
+    Requires that sigma in ``soft_cme.aux_sigmas``.
+
     ``cme_divergence`` selects the CME training objective: ``"soft_ce"`` (default)
     or ``"js"`` (Jensen–Shannon). Set via config ``loss.cme_divergence``; it flows
     through ``loss_kwargs`` in ``ct_train.py`` (all ``loss`` keys except ``name``).
@@ -438,8 +602,8 @@ def make_combined_loss(
 
     ``cme_temperature`` scales CME logits as ``logits / T`` before the main and
     stage-1 CME objectives (temperature scaling toward soft targets). Eval omits
-    this (``T=1``) via ``build_canonical_eval_loss``. Ignored when ``cme_probs``
-    is provided by a presence-gated model.
+    this (``T=1``) via ``build_canonical_eval_loss``. Ignored when SoftCE is
+    applied to gated probs.
 
     ``cme_target_temperature`` sharpens (T<1) or softens (T>1) soft CME targets
     during training only; canonical eval uses raw σ=96 targets.
@@ -452,11 +616,34 @@ def make_combined_loss(
     masked-mean predicted CME distribution and the masked-mean soft target
     (global composition consistency). Canonical eval ignores it.
     """
-    if cme_divergence not in ("soft_ce", "js"):
+    if cme_divergence not in ("soft_ce", "js", "reverse_kl"):
         raise ValueError(
-            f"cme_divergence must be 'soft_ce' or 'js', got {cme_divergence!r}"
+            f"cme_divergence must be 'soft_ce', 'js', or 'reverse_kl', "
+            f"got {cme_divergence!r}"
         )
-    cme_fn = soft_js_divergence if cme_divergence == "js" else soft_cross_entropy
+    softce_src = str(cme_softce_source).strip().lower()
+    if softce_src not in ("comp", "gated", "gated_joint", "both"):
+        raise ValueError(
+            f"cme_softce_source must be 'comp', 'gated', 'gated_joint', "
+            f"or 'both' (got {cme_softce_source!r})"
+        )
+    presence_tgt = str(presence_target).strip().lower()
+    if presence_tgt not in (
+        "soft_cme",
+        "soft_cme_thresh",
+        "soft_cme_power",
+        "mass",
+    ):
+        raise ValueError(
+            f"presence_target must be soft_cme|soft_cme_thresh|"
+            f"soft_cme_power|mass (got {presence_target!r})"
+        )
+    if cme_divergence == "js":
+        cme_fn = soft_js_divergence
+    elif cme_divergence == "reverse_kl":
+        cme_fn = reverse_kl_from_logits
+    else:
+        cme_fn = soft_cross_entropy
 
     cls_fn = make_cross_entropy(label_smoothing)
     w_cls = float(cls_weight)
@@ -469,6 +656,13 @@ def make_combined_loss(
     w_gene_sim = float(gene_sim_cme_weight)
     w_spearman = float(cme_spearman_weight)
     w_presence = float(presence_weight)
+    w_gated = float(cme_gated_weight)
+    w_pres_sparse = float(presence_sparsity_weight)
+    support_eps = float(cme_target_support_eps)
+    use_class_balance = bool(cme_class_balance)
+    train_sigma = (
+        None if cme_train_sigma is None else float(cme_train_sigma)
+    )
     spearman_tau = float(cme_spearman_tau)
     spearman_chunk = int(cme_spearman_chunk_size)
     gene_temp = float(gene_sim_temperature)
@@ -476,6 +670,8 @@ def make_combined_loss(
     cme_temp = float(cme_temperature)
     tgt_temp = float(cme_target_temperature)
     presence_sat = float(presence_saturation)
+    presence_pow = float(presence_target_power)
+    presence_eps = float(presence_target_eps)
     if presence_scale is None:
         presence_scale_v: Optional[torch.Tensor] = None
     elif isinstance(presence_scale, (list, tuple)):
@@ -486,12 +682,50 @@ def make_combined_loss(
         presence_scale_v = torch.tensor(
             [float(presence_scale)], dtype=torch.float32
         )
+    if presence_pos_weight is None:
+        presence_pw_mode: Optional[str] = None
+        presence_pw_fixed: Optional[torch.Tensor] = None
+    elif isinstance(presence_pos_weight, str):
+        if presence_pos_weight.strip().lower() != "auto":
+            raise ValueError(
+                f"presence_pos_weight string must be 'auto' "
+                f"(got {presence_pos_weight!r})"
+            )
+        presence_pw_mode = "auto"
+        presence_pw_fixed = None
+    elif isinstance(presence_pos_weight, (list, tuple)):
+        presence_pw_mode = "fixed"
+        presence_pw_fixed = torch.tensor(
+            [float(x) for x in presence_pos_weight], dtype=torch.float32
+        )
+    else:
+        presence_pw_mode = "fixed"
+        presence_pw_fixed = torch.tensor(
+            [float(presence_pos_weight)], dtype=torch.float32
+        )
 
     def _scaled_cme_logits(logits: torch.Tensor) -> torch.Tensor:
         return logits / cme_temp if cme_temp != 1.0 else logits
 
     def _tempered_target(soft: torch.Tensor) -> torch.Tensor:
-        return temper_soft_target(soft, tgt_temp, eps=eps)
+        out = temper_soft_target(soft, tgt_temp, eps=eps)
+        if support_eps > 0.0:
+            out = out.clone()
+            out = out * (out > support_eps).to(dtype=out.dtype)
+            out = out / out.sum(dim=-1, keepdim=True).clamp_min(eps)
+        return out
+
+    def _gated_probs_detach_pi(outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """normalize(π.detach() ⊙ q) so SoftCE updates composition only."""
+        if "presence_logits" not in outputs or "comp_logits" not in outputs:
+            raise ValueError(
+                "gated SoftCE with detached π requires presence_logits "
+                "and comp_logits"
+            )
+        presence = torch.sigmoid(outputs["presence_logits"]).detach()
+        comp = F.softmax(outputs["comp_logits"], dim=-1)
+        gated = presence * comp
+        return gated / gated.sum(dim=-1, keepdim=True).clamp_min(eps)
 
     def _cme_pred_term(
         outputs: Dict[str, torch.Tensor],
@@ -499,21 +733,100 @@ def make_combined_loss(
         node_mask: torch.Tensor,
         *,
         logits_key: str = "cme_logits",
+        source: Optional[str] = None,
     ) -> torch.Tensor:
-        """SoftCE / JS on gated ``cme_probs`` when present, else logits."""
-        if logits_key == "cme_logits" and "cme_probs" in outputs:
+        """SoftCE / JS on composition and/or gated mix (final CME head).
+
+        Stage-1 / non-final keys always SoftCE on the named logits tensor.
+        """
+        # Stage-1 / aux probes: never route through the presence gate.
+        if logits_key not in ("cme_logits",):
+            if logits_key not in outputs:
+                raise ValueError(f"missing outputs['{logits_key}']")
+            return cme_fn(
+                _scaled_cme_logits(outputs[logits_key]),
+                soft,
+                node_mask,
+                eps=eps,
+            )
+
+        src = softce_src if source is None else source
+        has_gate = "comp_logits" in outputs and "presence_logits" in outputs
+
+        def _class_w() -> Optional[torch.Tensor]:
+            if not use_class_balance:
+                return None
+            # Inverse mean soft mass over batch cells (rare types upweighted).
+            m = soft.clamp_min(0.0).mean(dim=(0, 1)).clamp_min(eps)
+            w = (m.mean() / m).clamp(0.25, 8.0)
+            return w
+
+        def _on_comp() -> torch.Tensor:
+            if "comp_logits" not in outputs:
+                raise ValueError(
+                    "cme_softce_source='comp' requires outputs['comp_logits'] "
+                    "(enable model.cme_presence_gate)"
+                )
+            logits = _scaled_cme_logits(outputs["comp_logits"])
             if cme_divergence == "js":
-                # soft_js expects logits; convert probs → log-space scores
-                # that softmax recovers (approx) via log(p).
+                return soft_js_divergence(logits, soft, node_mask, eps=eps)
+            if cme_divergence == "reverse_kl":
+                return reverse_kl_from_logits(logits, soft, node_mask, eps=eps)
+            return soft_cross_entropy(
+                logits, soft, node_mask, eps=eps, class_weights=_class_w()
+            )
+
+        def _on_gated(*, detach_pi: bool) -> torch.Tensor:
+            if detach_pi and has_gate:
+                probs = _gated_probs_detach_pi(outputs)
+            elif "cme_probs" in outputs:
+                probs = outputs["cme_probs"]
+            else:
+                raise ValueError(
+                    "gated SoftCE requires outputs['cme_probs'] "
+                    "or presence+comp logits"
+                )
+            if cme_divergence == "js":
+                scores = probs.clamp_min(eps).log()
+                return soft_js_divergence(scores, soft, node_mask, eps=eps)
+            if cme_divergence == "reverse_kl":
+                return reverse_kl_probs(probs, soft, node_mask, eps=eps)
+            return soft_cross_entropy_probs(
+                probs, soft, node_mask, eps=eps, class_weights=_class_w()
+            )
+
+        if has_gate and src == "comp":
+            return _on_comp()
+        if has_gate and src == "gated":
+            return _on_gated(detach_pi=True)
+        if has_gate and src == "gated_joint":
+            # Live mix: SoftCE gradients update both π and q.
+            return _on_gated(detach_pi=False)
+        if has_gate and src == "both":
+            return _on_comp()  # gated term added separately via w_gated
+
+        # No gate / legacy: prefer cme_probs, else logits.
+        if "cme_probs" in outputs and not has_gate:
+            if cme_divergence == "js":
                 scores = outputs["cme_probs"].clamp_min(eps).log()
                 return soft_js_divergence(scores, soft, node_mask, eps=eps)
+            if cme_divergence == "reverse_kl":
+                return reverse_kl_probs(
+                    outputs["cme_probs"], soft, node_mask, eps=eps
+                )
             return soft_cross_entropy_probs(
-                outputs["cme_probs"], soft, node_mask, eps=eps
+                outputs["cme_probs"],
+                soft,
+                node_mask,
+                eps=eps,
+                class_weights=_class_w(),
             )
-        if logits_key not in outputs:
-            raise ValueError(f"missing outputs['{logits_key}']")
+        if "cme_logits" not in outputs:
+            if "comp_logits" in outputs:
+                return _on_comp()
+            raise ValueError("missing outputs['cme_logits']")
         return cme_fn(
-            _scaled_cme_logits(outputs[logits_key]),
+            _scaled_cme_logits(outputs["cme_logits"]),
             soft,
             node_mask,
             eps=eps,
@@ -529,20 +842,52 @@ def make_combined_loss(
         total = w_cls * cls_loss
 
         if w_cme != 0.0:
-            if "cme_logits" not in outputs and "cme_probs" not in outputs:
+            if (
+                "cme_logits" not in outputs
+                and "cme_probs" not in outputs
+                and "comp_logits" not in outputs
+            ):
                 raise ValueError(
-                    "cme_weight>0 requires outputs['cme_logits'] or "
-                    "outputs['cme_probs'] (enable model.predict_cme)"
+                    "cme_weight>0 requires outputs['cme_logits'], "
+                    "outputs['cme_probs'], or outputs['comp_logits']"
                 )
             soft = getattr(batch, "soft_cme", None)
             if soft is None:
                 raise ValueError("batch.soft_cme is required when cme_weight>0")
+            if train_sigma is not None:
+                aux = getattr(batch, "soft_cme_aux", None) or {}
+                # Keys may be float or str depending on attach path.
+                cand = None
+                for k, v in aux.items():
+                    if abs(float(k) - train_sigma) < 1e-6:
+                        cand = v
+                        break
+                if cand is None:
+                    raise ValueError(
+                        f"cme_train_sigma={train_sigma} not in "
+                        f"batch.soft_cme_aux keys={list(aux.keys())}"
+                    )
+                soft = cand
             soft = _tempered_target(soft)
             cme_loss = _cme_pred_term(outputs, soft, batch.node_mask)
             parts["cme"] = cme_loss
             total = total + w_cme * cme_loss
+            if (
+                softce_src == "both"
+                and w_gated != 0.0
+                and "presence_logits" in outputs
+                and "comp_logits" in outputs
+            ):
+                gated_loss = _cme_pred_term(
+                    outputs, soft, batch.node_mask, source="gated"
+                )
+                parts["cme_gated"] = gated_loss
+                total = total + w_gated * gated_loss
+            else:
+                parts["cme_gated"] = cls_loss.detach() * 0.0
         else:
             parts["cme"] = cls_loss.detach() * 0.0
+            parts["cme_gated"] = cls_loss.detach() * 0.0
 
         if w_presence != 0.0:
             if "presence_logits" not in outputs:
@@ -550,38 +895,77 @@ def make_combined_loss(
                     "presence_weight>0 requires outputs['presence_logits'] "
                     "(enable model.cme_presence_gate)"
                 )
-            mass = getattr(batch, "cme_mass", None)
-            if mass is None:
-                raise ValueError(
-                    "batch.cme_mass is required when presence_weight>0 "
-                    "(recompute soft CME npz with cme_mass)"
-                )
-            scale = presence_scale_v
-            if scale is None:
-                raise ValueError(
-                    "presence_weight>0 requires loss.presence_scale "
-                    "(or auto-filled from soft-CME per-type medians)"
-                )
-            # Broadcast scalar-length-1 or length-C onto mass's class axis.
-            if scale.numel() == 1:
-                scale_t = scale.to(device=mass.device, dtype=mass.dtype)
-            elif scale.numel() != mass.size(-1):
-                raise ValueError(
-                    f"presence_scale length {scale.numel()} != "
-                    f"num_classes {mass.size(-1)}"
+            if presence_tgt == "mass":
+                mass = getattr(batch, "cme_mass", None)
+                if mass is None:
+                    raise ValueError(
+                        "presence_target='mass' requires batch.cme_mass "
+                        "(recompute soft CME npz with cme_mass)"
+                    )
+                scale = presence_scale_v
+                if scale is None:
+                    raise ValueError(
+                        "presence_target='mass' requires loss.presence_scale "
+                        "(or auto-filled from soft-CME per-type medians)"
+                    )
+                if scale.numel() == 1:
+                    scale_t = scale.to(device=mass.device, dtype=mass.dtype)
+                elif scale.numel() != mass.size(-1):
+                    raise ValueError(
+                        f"presence_scale length {scale.numel()} != "
+                        f"num_classes {mass.size(-1)}"
+                    )
+                else:
+                    scale_t = scale.to(device=mass.device, dtype=mass.dtype)
+                pi_star = soft_presence_from_mass(
+                    mass, scale_t, presence_saturation=presence_sat
                 )
             else:
-                scale_t = scale.to(device=mass.device, dtype=mass.dtype)
-            pi_star = soft_presence_from_mass(
-                mass, scale_t, presence_saturation=presence_sat
-            )
+                soft = getattr(batch, "soft_cme", None)
+                if soft is None:
+                    raise ValueError(
+                        f"presence_target={presence_tgt!r} requires "
+                        "batch.soft_cme"
+                    )
+                pi_star = soft_presence_from_soft_cme(
+                    soft,
+                    mode=presence_tgt,
+                    power=presence_pow,
+                    eps=presence_eps,
+                    renorm_eps=eps,
+                )
+
+            if presence_pw_mode == "auto":
+                pw = _auto_presence_pos_weight(pi_star, batch.node_mask)
+            elif presence_pw_mode == "fixed":
+                assert presence_pw_fixed is not None
+                pw = presence_pw_fixed
+            else:
+                pw = None
             presence_loss = masked_bce_presence(
-                outputs["presence_logits"], pi_star, batch.node_mask
+                outputs["presence_logits"],
+                pi_star,
+                batch.node_mask,
+                pos_weight=pw,
             )
             parts["presence"] = presence_loss
             total = total + w_presence * presence_loss
         else:
             parts["presence"] = cls_loss.detach() * 0.0
+
+        if w_pres_sparse != 0.0:
+            if "presence_logits" not in outputs:
+                raise ValueError(
+                    "presence_sparsity_weight>0 requires outputs['presence_logits']"
+                )
+            pi = torch.sigmoid(outputs["presence_logits"])
+            m = batch.node_mask.bool()
+            # Mean gate activation over real cells / classes (encourage sparsity).
+            sparse_loss = pi[m].mean() if m.any() else pi.sum() * 0.0
+            parts["presence_sparsity"] = sparse_loss
+            total = total + w_pres_sparse * sparse_loss
+        else:
+            parts["presence_sparsity"] = cls_loss.detach() * 0.0
 
         if w_s1_cls != 0.0:
             if "cls_logits_stage1" not in outputs:

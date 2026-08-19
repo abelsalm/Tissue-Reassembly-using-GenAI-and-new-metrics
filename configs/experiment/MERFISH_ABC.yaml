@@ -8,7 +8,7 @@ distribute:
 
 dataset:
     dataset_name: 'MERFISH_ABC'
-    gene_columns_start: 6   # first column after the index is a gene
+    gene_columns_start: 8   # first column after the index is a gene
     gene_columns_end: -1 
     train_data_path:  "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv"
     test_data_path: "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
