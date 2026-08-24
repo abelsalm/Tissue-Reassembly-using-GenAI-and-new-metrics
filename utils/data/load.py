@@ -137,20 +137,145 @@ def detect_nan_rows(pos: np.ndarray) -> np.ndarray:
     return torch.isnan(pos).any(dim=1)
 
 
-def position_normalize(input_data: pd.DataFrame) -> pd.DataFrame:
+GRAPH_SPLIT_SECTION = "section"
+GRAPH_SPLIT_DOMAIN = "domain"
+GRAPH_GROUP_SEP = "||"
+DEFAULT_DOMAIN_COLUMN = "spatial_module_l1_complete"
+
+
+def resolve_graph_split(cfg) -> str:
+    """Return ``section`` (whole slices) or ``domain`` (section × spatial domain)."""
+    dataset = getattr(cfg, "dataset", cfg)
+    raw = getattr(dataset, "graph_split", GRAPH_SPLIT_SECTION)
+    key = str(raw or GRAPH_SPLIT_SECTION).strip().lower()
+    aliases = {
+        "section": GRAPH_SPLIT_SECTION,
+        "slice": GRAPH_SPLIT_SECTION,
+        "slices": GRAPH_SPLIT_SECTION,
+        "domain": GRAPH_SPLIT_DOMAIN,
+        "domains": GRAPH_SPLIT_DOMAIN,
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"dataset.graph_split must be 'section' or 'domain' (got {raw!r})"
+        )
+    return aliases[key]
+
+
+def domain_column_name(cfg) -> str:
+    dataset = getattr(cfg, "dataset", cfg)
+    return str(
+        getattr(dataset, "domain_column", DEFAULT_DOMAIN_COLUMN)
+        or DEFAULT_DOMAIN_COLUMN
+    )
+
+
+def graph_group_columns(cfg) -> list:
+    """Columns that define one LUNA graph family.
+
+    ``section``: ``cell_section`` only (legacy whole-slice graphs).
+    ``domain``: ``(cell_section, domain_column)`` so each spatial domain
+    inside a slice is its own graph family.
+    """
+    if resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN:
+        return ["cell_section", domain_column_name(cfg)]
+    return ["cell_section"]
+
+
+def compose_graph_group_labels(frame: pd.DataFrame, columns: list) -> np.ndarray:
+    """Composite string labels ``section`` or ``section||domain``."""
+    if not columns:
+        raise ValueError("graph group columns must be non-empty")
+    missing = [c for c in columns if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Missing graph-group columns: {missing}")
+    key = frame[columns[0]].astype(str)
+    for col in columns[1:]:
+        key = key + GRAPH_GROUP_SEP + frame[col].astype(str)
+    return key.to_numpy()
+
+
+def should_normalize_per_graph(cfg) -> bool:
+    """If True, rescale coords independently inside each graph group."""
+    dataset = getattr(cfg, "dataset", cfg)
+    explicit = getattr(dataset, "normalize_positions_per_graph", None)
+    if explicit is not None:
+        return bool(explicit)
+    return resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN
+
+
+def domain_keep_prefix(cfg):
+    dataset = getattr(cfg, "dataset", cfg)
+    raw = getattr(dataset, "domain_keep_prefix", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def filter_domain_cells(data: pd.DataFrame, cfg) -> pd.DataFrame:
+    """Drop unlabeled / prefix-excluded cells when ``graph_split=domain``."""
+    if resolve_graph_split(cfg) != GRAPH_SPLIT_DOMAIN:
+        return data
+    col = domain_column_name(cfg)
+    if col not in data.columns:
+        raise ValueError(
+            f"dataset.graph_split='domain' requires column {col!r} in the CSV"
+        )
+    before = len(data)
+    labels = data[col]
+    keep = labels.notna()
+    as_str = labels.astype(str)
+    keep &= as_str.str.strip().ne("")
+    keep &= ~as_str.str.lower().isin(("nan", "none", "<na>", "nat"))
+    prefix = domain_keep_prefix(cfg)
+    if prefix:
+        keep &= as_str.str.startswith(prefix)
+    filtered = data.loc[keep]
+    if filtered.empty:
+        raise ValueError(
+            f"No cells left after domain filter (column={col!r}, prefix={prefix!r})"
+        )
+    print(
+        f"[data] domain filter: kept {len(filtered):,}/{before:,} cells "
+        f"(column={col!r}, prefix={prefix!r})",
+        flush=True,
+    )
+    return filtered
+
+
+def position_normalize(
+    input_data: pd.DataFrame, group_by=None
+) -> pd.DataFrame:
     """
     Normalizes the given positions to a range between -0.5 and 0.5.
 
     Args:
-        pos (np.ndarray): An array of positions to be normalized.
+        input_data: DataFrame with ``coord_X`` / ``coord_Y``.
+        group_by: Optional column name or list of columns. Min/max are
+            computed independently inside each group. ``None`` keeps the
+            legacy behaviour (group by ``cell_section`` when present).
 
     Returns:
-        np.ndarray: The normalized positions.
+        pd.DataFrame: The same frame with normalized coordinates.
     """
+    if group_by is None:
+        group_cols = (
+            ["cell_section"] if "cell_section" in input_data.columns else None
+        )
+    elif isinstance(group_by, (list, tuple)):
+        group_cols = list(group_by)
+    else:
+        group_cols = [group_by]
+
+    use_groups = bool(group_cols) and all(
+        col in input_data.columns for col in group_cols
+    )
+    group_key = group_cols[0] if group_cols and len(group_cols) == 1 else group_cols
 
     for key in ["coord_X", "coord_Y"]:
-        if "cell_section" in input_data.columns:
-            groups = input_data.groupby("cell_section")[key]
+        if use_groups:
+            groups = input_data.groupby(group_key, dropna=False)[key]
             min_, max_ = groups.transform("min"), groups.transform("max")
         else:
             min_, max_ = input_data[key].min(), input_data[key].max()

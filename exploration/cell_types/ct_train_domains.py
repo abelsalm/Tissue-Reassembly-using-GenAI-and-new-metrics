@@ -28,6 +28,12 @@ import torch
 import wandb
 from omegaconf import OmegaConf
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    ReduceLROnPlateau,
+    SequentialLR,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -127,6 +133,311 @@ def resolve_device(name: str) -> torch.device:
         print("[warn] CUDA requested but unavailable; falling back to CPU.")
         return torch.device("cpu")
     return torch.device(name)
+
+
+class ModelEMA:
+    """Exponential moving average of trainable parameters."""
+
+    def __init__(self, model: CellTypeTransformer, decay: float = 0.999) -> None:
+        self.decay = float(decay)
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self._backup: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: CellTypeTransformer) -> None:
+        decay = self.decay
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self.shadow[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: CellTypeTransformer) -> None:
+        self._backup = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self._backup[name] = param.data.clone()
+            param.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: CellTypeTransformer) -> None:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            param.data.copy_(self._backup[name])
+        self._backup = {}
+
+
+def build_scheduler(optimizer: AdamW, cfg: Dict[str, Any], n_epochs: int):
+    tcfg = cfg.get("train") or {}
+    scfg = tcfg.get("scheduler") or {}
+    name = str(scfg.get("name", "none")).strip().lower()
+    if name in ("", "none", "null", "off"):
+        return None
+    if name in ("cosine", "cosine_warmup"):
+        warmup_epochs = int(scfg.get("warmup_epochs", 0))
+        min_lr = float(scfg.get("min_lr", 1e-6))
+        if scfg.get("t_max") is not None:
+            cosine_epochs = max(1, int(scfg["t_max"]))
+        else:
+            cosine_epochs = max(1, n_epochs - warmup_epochs)
+        cosine = CosineAnnealingLR(
+            optimizer, T_max=cosine_epochs, eta_min=min_lr
+        )
+        if warmup_epochs <= 0:
+            return cosine
+        warmup = LinearLR(
+            optimizer,
+            start_factor=float(scfg.get("warmup_start_factor", 0.01)),
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        return SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
+        )
+    if name in ("plateau", "reduce_on_plateau", "reducelronplateau"):
+        return ReduceLROnPlateau(
+            optimizer,
+            mode=str(scfg.get("mode", "max")),
+            factor=float(scfg.get("factor", 0.5)),
+            patience=int(scfg.get("patience", 8)),
+            min_lr=float(scfg.get("min_lr", 1e-6)),
+            threshold=float(scfg.get("threshold", 0.001)),
+        )
+    raise ValueError(f"Unknown scheduler '{name}'")
+
+
+def inverse_freq_weights(
+    class_ids: torch.Tensor, num_classes: int, power: float = 1.0
+) -> List[float]:
+    counts = torch.bincount(class_ids.reshape(-1).long(), minlength=num_classes)
+    counts = counts.float().clamp_min(1.0)
+    w = (counts.sum() / (float(num_classes) * counts)).pow(float(power))
+    w = w / w.mean()
+    return [float(x) for x in w.tolist()]
+
+
+def _id_index_size(cell_id: torch.Tensor) -> int:
+    return int(cell_id.max().item()) + 1
+
+
+def build_type_lookup(
+    datamodule: DataModule,
+) -> Tuple[Dict[str, torch.Tensor], int, List[str]]:
+    """Map ``cell_ID`` codes → train cell-type ids (0 = UNK)."""
+    train_ds = datamodule.train_dataset
+    decoder = dict(train_ds.statistics.cell_class_decoder)
+    names = [decoder[i] for i in range(len(decoder))]
+    n_types = len(names)
+    tables: Dict[str, torch.Tensor] = {}
+    datasets = {
+        "train": datamodule.train_dataset,
+        "validation": getattr(datamodule, "validation_dataset", None),
+        "test": getattr(datamodule, "test_dataset", None),
+    }
+    train_name_to_id = {str(n): i + 1 for i, n in enumerate(names)}
+    for split, ds in datasets.items():
+        if ds is None:
+            continue
+        codes = ds._data.cell_ID
+        orig = ds._data.cell_class
+        table = torch.zeros(_id_index_size(codes), dtype=torch.long)
+        if split == "train":
+            mapped = orig.long() + 1
+        else:
+            split_dec = dict(ds.statistics.cell_class_decoder)
+            mapped = torch.zeros_like(orig)
+            for src_i, name in split_dec.items():
+                mapped[orig == int(src_i)] = int(train_name_to_id.get(str(name), 0))
+        table[codes] = mapped
+        tables[split] = table
+    return tables, n_types, names
+
+
+def build_cme_lookup(
+    datamodule: DataModule,
+    cfg: Dict[str, Any],
+) -> Tuple[Dict[str, torch.Tensor], int]:
+    """Load precomputed Gaussian CME keyed by original cell id → ``cell_ID`` table."""
+    acfg = cfg.get("aux_inputs") or {}
+    out_dir = resolve_repo_path(
+        acfg.get("cme_dir", "exploration/cell_types/outputs/abc_soft_cmes")
+    )
+    sigma_list = acfg.get("cme_sigmas")
+    if sigma_list:
+        sigmas = [float(s) for s in sigma_list]
+    else:
+        sigmas = [float(acfg.get("cme_sigma", 0.25))]
+    from exploration.cell_types.ct_soft_cme import _sigma_tag
+
+    split_files = {
+        "train": "train",
+        "validation": "validation",
+        "test": "test",
+    }
+    datasets = {
+        "train": datamodule.train_dataset,
+        "validation": getattr(datamodule, "validation_dataset", None),
+        "test": getattr(datamodule, "test_dataset", None),
+    }
+    tables: Dict[str, torch.Tensor] = {}
+    cme_dim = 0
+    loaded_by_path: Dict[str, Dict[str, Any]] = {}
+    dcfg = cfg["dataset"]
+    path_by_split = {
+        "train": str(dcfg["train_data_path"]),
+        "validation": str(dcfg.get("validation_data_path") or ""),
+        "test": str(dcfg.get("test_data_path") or ""),
+    }
+    from exploration.cell_types.ct_soft_cme import _sigma_tag
+
+    for split, ds in datasets.items():
+        if ds is None:
+            continue
+        file_split = split_files[split]
+        csv_path = path_by_split[split]
+        feats = []
+        orig_ids = np.asarray(ds._cell_ids_clean).astype(str)
+        codes = ds._data.cell_ID
+        for sigma in sigmas:
+            cache_key = f"{csv_path}::{sigma}"
+            if cache_key in loaded_by_path:
+                loaded = loaded_by_path[cache_key]
+            else:
+                npz_path = out_dir / f"{file_split}_sigma{_sigma_tag(sigma)}.npz"
+                if not npz_path.exists():
+                    raise FileNotFoundError(
+                        f"Missing ABC CME for split={file_split} sigma={sigma} "
+                        f"in {out_dir}. Precompute with experiments/precompute_abc_cme.py"
+                    )
+                packed = np.load(npz_path, allow_pickle=True)
+                loaded = {
+                    "soft_cme": packed["soft_cme"],
+                    "cell_id": packed["cell_id"],
+                }
+                loaded_by_path[cache_key] = loaded
+            soft = np.asarray(loaded["soft_cme"], dtype=np.float32)
+            cell_id = np.asarray(loaded["cell_id"])
+            dim = int(soft.shape[1])
+            by_id = pd.DataFrame(soft, index=pd.Index(cell_id.astype(str)))
+            aligned = by_id.reindex(pd.Index(orig_ids))
+            if aligned.isna().any().any():
+                aligned = aligned.fillna(1.0 / max(dim, 1))
+            feats.append(torch.from_numpy(aligned.to_numpy(dtype=np.float32)))
+        feat = torch.cat(feats, dim=-1)
+        cme_dim = int(feat.size(-1))
+        table = torch.zeros(_id_index_size(codes), cme_dim, dtype=torch.float32)
+        table[codes] = feat
+        tables[split] = table
+    print(f"[ct_domains] CME sigmas={sigmas} dim={cme_dim}", flush=True)
+    return tables, cme_dim
+
+
+def attach_aux_to_batch(
+    batch,
+    device: torch.device,
+    type_table: Optional[torch.Tensor],
+    cme_table: Optional[torch.Tensor],
+) -> None:
+    if batch.cell_ID is None:
+        return
+    ids = batch.cell_ID
+    if ids.dim() == 3:
+        ids = ids.squeeze(-1)
+    ids = ids.long().clamp(min=0)
+    if type_table is not None:
+        t = type_table.to(device)
+        ids_t = ids.clamp(max=t.size(0) - 1)
+        batch.cell_type = t[ids_t]
+    if cme_table is not None:
+        c = cme_table.to(device)
+        ids_c = ids.clamp(max=c.size(0) - 1)
+        batch.cme_features = c[ids_c]
+
+
+def compact_metrics(metrics: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if metrics is None:
+        return None
+    return {
+        "loss": float(metrics["loss"]),
+        "acc": float(metrics["acc"]),
+        "n_cells": float(metrics["n_cells"]),
+    }
+
+
+def best_per_class_payload(
+    *,
+    epoch: int,
+    split: str,
+    class_names: List[str],
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compact per-class table for the current best checkpoint (one write)."""
+    accs = list(metrics.get("per_class_acc") or [])
+    ns = list(metrics.get("per_class_n") or [])
+    rows: List[Dict[str, Any]] = []
+    defined: List[float] = []
+    zeros: List[str] = []
+    for i, name in enumerate(class_names):
+        acc = accs[i] if i < len(accs) else None
+        n = int(ns[i]) if i < len(ns) else 0
+        rows.append({"class": name, "acc": acc, "n": n})
+        if acc is None or n <= 0:
+            continue
+        defined.append(float(acc))
+        if float(acc) <= 0.0:
+            zeros.append(name)
+    macro = (sum(defined) / len(defined)) if defined else None
+    return {
+        "epoch": int(epoch),
+        "split": str(split),
+        "micro_acc": float(metrics.get("acc", 0.0)),
+        "macro_acc": macro,
+        "n_classes": len(rows),
+        "n_zero_acc": len(zeros),
+        "zero_classes": zeros,
+        "per_class": rows,
+    }
+
+
+def write_best_per_class(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def print_best_per_class_summary(payload: Dict[str, Any]) -> None:
+    rows = list(payload.get("per_class") or [])
+    zeros = list(payload.get("zero_classes") or [])
+    macro = payload.get("macro_acc")
+    macro_s = f"{macro:.4f}" if isinstance(macro, float) else "n/a"
+    print(
+        f"[ct_domains] best {payload.get('split', 'val')} per-class "
+        f"(epoch={payload.get('epoch')}, micro={payload.get('micro_acc'):.4f}, "
+        f"macro={macro_s}): {payload.get('n_zero_acc', 0)}/"
+        f"{payload.get('n_classes', 0)} classes at 0",
+        flush=True,
+    )
+    if zeros:
+        print(
+            f"[ct_domains] zero-acc classes: {', '.join(zeros)}",
+            flush=True,
+        )
+    scored = [r for r in rows if r.get("acc") is not None and int(r.get("n") or 0) > 0]
+    scored.sort(key=lambda r: float(r["acc"]))
+    if scored:
+        worst = ", ".join(
+            f"{r['class']}={float(r['acc']):.3f}(n={int(r['n'])})"
+            for r in scored[:8]
+        )
+        print(f"[ct_domains] hardest classes: {worst}", flush=True)
 
 
 def build_datamodule_cfg(cfg: Dict[str, Any]):
@@ -303,8 +614,18 @@ def apply_domain_labels(
     return num_classes, class_names, decoder
 
 
-def build_model(cfg: Dict[str, Any], gene_dim: int, num_classes: int) -> CellTypeTransformer:
+def build_model(
+    cfg: Dict[str, Any],
+    gene_dim: int,
+    num_classes: int,
+    *,
+    num_cell_types: int = 0,
+    cme_input_dim: int = 0,
+) -> CellTypeTransformer:
     mcfg = cfg["model"]
+    acfg = cfg.get("aux_inputs") or {}
+    use_type = bool(acfg.get("cell_type", False))
+    use_cme = bool(acfg.get("cme", False))
     return CellTypeTransformer(
         gene_dim=gene_dim,
         num_classes=num_classes,
@@ -314,11 +635,44 @@ def build_model(cfg: Dict[str, Any], gene_dim: int, num_classes: int) -> CellTyp
         dropout_cls=float(mcfg.get("dropout_cls", 0.1)),
         dropout_layer=float(mcfg.get("dropout_layer", 0.1)),
         gene_mlp_activation=mcfg.get("gene_mlp_activation", "relu"),
+        gene_mlp_depth=int(mcfg.get("gene_mlp_depth", 2)),
+        layer_activation=str(mcfg.get("layer_activation", "relu")),
         cls_activation=str(mcfg.get("cls_activation", "relu")),
         global_skip=mcfg.get("global_skip", None),
         subgraph_summary=bool(mcfg.get("subgraph_summary", False)),
+        subgraph_pool=str(mcfg.get("subgraph_pool", "mean")),
+        subgraph_pool_source=str(mcfg.get("subgraph_pool_source", "mixed")),
+        attention_use_node_mask=bool(mcfg.get("attention_use_node_mask", False)),
+        gene_knn_k=int(mcfg.get("gene_knn_k", 0) or 0),
+        pre_norm=bool(mcfg.get("pre_norm", False)),
         predict_cme=False,
         feature_cross=False,
+        use_cell_type_input=use_type,
+        num_cell_types=int(num_cell_types if use_type else 0),
+        cell_type_embed_dim=int(acfg.get("type_embed_dim", mcfg.get("type_embed_dim", 32))),
+        use_cme_input=use_cme,
+        cme_input_dim=int(cme_input_dim if use_cme else 0),
+        aux_fusion=str(acfg.get("fusion", mcfg.get("aux_fusion", "add"))),
+        aux_inject=str(acfg.get("inject", mcfg.get("aux_inject", "input"))),
+        type_dropout=float(acfg.get("type_dropout", 0.0)),
+        n_domain_queries=int(mcfg.get("n_domain_queries", acfg.get("n_domain_queries", 0)) or 0),
+        bag_type_hist=bool(mcfg.get("bag_type_hist", acfg.get("bag_type_hist", False))),
+        aux_token_mode=str(mcfg.get("aux_token_mode", acfg.get("aux_token_mode", "off"))),
+        n_encoder_queries=int(mcfg.get("n_encoder_queries", acfg.get("n_encoder_queries", 0)) or 0),
+        dual_stream=bool(mcfg.get("dual_stream", acfg.get("dual_stream", False))),
+        attn_kind=str(mcfg.get("attn_kind", acfg.get("attn_kind", "linear"))),
+        graph_k=int(mcfg.get("graph_k", acfg.get("graph_k", 32)) or 32),
+        graph_on=str(mcfg.get("graph_on", acfg.get("graph_on", "cme"))),
+        cme_n_scales=int(
+            mcfg.get(
+                "cme_n_scales",
+                acfg.get(
+                    "cme_n_scales",
+                    len(acfg.get("cme_sigmas") or [acfg.get("cme_sigma", 0.25)]),
+                ),
+            )
+            or 1
+        ),
     )
 
 
@@ -487,6 +841,9 @@ def run_epoch(
     split: str = "train",
     global_step_offset: int = 0,
     wandb_log_steps: bool = False,
+    type_table: Optional[torch.Tensor] = None,
+    cme_table: Optional[torch.Tensor] = None,
+    ema: Optional[ModelEMA] = None,
 ) -> Dict[str, Any]:
     train = optimizer is not None
     model.train(train)
@@ -500,6 +857,7 @@ def run_epoch(
 
     for step, raw in enumerate(loader):
         batch = to_batch(raw, device=device)
+        attach_aux_to_batch(batch, device, type_table, cme_table)
         outputs = model(batch)
         if not isinstance(outputs, dict):
             outputs = {"cls_logits": outputs}
@@ -512,6 +870,8 @@ def run_epoch(
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
         logits = outputs["cls_logits"].detach()
         acc, n = masked_accuracy(logits, batch)
@@ -595,7 +955,33 @@ def main() -> None:
     dm_cfg = build_datamodule_cfg(cfg)
     print("[ct_domains] Loading data …")
     datamodule = DataModule(dm_cfg)
+
+    acfg = cfg.get("aux_inputs") or {}
+    use_type = bool(acfg.get("cell_type", False))
+    use_cme = bool(acfg.get("cme", False))
+    type_tables: Dict[str, torch.Tensor] = {}
+    cme_tables: Dict[str, torch.Tensor] = {}
+    num_cell_types = 0
+    cme_dim = 0
+    if use_type:
+        type_tables, num_cell_types, type_names = build_type_lookup(datamodule)
+        print(
+            f"[ct_domains] cell-type input ON  T={num_cell_types} "
+            f"(embed + inject={acfg.get('inject', 'input')}/"
+            f"{acfg.get('fusion', 'add')})",
+            flush=True,
+        )
+        print(f"[ct_domains] type vocab sample: {type_names[:6]}…", flush=True)
+
     num_classes, class_names, decoder = apply_domain_labels(datamodule, cfg)
+
+    if use_cme:
+        cme_tables, cme_dim = build_cme_lookup(datamodule, cfg)
+        sigmas_print = acfg.get("cme_sigmas") or [acfg.get("cme_sigma", 0.25)]
+        print(
+            f"[ct_domains] CME input ON  dim={cme_dim}  sigmas={sigmas_print}",
+            flush=True,
+        )
 
     infos = Infos(datamodule, dm_cfg)
     gene_dim = int(infos.num_genes)
@@ -607,10 +993,20 @@ def main() -> None:
         flush=True,
     )
 
-    model = build_model(cfg, gene_dim=gene_dim, num_classes=num_classes).to(device)
+    model = build_model(
+        cfg,
+        gene_dim=gene_dim,
+        num_classes=num_classes,
+        num_cell_types=num_cell_types,
+        cme_input_dim=cme_dim,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
-        f"[ct_domains] single-head classifier  params={n_params:,}",
+        f"[ct_domains] single-head classifier  params={n_params:,}  "
+        f"attn={getattr(model, 'attn_kind', 'linear')}  "
+        f"graph_k={getattr(model, 'graph_k', 0)}  "
+        f"graph_on={getattr(model, 'graph_on', 'cme')}  "
+        f"cme_n_scales={getattr(model, 'cme_n_scales', 1)}",
         flush=True,
     )
 
@@ -625,24 +1021,63 @@ def main() -> None:
     )
     log_model_parameter_counts(model)
     wcfg = cfg.get("wandb") or {}
-    wandb_log_steps = use_wandb and bool(wcfg.get("log_every_steps", True))
-    log_per_class = use_wandb and bool(wcfg.get("log_per_class_acc", True))
+    wandb_log_steps = use_wandb and bool(wcfg.get("log_every_steps", False))
+    log_per_class = use_wandb and bool(wcfg.get("log_per_class_acc", False))
 
-    loss_kwargs = {
-        k: v for k, v in dict(cfg.get("loss", {})).items() if k != "name"
-    }
-    loss_fn = get_loss(str(cfg["loss"]["name"]), **loss_kwargs)
+    loss_cfg = dict(cfg.get("loss", {}))
+    loss_name = str(loss_cfg.pop("name", "cross_entropy"))
+    cw = loss_cfg.get("class_weight")
+    if isinstance(cw, str):
+        key = cw.lower().strip()
+        power_by_name = {
+            "inverse_freq": 1.0,
+            "auto": 1.0,
+            "balanced": 1.0,
+            "inverse_sqrt": 0.5,
+        }
+        if key not in power_by_name:
+            raise ValueError(
+                f"Unknown class_weight {cw!r}. Use inverse_freq, inverse_sqrt, "
+                "or a list of C floats."
+            )
+        w = inverse_freq_weights(
+            datamodule.train_dataset._data.cell_class,
+            num_classes,
+            power=power_by_name[key],
+        )
+        loss_cfg["class_weight"] = w
+        print(
+            f"[ct_domains] class_weight={key} min={min(w):.3f} max={max(w):.3f}",
+            flush=True,
+        )
+    loss_fn = get_loss(loss_name, **loss_cfg)
     tcfg = cfg["train"]
     optimizer = AdamW(
         model.parameters(),
         lr=float(tcfg["lr"]),
         weight_decay=float(tcfg.get("weight_decay", 0.0)),
     )
+    scheduler = build_scheduler(optimizer, cfg, int(tcfg["n_epochs"]))
+    if scheduler is not None:
+        print(
+            f"[ct_domains] scheduler={((tcfg.get('scheduler') or {}).get('name'))}",
+            flush=True,
+        )
+    ema_cfg = tcfg.get("ema") or {}
+    ema: Optional[ModelEMA] = None
+    if bool(ema_cfg.get("enabled", False)):
+        ema = ModelEMA(model, decay=float(ema_cfg.get("decay", 0.98)))
+        print(f"[ct_domains] EMA enabled decay={ema.decay}", flush=True)
 
     train_loader = datamodule.train_dataloader()
     val_loader = None
     if getattr(datamodule, "validation_dataset", None) is not None:
         val_loader = datamodule.validation_dataloader()
+
+    type_train = type_tables.get("train")
+    type_val = type_tables.get("validation")
+    cme_train = cme_tables.get("train")
+    cme_val = cme_tables.get("validation")
 
     best_val_acc = -1.0
     best_val_loss = float("inf")
@@ -693,6 +1128,9 @@ def main() -> None:
                 split="train",
                 global_step_offset=global_step,
                 wandb_log_steps=wandb_log_steps,
+                type_table=type_train,
+                cme_table=cme_train,
+                ema=ema,
             )
             global_step += len(train_loader)
             print(
@@ -704,6 +1142,8 @@ def main() -> None:
 
             val_metrics = None
             if val_loader is not None and (epoch % val_every == 0):
+                if ema is not None:
+                    ema.apply_shadow(model)
                 val_metrics = run_epoch(
                     model,
                     val_loader,
@@ -713,7 +1153,11 @@ def main() -> None:
                     optimizer=None,
                     epoch=epoch,
                     split="val",
+                    type_table=type_val,
+                    cme_table=cme_val,
                 )
+                if ema is not None:
+                    ema.restore(model)
                 print(
                     f"[val]   loss={val_metrics['loss']:.4f} "
                     f"acc={val_metrics['acc']:.4f} "
@@ -739,20 +1183,37 @@ def main() -> None:
                     best_val_loss = val_metrics["loss"]
 
                 if val_metrics["acc"] >= best_val_acc:
+                    if ema is not None:
+                        ema.apply_shadow(model)
                     save_checkpoint(
                         run_dir / "best.pt",
                         model,
                         optimizer,
                         epoch,
                         cfg,
-                        {"train": train_metrics, "val": val_metrics},
+                        {
+                            "train": compact_metrics(train_metrics),
+                            "val": compact_metrics(val_metrics),
+                        },
                         class_names,
                     )
+                    if ema is not None:
+                        ema.restore(model)
                     print(
                         f"[ct_domains] saved best checkpoint "
                         f"(val_acc={best_val_acc:.4f})",
                         flush=True,
                     )
+                    best_pc = best_per_class_payload(
+                        epoch=epoch,
+                        split="val",
+                        class_names=class_names,
+                        metrics=val_metrics,
+                    )
+                    write_best_per_class(
+                        log_run_dir / "best_per_class.json", best_pc
+                    )
+                    write_best_per_class(run_dir / "best_per_class.json", best_pc)
                     if use_wandb:
                         wandb_log(
                             {
@@ -804,20 +1265,25 @@ def main() -> None:
                     )
             wandb_log(epoch_log, step=global_step)
 
-            _metric_keys = ("loss", "acc", "n_cells", "per_class_acc", "per_class_n")
             history.append(
                 {
                     "epoch": epoch,
-                    "train": {
-                        k: v for k, v in train_metrics.items() if k in _metric_keys
-                    },
-                    "val": None
-                    if val_metrics is None
-                    else {
-                        k: v for k, v in val_metrics.items() if k in _metric_keys
-                    },
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                    "train": compact_metrics(train_metrics),
+                    "val": compact_metrics(val_metrics),
                 }
             )
+
+            if scheduler is not None:
+                if isinstance(scheduler, ReduceLROnPlateau):
+                    metric = (
+                        val_metrics["acc"]
+                        if val_metrics is not None
+                        else train_metrics["acc"]
+                    )
+                    scheduler.step(metric)
+                else:
+                    scheduler.step()
 
             if save_every > 0 and epoch % save_every == 0:
                 save_checkpoint(
@@ -826,12 +1292,15 @@ def main() -> None:
                     optimizer,
                     epoch,
                     cfg,
-                    {"train": train_metrics, "val": val_metrics},
+                    {
+                        "train": compact_metrics(train_metrics),
+                        "val": compact_metrics(val_metrics),
+                    },
                     class_names,
                 )
 
             with (log_run_dir / "history.json").open("w") as f:
-                json.dump(history, f, indent=2)
+                json.dump(history, f)
 
             if (
                 early_stop
@@ -869,6 +1338,22 @@ def main() -> None:
             )
             wandb.summary["best_val_acc"] = best_val_acc
             wandb.summary["best_val_loss"] = best_val_loss
+        best_pc_path = log_run_dir / "best_per_class.json"
+        if best_pc_path.exists():
+            best_pc = json.loads(best_pc_path.read_text())
+            print_best_per_class_summary(best_pc)
+            if use_wandb:
+                wandb.summary["best_macro_acc"] = best_pc.get("macro_acc")
+                wandb.summary["best_n_zero_acc"] = best_pc.get("n_zero_acc")
+                wandb.summary["best_zero_classes"] = best_pc.get("zero_classes")
+                wandb_log(
+                    per_class_acc_wandb_payload(
+                        "best_val",
+                        [r.get("acc") for r in best_pc.get("per_class") or []],
+                        class_names,
+                    ),
+                    step=global_step,
+                )
         print(
             f"\n[ct_domains] done. best_val_acc={best_val_acc:.4f}  "
             f"checkpoints={run_dir}  logs={log_run_dir}"

@@ -120,8 +120,25 @@ def on_train_epoch_start_func(self) -> None:
         train_ds = datamodule.train_dataset
         if rechunk_every > 0 and self.current_epoch % rechunk_every == 0:
             train_ds.rechunk(seed=self.current_epoch)
+            n_groups = (
+                train_ds.graph_group_count()
+                if hasattr(train_ds, "graph_group_count")
+                else None
+            )
+            graph_split = getattr(train_ds, "graph_split", "section")
             if wandb.run:
-                wandb.log({"rechunk_epoch": self.current_epoch}, commit=False)
+                payload = {
+                    "rechunk_epoch": self.current_epoch,
+                    "graph_split": str(graph_split),
+                }
+                if n_groups is not None:
+                    payload["n_graph_groups"] = int(n_groups)
+                wandb.log(payload, commit=False)
+            print(
+                f"[Epoch {self.current_epoch}] rechunked within "
+                f"{n_groups if n_groups is not None else '?'} {graph_split} groups",
+                flush=True,
+            )
 
         if getattr(self.cfg.train, "position_warp_augment", False):
             train_ds.apply_epoch_warp(

@@ -26,6 +26,7 @@ def main(cfg: DictConfig):
 
     # Set up the dataset
     datamodule, dataset_infos = setup_dataset(cfg)
+    print_graph_split_summary(cfg, datamodule)
 
     # Run training or testing based on mode
     if cfg.general.mode == "train_and_test":
@@ -43,6 +44,27 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def print_graph_split_summary(cfg: DictConfig, datamodule) -> None:
+    """Log whether LUNA graphs are whole slices or section×domain clusters."""
+    from utils.data.load import domain_column_name, resolve_graph_split
+
+    graph_split = resolve_graph_split(cfg)
+    train_ds = datamodule.train_dataset
+    n_groups = (
+        train_ds.graph_group_count()
+        if hasattr(train_ds, "graph_group_count")
+        else "?"
+    )
+    extra = ""
+    if graph_split == "domain":
+        extra = f"  domain_column={domain_column_name(cfg)!r}"
+    print(
+        f"[LUNA] graph_split={graph_split}{extra}  "
+        f"train_groups={n_groups}  train_graphs={len(train_ds)}",
+        flush=True,
+    )
 
 
 def train_model(cfg: DictConfig, datamodule, dataset_infos):

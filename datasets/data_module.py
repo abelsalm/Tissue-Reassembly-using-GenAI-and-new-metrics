@@ -12,9 +12,14 @@ from utils.data.abstract_datatype import (
 )
 from utils.data.load import (
     character_to_int,
+    compose_graph_group_labels,
     detect_nan_rows,
+    filter_domain_cells,
+    graph_group_columns,
     position_normalize,
-    standardise_dataframe_colnames
+    resolve_graph_split,
+    should_normalize_per_graph,
+    standardise_dataframe_colnames,
 )
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
@@ -38,7 +43,9 @@ class Dataset(InMemoryDataset):
         self.num_cell_class = len(input_data["cell_class"].unique())
         self.maximum_graph_size = cfg.dataset.maximum_graph_size[split]
         self.cfg = cfg
-        
+        self.graph_split = resolve_graph_split(cfg)
+        self.graph_group_cols = graph_group_columns(cfg)
+
         self._data, self.slices = Data(), {}
 
         # Dataset processing pipeline
@@ -46,11 +53,23 @@ class Dataset(InMemoryDataset):
         self.process_slices()
 
     def process_data(self) -> None:
-        self.input_data = self.input_data.sort_values("cell_section", ignore_index=False)
+        self.input_data = filter_domain_cells(self.input_data, self.cfg)
+        self.num_cell_class = len(self.input_data["cell_class"].unique())
+        self.input_data = self.input_data.sort_values(
+            self.graph_group_cols, ignore_index=False
+        )
         gene_names = self.filter_genes()
+        group_labels = compose_graph_group_labels(
+            self.input_data, self.graph_group_cols
+        )
 
-        # Normalize coordinates
-        self.input_data = position_normalize(self.input_data)
+        # Normalize coordinates per graph group (domain) or per slice.
+        group_by = (
+            self.graph_group_cols
+            if should_normalize_per_graph(self.cfg)
+            else "cell_section"
+        )
+        self.input_data = position_normalize(self.input_data, group_by=group_by)
         (
             positions,
             node_features,
@@ -72,11 +91,21 @@ class Dataset(InMemoryDataset):
                 f"(kept={kept}/{total}). Check coord_X/coord_Y and normalization."
             )
 
-        # Store section label for each clean cell (matches tensor row order).
-        # Used by rechunk() to restrict shuffling to within-section permutations.
+        # Store grouping labels for each clean cell (matches tensor row order).
+        # Used by rechunk() / process_slices() so graphs never cross groups.
         nan_mask = ~nan_rows
-        self._cell_sections_clean = self.input_data["cell_section"].values[nan_mask.numpy()]
-        self._cell_ids_clean = self.input_data.index.values[nan_mask.numpy()]
+        nan_np = nan_mask.numpy()
+        self._cell_sections_clean = self.input_data["cell_section"].values[nan_np]
+        self._graph_groups_clean = group_labels[nan_np]
+        self._cell_ids_clean = self.input_data.index.values[nan_np]
+
+        (
+            clean_positions,
+            clean_node_features,
+            clean_cell_class,
+        ) = self._drop_small_graph_groups(
+            clean_positions, clean_node_features, clean_cell_class
+        )
 
         # Update data attributes
         self._update_data_attributes(
@@ -156,10 +185,46 @@ class Dataset(InMemoryDataset):
         )
 
     def _create_region_mapping_dict(self):
-        num_cell_to_region_mapping_dict = (
-            self.input_data.groupby("cell_section").size().to_dict()
+        groups = np.asarray(self._graph_groups_clean)
+        names, counts = np.unique(groups, return_counts=True)
+        return {int(count): str(name) for name, count in zip(names, counts)}
+
+    def graph_group_count(self) -> int:
+        return int(len(np.unique(np.asarray(self._graph_groups_clean))))
+
+    def _drop_small_graph_groups(self, positions, node_features, cell_class):
+        min_size = getattr(self.cfg.dataset, "min_graph_size", None)
+        if not min_size:
+            return positions, node_features, cell_class
+
+        min_size = int(min_size)
+        groups = np.asarray(self._graph_groups_clean)
+        keep = np.ones(groups.size, dtype=bool)
+        dropped_groups = 0
+        for group in np.unique(groups):
+            idx = groups == group
+            if int(idx.sum()) < min_size:
+                keep[idx] = False
+                dropped_groups += 1
+        if dropped_groups == 0:
+            return positions, node_features, cell_class
+
+        dropped_cells = int((~keep).sum())
+        print(
+            f"[{self.name}/{self.split}] Dropped {dropped_groups} graph groups "
+            f"with < {min_size} cells ({dropped_cells} cells).",
+            flush=True,
         )
-        return {v: k for k, v in num_cell_to_region_mapping_dict.items()}
+        keep_t = torch.from_numpy(keep)
+        self._graph_groups_clean = groups[keep]
+        self._cell_sections_clean = np.asarray(self._cell_sections_clean)[keep]
+        self._cell_ids_clean = np.asarray(self._cell_ids_clean)[keep]
+        if int(keep_t.sum().item()) == 0:
+            raise ValueError(
+                f"[{self.name}] Split '{self.split}' became empty after "
+                f"min_graph_size={min_size} filtering."
+            )
+        return positions[keep_t], node_features[keep_t], cell_class[keep_t]
 
     def filter_genes(self) -> list:
         gene_columns_start = self.cfg.dataset.gene_columns_start
@@ -182,16 +247,25 @@ class Dataset(InMemoryDataset):
                 "cell_ID",
             ]
         }
+        n_graphs = max(int(slice_.numel()) - 1, 0)
+        print(
+            f"[{self.name}/{self.split}] graph_split={self.graph_split} "
+            f"groups={self.graph_group_count()} graphs={n_graphs} "
+            f"cells={int(self._data.positions.shape[0])}",
+            flush=True,
+        )
 
     def rechunk(self, seed=None) -> None:
-        """Randomly reshuffle cells within each section, assigning them to new chunks.
+        """Randomly reshuffle cells within each graph group.
 
+        Graph groups are whole ``cell_section`` slices, or
+        ``(cell_section, domain)`` pairs when ``dataset.graph_split=domain``.
         The chunk boundaries (self.slices) stay the same — they define fixed
         windows of size maximum_graph_size into the flat tensor.  What changes
-        is the cell order inside that flat tensor: within each section, all
+        is the cell order inside that flat tensor: within each group, all
         cells are randomly permuted, so every chunk receives a fresh random
-        draw of ~maximum_graph_size cells from the section instead of always
-        the same spatial neighbours.
+        draw of ~maximum_graph_size cells from the same slice / domain instead
+        of always the same spatial neighbours.
 
         Has no effect when maximum_graph_size is None.
         """
@@ -201,9 +275,10 @@ class Dataset(InMemoryDataset):
         rng = np.random.default_rng(seed)
         total_cells = self._data.positions.shape[0]
         perm = np.arange(total_cells)
+        groups = np.asarray(self._graph_groups_clean)
 
-        for section in np.unique(self._cell_sections_clean):
-            indices = np.where(self._cell_sections_clean == section)[0]
+        for group in np.unique(groups):
+            indices = np.where(groups == group)[0]
             perm[indices] = rng.permutation(indices)
 
         perm_t = torch.from_numpy(perm)
@@ -241,17 +316,18 @@ class Dataset(InMemoryDataset):
         # IMPORTANT: slice boundaries must be computed on the cleaned rows,
         # otherwise they can exceed the length of self._data tensors and crash
         # torch_geometric's InMemoryDataset slicing.
-        sections = np.asarray(self._cell_sections_clean)
-        if sections.size == 0:
+        # Groups are whole sections, or (section, domain) in domain mode.
+        groups = np.asarray(self._graph_groups_clean)
+        if groups.size == 0:
             return np.array([0], dtype=int)
 
-        current_section = sections[0]
+        current_group = groups[0]
         slice_start = 0
         boundaries: list[int] = []
 
-        for i in range(1, sections.size + 1):
-            is_end = i == sections.size
-            if is_end or sections[i] != current_section:
+        for i in range(1, groups.size + 1):
+            is_end = i == groups.size
+            if is_end or groups[i] != current_group:
                 slice_end = i
 
                 if self.maximum_graph_size is None:
@@ -263,14 +339,14 @@ class Dataset(InMemoryDataset):
                     boundaries.append(slice_end)
 
                 if not is_end:
-                    current_section = sections[i]
+                    current_group = groups[i]
                     slice_start = i
 
         boundaries = sorted(set(int(b) for b in boundaries))
         if boundaries[0] != 0:
             boundaries = [0] + boundaries
-        if boundaries[-1] != sections.size:
-            boundaries.append(sections.size)
+        if boundaries[-1] != groups.size:
+            boundaries.append(groups.size)
 
         # Remove any accidental duplicates / empty ranges (defensive)
         boundaries = [boundaries[0]] + [
@@ -360,17 +436,30 @@ class DataModule(AbstractDataModule):
         data = pd.read_csv(data_path, index_col=0, dtype=dtype_hints)
         print(f"[DataModule] Loaded {len(data):,} rows for split={split}.")
 
-        # 3. Optional subsampling — set ``dataset.subsample_n`` to cap the
+        # 3. Standardise column names and validate before grouping / subsample.
+        data = standardise_dataframe_colnames(data)
+        required = ["coord_X", "coord_Y", "cell_section", "cell_class"]
+        if resolve_graph_split(cfg) == "domain":
+            required.extend(graph_group_columns(cfg))
+        missing = [c for c in required if c not in data.columns]
+        if missing:
+            raise AssertionError(
+                f"CSV is missing required columns {missing}. "
+                f"Present: {list(data.columns[:12])}..."
+            )
+
+        # 4. Optional subsampling — set ``dataset.subsample_n`` to cap the
         #    number of rows kept per split. Useful to fit very large datasets
         #    in CPU RAM. ``subsample_per_section: True`` keeps at most N rows
-        #    *per section* instead of N rows total.
+        #    *per graph group* (section, or section×domain) instead of N total.
         subsample_n = getattr(cfg.dataset, "subsample_n", None)
         if subsample_n:
             seed = int(getattr(cfg.general, "seed", 0))
             per_section = bool(getattr(cfg.dataset, "subsample_per_section", False))
-            if per_section and "cell_section" in data.columns:
+            group_cols = [c for c in graph_group_columns(cfg) if c in data.columns]
+            if per_section and group_cols:
                 data = (
-                    data.groupby("cell_section", group_keys=False)
+                    data.groupby(group_cols, group_keys=False)
                     .apply(lambda g: g.sample(
                         n=min(int(subsample_n), len(g)), random_state=seed
                     ))
@@ -380,12 +469,8 @@ class DataModule(AbstractDataModule):
                 data = data.sample(n=n, random_state=seed).sort_index()
             print(
                 f"[DataModule] Subsampled split={split} to {len(data):,} rows "
-                f"(per_section={per_section}, seed={seed})."
+                f"(per_group={per_section}, groups={group_cols}, seed={seed})."
             )
-
-        # 4. Standardise column names and validate.
-        data = standardise_dataframe_colnames(data)
-        assert all(column in data.columns for column in ['coord_X', 'coord_Y', 'cell_section', 'cell_class'])
 
         return data
 

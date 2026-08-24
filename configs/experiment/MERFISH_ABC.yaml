@@ -1,10 +1,10 @@
 # @package _global_
 general:
     name : 'MERFISH_ABC'
-    mode : 'test_only'
+    mode : 'train_and_test'
 
 distribute:
-    gpus_per_node: 4  # 1 = auto-detect one device (works on CPU-only machines)
+    gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
 
 dataset:
     dataset_name: 'MERFISH_ABC'
@@ -14,14 +14,29 @@ dataset:
     test_data_path: "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
     validation_data_path: "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
     maximum_graph_size:
-        train:  5000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
-        test: 5000
-        validation: 5000
+        train:  4000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        test: 4000
+        validation: 4000
     # ── Memory-handling options for very large datasets ───────────────
     # Cap how many rows are kept per split (null = use everything).
-    # If subsample_per_section: true, the cap is applied per cell_section.
+    # If subsample_per_section: true, the cap is applied per graph group
+    # (cell_section, or cell_section × domain when graph_split=domain).
     subsample_n: null
     subsample_per_section: false
+    # Graph construction for the LUNA DDPM (not the cell-type / domain classifiers).
+    #   section — one graph family per cell_section (whole-slice training, default)
+    #   domain  — also split each slice by spatial_module clusters so each
+    #             (cell_section, domain) pair is its own graph family
+    graph_split: domain # or section by default
+    domain_column: spatial_module_l1_complete
+    # Keep only labels starting with this prefix (null = every non-empty domain).
+    # Set to "shared" to drop ABC1_only_* / ABC2_only_* modules.
+    domain_keep_prefix: null
+    # Drop (section, domain) groups smaller than this (null = keep all).
+    min_graph_size: 32
+    # When graph_split=domain, rescale coords independently per domain so each
+    # cluster fills [-0.5, 0.5] the way a whole slice does in section mode.
+    normalize_positions_per_graph: true
     # DataLoader memory knobs (already wired up in AbstractDataModule).
     # 0 keeps everything in the main process and avoids forking the
     # in-memory tensors per worker (multi-GB savings on big datasets).
@@ -30,7 +45,7 @@ dataset:
 
 train: # !!!!
     n_epochs: 3000        # tiny number for a smoke-test; increase for real training
-    batch_size: 8      # keep small on CPU
+    batch_size: 4      # keep small on CPU
     lr: 5e-4
     # Mixed precision halves GPU memory and is usually safe.
     # "16-mixed" on V100/T4, "bf16-mixed" on A100/H100, "32-true" to disable.
@@ -40,12 +55,12 @@ train: # !!!!
 
 test:
     save_dir: '/home/abel/code/outputs'
-    checkpoint_paths: 
-    - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1215.ckpt'
-    - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/last_epoch.ckpt'
-    - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1247.ckpt'
-    - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1279.ckpt'
-    - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1455.ckpt'
+    checkpoint_paths: null 
+    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1215.ckpt'
+    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/last_epoch.ckpt'
+    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1247.ckpt'
+    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1279.ckpt'
+    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1455.ckpt'
     checkpoints_parent_dir: null # "/data-master/code/outputs/2026-05-07/15-53-16-Axolotl/checkpoints" #"/data-master/code/outputs/2026-05-04/10-54-06-MERFISH_small_cortex/checkpoints"
     checkpoints_name_list: all #['epoch=1999.ckpt']
 

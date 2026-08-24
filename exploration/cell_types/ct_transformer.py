@@ -152,6 +152,102 @@ class GeneSelfAttention(nn.Module):
         return x
 
 
+def knn_indices_from_features(
+    features: torch.Tensor,
+    node_mask: torch.Tensor,
+    k: int,
+    include_self: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cosine kNN in a coordinate-free feature space.
+
+    Returns ``idx`` ``(B, N, k)`` and ``valid`` ``(B, N, k)`` bool mask.
+    Pads never appear as neighbors. Self is included when ``include_self``.
+    Graph edges are discrete (no gradient through indices).
+    """
+    if k < 1:
+        raise ValueError(f"graph k must be >= 1 (got {k})")
+    bsz, n_cells, _ = features.shape
+    mask = node_mask.bool()
+    q = F.normalize(features.detach(), dim=-1)
+    sim = torch.bmm(q, q.transpose(1, 2))
+    sim = sim.masked_fill(~mask.unsqueeze(1), float("-inf"))
+    sim = sim.masked_fill(~mask.unsqueeze(2), float("-inf"))
+    if not include_self:
+        eye = torch.eye(n_cells, device=sim.device, dtype=torch.bool).unsqueeze(0)
+        sim = sim.masked_fill(eye, float("-inf"))
+    n_real = mask.sum(dim=-1)
+    max_k = int(n_cells if include_self else max(n_cells - 1, 1))
+    kk = min(int(k), max_k)
+    idx = sim.topk(kk, dim=-1).indices
+    sim_vals = sim.gather(2, idx)
+    neigh_ok = mask.unsqueeze(1).expand(-1, n_cells, -1).gather(2, idx)
+    valid = neigh_ok & torch.isfinite(sim_vals)
+    # If a row asked for more neighbors than exist, topk still returns k slots.
+    k_cap = n_real.clamp_min(1).to(dtype=torch.long).view(bsz, 1, 1).expand(
+        bsz, n_cells, kk
+    )
+    rank = torch.arange(kk, device=features.device).view(1, 1, kk).expand(
+        bsz, n_cells, kk
+    )
+    valid = valid & (rank < k_cap)
+    return idx, valid
+
+
+class GraphKNNAttention(nn.Module):
+    """Scaled-dot attention restricted to a kNN graph (GAT-style locality).
+
+    For each cell, attend only over ``k`` neighbors in a feature graph
+    (CME or transcriptome), not the full bag. Complexity ``O(N k d)``.
+    """
+
+    def __init__(
+        self,
+        node_features_dimensions: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        assert node_features_dimensions % num_heads == 0, (
+            f"dx={node_features_dimensions} must be divisible by "
+            f"num_heads={num_heads}"
+        )
+        self.dim = node_features_dimensions
+        self.num_heads = num_heads
+        self.head_dim = node_features_dimensions // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(node_features_dimensions, 3 * node_features_dimensions)
+        self.proj = nn.Linear(node_features_dimensions, node_features_dimensions)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        knn_idx: torch.Tensor,
+        knn_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, n_cells, _ = node_features.shape
+        k_n = knn_idx.size(-1)
+        h = self.num_heads
+        d = self.head_dim
+        qkv = self.qkv(node_features).view(bsz, n_cells, 3, h, d)
+        q, k, v = qkv.unbind(dim=2)
+        batch_ix = torch.arange(bsz, device=node_features.device).view(
+            bsz, 1, 1
+        ).expand(bsz, n_cells, k_n)
+        k_nbor = k[batch_ix, knn_idx]
+        v_nbor = v[batch_ix, knn_idx]
+        scores = (q.unsqueeze(2) * k_nbor).sum(dim=-1) * self.scale
+        scores = scores.masked_fill(~knn_valid.unsqueeze(-1), float("-inf"))
+        attn = torch.softmax(scores, dim=2)
+        attn = torch.nan_to_num(attn, nan=0.0)
+        attn = self.drop(attn)
+        out = (attn.unsqueeze(-1) * v_nbor).sum(dim=2)
+        out = out.reshape(bsz, n_cells, self.dim)
+        out = self.proj(out)
+        return out * node_mask.unsqueeze(-1).to(out.dtype)
+
+
 class GeneTransformerLayer(nn.Module):
     """Same residual + FFN block as ``models.transformer.TransformerLayer``,
     but only the node-feature branch (no PositionNorm / time FFN).
@@ -167,14 +263,26 @@ class GeneTransformerLayer(nn.Module):
         ffn_activation: str = "relu",
         attention_use_node_mask: bool = False,
         pre_norm: bool = False,
+        attn_kind: str = "linear",
     ) -> None:
         super().__init__()
         self.pre_norm = bool(pre_norm)
-        self.self_attn = GeneSelfAttention(
-            node_features_dimensions=node_features_dimensions,
-            num_heads=num_heads,
-            use_node_mask=attention_use_node_mask,
-        )
+        kind = str(attn_kind).strip().lower()
+        if kind not in ("linear", "knn"):
+            raise ValueError(f"attn_kind must be linear|knn (got {attn_kind!r})")
+        self.attn_kind = kind
+        if kind == "knn":
+            self.self_attn = GraphKNNAttention(
+                node_features_dimensions=node_features_dimensions,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+        else:
+            self.self_attn = GeneSelfAttention(
+                node_features_dimensions=node_features_dimensions,
+                num_heads=num_heads,
+                use_node_mask=attention_use_node_mask,
+            )
 
         self.lin_node_features_1 = Linear(
             node_features_dimensions, dim_ff_node_features
@@ -194,11 +302,22 @@ class GeneTransformerLayer(nn.Module):
         self.activation = build_activation(ffn_activation)
 
     def forward(
-        self, node_features: torch.Tensor, node_mask: torch.Tensor
+        self,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        knn_idx: Optional[torch.Tensor] = None,
+        knn_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        def _attn(x: torch.Tensor) -> torch.Tensor:
+            if self.attn_kind == "knn":
+                if knn_idx is None or knn_valid is None:
+                    raise ValueError("knn attention requires knn_idx and knn_valid")
+                return self.self_attn(x, node_mask, knn_idx, knn_valid)
+            return self.self_attn(x, node_mask)
+
         if self.pre_norm:
             x_n = self.norm_node_features_1(node_features)
-            attn_out = self.self_attn(x_n, node_mask)
+            attn_out = _attn(x_n)
             x = node_features + self.dropout_node_features_1(attn_out)
             x_n2 = self.norm_node_features_2(x)
             ff = self.lin_node_features_2(
@@ -208,7 +327,7 @@ class GeneTransformerLayer(nn.Module):
             )
             x = x + self.dropout_node_features_3(ff)
         else:
-            attn_out = self.self_attn(node_features, node_mask)
+            attn_out = _attn(node_features)
             x = self.dropout_node_features_1(attn_out)
             x = self.norm_node_features_1(node_features + x)
             ff = self.lin_node_features_2(
@@ -410,6 +529,23 @@ class CellTypeTransformer(nn.Module):
         presence_topk: int = 0,
         cme_entropy_temp_t0: float = 1.0,
         cme_entropy_temp_alpha: float = 0.0,
+        use_cell_type_input: bool = False,
+        num_cell_types: int = 0,
+        cell_type_embed_dim: int = 32,
+        use_cme_input: bool = False,
+        cme_input_dim: int = 0,
+        aux_fusion: str = "add",
+        aux_inject: str = "input",
+        type_dropout: float = 0.0,
+        n_domain_queries: int = 0,
+        bag_type_hist: bool = False,
+        aux_token_mode: str = "off",
+        n_encoder_queries: int = 0,
+        dual_stream: bool = False,
+        attn_kind: str = "linear",
+        graph_k: int = 32,
+        graph_on: str = "cme",
+        cme_n_scales: int = 1,
     ) -> None:
         super().__init__()
         if hidden_mlp_dims is None:
@@ -484,6 +620,60 @@ class CellTypeTransformer(nn.Module):
         self.cme_condition_on_cls = bool(cme_condition_on_cls)
         self.cme_entropy_temp_t0 = float(cme_entropy_temp_t0)
         self.cme_entropy_temp_alpha = float(cme_entropy_temp_alpha)
+        self.use_cell_type_input = bool(use_cell_type_input)
+        self.num_cell_types = int(num_cell_types)
+        self.cell_type_embed_dim = int(cell_type_embed_dim)
+        self.use_cme_input = bool(use_cme_input)
+        self.cme_input_dim = int(cme_input_dim)
+        fus = str(aux_fusion).strip().lower()
+        if fus not in ("add", "concat", "film", "gate"):
+            raise ValueError(
+                f"aux_fusion must be add|concat|film|gate (got {aux_fusion!r})"
+            )
+        self.aux_fusion = fus
+        inj = str(aux_inject).strip().lower()
+        if inj not in ("input", "head", "both"):
+            raise ValueError(
+                f"aux_inject must be input|head|both (got {aux_inject!r})"
+            )
+        self.aux_inject = inj
+        self.type_dropout = float(type_dropout)
+        self.n_domain_queries = int(n_domain_queries)
+        self.bag_type_hist = bool(bag_type_hist)
+        tok = str(aux_token_mode).strip().lower()
+        if tok not in ("off", "fused", "split", "fused_add", "split_add"):
+            raise ValueError(
+                f"aux_token_mode must be off|fused|split|fused_add|split_add "
+                f"(got {aux_token_mode!r})"
+            )
+        self.aux_token_mode = tok
+        self._aux_tokens_kind = (
+            "fused" if tok.startswith("fused") else
+            "split" if tok.startswith("split") else "off"
+        )
+        self._aux_tokens_keep_add = tok.endswith("_add")
+        self.n_encoder_queries = int(n_encoder_queries)
+        if self.n_encoder_queries < 0:
+            raise ValueError(
+                f"n_encoder_queries must be >= 0 (got {n_encoder_queries})"
+            )
+        self.dual_stream = bool(dual_stream)
+        kind = str(attn_kind).strip().lower()
+        if kind not in ("linear", "knn"):
+            raise ValueError(f"attn_kind must be linear|knn (got {attn_kind!r})")
+        self.attn_kind = kind
+        self.graph_k = int(graph_k)
+        gon = str(graph_on).strip().lower()
+        if gon not in ("cme", "gene"):
+            raise ValueError(f"graph_on must be cme|gene (got {graph_on!r})")
+        self.graph_on = gon
+        self.cme_n_scales = max(1, int(cme_n_scales))
+        if self.attn_kind == "knn" and self.graph_k < 1:
+            raise ValueError(f"graph_k must be >= 1 (got {graph_k})")
+        if self.use_cell_type_input and self.num_cell_types <= 0:
+            raise ValueError("use_cell_type_input requires num_cell_types > 0")
+        if self.use_cme_input and self.cme_input_dim <= 0:
+            raise ValueError("use_cme_input requires cme_input_dim > 0")
 
         if self.feature_cross and not self.predict_cme:
             raise ValueError("feature_cross=True requires predict_cme=True")
@@ -517,20 +707,141 @@ class CellTypeTransformer(nn.Module):
             gene_act_names,
         )
 
-        self.transformer_layers = nn.ModuleList(
-            [
-                GeneTransformerLayer(
-                    node_features_dimensions=self.dx,
-                    num_heads=int(hidden_dims["num_heads"]),
-                    dim_ff_node_features=int(hidden_dims["dim_ffX"]),
-                    dropout=dropout_layer,
-                    ffn_activation=layer_activation,
-                    attention_use_node_mask=self.attention_use_node_mask,
-                    pre_norm=self.pre_norm,
-                )
-                for _ in range(n_layers)
-            ]
+        layer_kwargs = dict(
+            node_features_dimensions=self.dx,
+            num_heads=int(hidden_dims["num_heads"]),
+            dim_ff_node_features=int(hidden_dims["dim_ffX"]),
+            dropout=dropout_layer,
+            ffn_activation=layer_activation,
+            attention_use_node_mask=self.attention_use_node_mask,
+            pre_norm=self.pre_norm,
+            attn_kind=self.attn_kind,
         )
+        self.transformer_layers = nn.ModuleList(
+            [GeneTransformerLayer(**layer_kwargs) for _ in range(n_layers)]
+        )
+        self.context_layers: Optional[nn.ModuleList] = None
+        self.stream_mix: Optional[nn.ModuleList] = None
+        if self.dual_stream:
+            self.context_layers = nn.ModuleList(
+                [GeneTransformerLayer(**layer_kwargs) for _ in range(n_layers)]
+            )
+            self.stream_mix = nn.ModuleList(
+                [nn.Linear(self.dx, self.dx) for _ in range(n_layers)]
+            )
+
+        # Optional cell-type / CME inputs (domain classifier). Never coordinates.
+        self.type_embed: Optional[nn.Embedding] = None
+        self.cme_proj: Optional[nn.Module] = None
+        self.cme_scale_projs: Optional[nn.ModuleList] = None
+        self.cme_scale_to_dx: Optional[nn.ModuleList] = None
+        self.cme_dim_per_scale = 0
+        self.type_to_dx: Optional[nn.Module] = None
+        self.cme_to_dx: Optional[nn.Module] = None
+        self.type_film: Optional[nn.Module] = None
+        self.aux_fuse: Optional[nn.Module] = None
+        self.aux_gate: Optional[nn.Module] = None
+        self._aux_head_dim = 0
+        if self.use_cell_type_input:
+            # Index 0 = UNK / pad.
+            self.type_embed = nn.Embedding(
+                self.num_cell_types + 1, self.cell_type_embed_dim
+            )
+        if self.use_cme_input:
+            if self.cme_input_dim % self.cme_n_scales != 0:
+                raise ValueError(
+                    f"cme_input_dim={self.cme_input_dim} not divisible by "
+                    f"cme_n_scales={self.cme_n_scales}"
+                )
+            self.cme_dim_per_scale = int(self.cme_input_dim // self.cme_n_scales)
+            self.cme_scale_projs = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(self.cme_dim_per_scale, self.cell_type_embed_dim),
+                        nn.SiLU(),
+                        nn.Linear(
+                            self.cell_type_embed_dim, self.cell_type_embed_dim
+                        ),
+                    )
+                    for _ in range(self.cme_n_scales)
+                ]
+            )
+            self.cme_proj = self.cme_scale_projs[0]
+        inject_input = (
+            (self.aux_token_mode == "off" or self._aux_tokens_keep_add)
+            and self.aux_inject in ("input", "both")
+        )
+        inject_head = self.aux_inject in ("head", "both")
+        need_aux_dx = (
+            inject_input or self._aux_tokens_kind != "off" or self.dual_stream
+        )
+        if need_aux_dx and (self.use_cell_type_input or self.use_cme_input):
+            if self.aux_fusion == "add" or self.aux_fusion == "gate" or self._aux_tokens_kind != "off":
+                if self.use_cell_type_input:
+                    self.type_to_dx = nn.Linear(self.cell_type_embed_dim, self.dx)
+                if self.use_cme_input:
+                    self.cme_scale_to_dx = nn.ModuleList(
+                        [
+                            nn.Linear(self.cell_type_embed_dim, self.dx)
+                            for _ in range(self.cme_n_scales)
+                        ]
+                    )
+                    self.cme_to_dx = self.cme_scale_to_dx[0]
+                if self.aux_fusion == "gate":
+                    self.aux_gate = nn.Linear(self.dx, self.dx)
+            elif self.aux_fusion == "film":
+                film_in = 0
+                if self.use_cell_type_input:
+                    film_in += self.cell_type_embed_dim
+                if self.use_cme_input:
+                    film_in += self.cell_type_embed_dim
+                self.type_film = nn.Linear(film_in, 2 * self.dx)
+            else:
+                fuse_in = self.dx
+                if self.use_cell_type_input:
+                    fuse_in += self.cell_type_embed_dim
+                if self.use_cme_input:
+                    fuse_in += self.cell_type_embed_dim
+                self.aux_fuse = nn.Linear(fuse_in, self.dx)
+        if inject_head:
+            if self.use_cell_type_input:
+                self._aux_head_dim += self.cell_type_embed_dim
+            if self.use_cme_input:
+                self._aux_head_dim += self.cell_type_embed_dim
+
+        self.domain_queries: Optional[nn.Parameter] = None
+        self.domain_query_proj: Optional[nn.Module] = None
+        self._query_head_dim = 0
+        if self.n_domain_queries > 0:
+            self.domain_queries = nn.Parameter(
+                torch.randn(self.n_domain_queries, self.dx) * 0.02
+            )
+            self.domain_query_proj = nn.Linear(
+                self.n_domain_queries * self.dx, self.dx
+            )
+            self._query_head_dim = self.dx
+
+        self.encoder_queries: Optional[nn.Parameter] = None
+        self.encoder_query_proj: Optional[nn.Module] = None
+        self._enc_query_head_dim = 0
+        if self.n_encoder_queries > 0:
+            self.encoder_queries = nn.Parameter(
+                torch.randn(self.n_encoder_queries, self.dx) * 0.02
+            )
+            self.encoder_query_proj = nn.Linear(self.dx, self.dx)
+            self._enc_query_head_dim = self.dx
+
+        self.type_hist_proj: Optional[nn.Module] = None
+        self._type_hist_head_dim = 0
+        if self.bag_type_hist:
+            if not self.use_cell_type_input:
+                raise ValueError("bag_type_hist requires use_cell_type_input")
+            self.type_hist_proj = nn.Sequential(
+                nn.Linear(self.num_cell_types + 1, self.dx),
+                nn.SiLU(),
+                nn.Linear(self.dx, self.dx),
+            )
+            self._type_hist_head_dim = self.dx
 
         head_in = self._head_input_dim()
         self.head_input_dim = head_in
@@ -729,7 +1040,98 @@ class CellTypeTransformer(nn.Module):
                 dim += self.dx
         if self.gene_knn_k > 0:
             dim += self.dx
+        dim += int(getattr(self, "_aux_head_dim", 0))
+        dim += int(getattr(self, "_query_head_dim", 0))
+        dim += int(getattr(self, "_type_hist_head_dim", 0))
+        dim += int(getattr(self, "_enc_query_head_dim", 0))
         return dim
+
+    def _maybe_drop_aux(self) -> bool:
+        if not self.training or self.type_dropout <= 0.0:
+            return False
+        device = next(self.parameters()).device
+        return bool(torch.rand((), device=device).item() < self.type_dropout)
+
+    def _aux_embeddings(
+        self, data: DataHolder
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return ``(type_emb, cme_emb)`` each ``(B, N, E)`` or None."""
+        type_emb = None
+        cme_emb = None
+        self._cached_cme_scale_embs = None
+        if self.type_embed is not None:
+            type_ids = getattr(data, "cell_type", None)
+            if type_ids is None:
+                raise ValueError("use_cell_type_input requires data.cell_type (B, N)")
+            if type_ids.dim() == 3:
+                type_ids = type_ids.squeeze(-1)
+            type_emb = self.type_embed(type_ids.long().clamp(min=0))
+        if self.cme_scale_projs is not None:
+            cme = getattr(data, "cme_features", None)
+            if cme is None:
+                raise ValueError("use_cme_input requires data.cme_features (B, N, C)")
+            chunks = torch.split(cme, self.cme_dim_per_scale, dim=-1)
+            if len(chunks) != len(self.cme_scale_projs):
+                raise ValueError(
+                    f"CME last dim {cme.size(-1)} does not match "
+                    f"{len(self.cme_scale_projs)} scales of {self.cme_dim_per_scale}"
+                )
+            scales = [proj(ch) for proj, ch in zip(self.cme_scale_projs, chunks)]
+            self._cached_cme_scale_embs = scales
+            cme_emb = (
+                scales[0] if len(scales) == 1 else torch.stack(scales, dim=0).sum(dim=0)
+            )
+        return type_emb, cme_emb
+
+    def _inject_aux_at_input(
+        self,
+        e_raw: torch.Tensor,
+        type_emb: Optional[torch.Tensor],
+        cme_emb: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.aux_inject not in ("input", "both"):
+            return e_raw
+        if type_emb is None and cme_emb is None:
+            return e_raw
+        if self.aux_fusion == "add":
+            if type_emb is not None and self.type_to_dx is not None:
+                e_raw = e_raw + self.type_to_dx(type_emb)
+            scale_embs = getattr(self, "_cached_cme_scale_embs", None)
+            if (
+                scale_embs is not None
+                and self.cme_scale_to_dx is not None
+                and cme_emb is not None
+            ):
+                for lin, emb in zip(self.cme_scale_to_dx, scale_embs):
+                    e_raw = e_raw + lin(emb)
+            elif cme_emb is not None and self.cme_to_dx is not None:
+                e_raw = e_raw + self.cme_to_dx(cme_emb)
+            return e_raw
+        if self.aux_fusion == "gate":
+            aux = e_raw.new_zeros(e_raw.shape)
+            if type_emb is not None and self.type_to_dx is not None:
+                aux = aux + self.type_to_dx(type_emb)
+            if cme_emb is not None and self.cme_to_dx is not None:
+                aux = aux + self.cme_to_dx(cme_emb)
+            if self.aux_gate is None:
+                return e_raw + aux
+            gate = torch.sigmoid(self.aux_gate(e_raw))
+            return e_raw + gate * aux
+        if self.aux_fusion == "film":
+            parts = [p for p in (type_emb, cme_emb) if p is not None]
+            if not parts or self.type_film is None:
+                return e_raw
+            gb = self.type_film(torch.cat(parts, dim=-1))
+            gamma, beta = gb.chunk(2, dim=-1)
+            return e_raw * (1.0 + gamma) + beta
+        parts = [e_raw]
+        if type_emb is not None:
+            parts.append(type_emb)
+        if cme_emb is not None:
+            parts.append(cme_emb)
+        if self.aux_fuse is None or len(parts) == 1:
+            return e_raw
+        return self.aux_fuse(torch.cat(parts, dim=-1))
 
     def encode_raw_and_mixed(
         self, data: DataHolder
@@ -737,11 +1139,104 @@ class CellTypeTransformer(nn.Module):
         """Return ``(E_raw, E_mixed)``, each ``(B, N, dx)``, masked."""
         node_mask = data.node_mask
         e_raw = self.mlp_in_node_features(data.node_features)
+        # Transcriptomic tokens before type/CME fusion (coordinate-free gene graph).
+        e_gene = e_raw
+        drop_aux = self._maybe_drop_aux()
+        type_emb, cme_emb = self._aux_embeddings(data)
+        if drop_aux:
+            type_emb, cme_emb = None, None
+            self._cached_cme_scale_embs = None
+        self._cached_type_emb = type_emb
+        self._cached_cme_emb = cme_emb
+        if self.aux_token_mode == "off" or self._aux_tokens_keep_add:
+            e_raw = self._inject_aux_at_input(e_raw, type_emb, cme_emb)
         e_raw = e_raw * node_mask.unsqueeze(-1).to(e_raw.dtype)
 
-        e_mixed = e_raw
-        for layer in self.transformer_layers:
-            e_mixed = layer(e_mixed, node_mask)
+        tokens = e_raw
+        tok_mask = node_mask
+        bsz, n_cells, _ = e_raw.shape
+        qn = 0
+        if self.encoder_queries is not None:
+            q = self.encoder_queries.unsqueeze(0).expand(bsz, -1, -1)
+            tokens = torch.cat([q, tokens], dim=1)
+            tok_mask = torch.cat(
+                [node_mask.new_ones(bsz, self.n_encoder_queries), tok_mask],
+                dim=1,
+            )
+            qn = self.n_encoder_queries
+        if self._aux_tokens_kind != "off":
+            ctx_parts: list[torch.Tensor] = []
+            zeros = e_raw.new_zeros(bsz, n_cells, self.dx)
+            if self._aux_tokens_kind == "fused":
+                ctx = zeros
+                if type_emb is not None and self.type_to_dx is not None:
+                    ctx = ctx + self.type_to_dx(type_emb)
+                if cme_emb is not None and self.cme_to_dx is not None:
+                    ctx = ctx + self.cme_to_dx(cme_emb)
+                ctx_parts.append(ctx * node_mask.unsqueeze(-1).to(e_raw.dtype))
+            else:
+                if self.use_cell_type_input:
+                    ttok = zeros
+                    if type_emb is not None and self.type_to_dx is not None:
+                        ttok = self.type_to_dx(type_emb)
+                    ctx_parts.append(ttok * node_mask.unsqueeze(-1).to(e_raw.dtype))
+                if self.use_cme_input:
+                    ctok = zeros
+                    if cme_emb is not None and self.cme_to_dx is not None:
+                        ctok = self.cme_to_dx(cme_emb)
+                    ctx_parts.append(ctok * node_mask.unsqueeze(-1).to(e_raw.dtype))
+            if ctx_parts:
+                ctx_cat = torch.cat(ctx_parts, dim=1)
+                ctx_mask = node_mask.repeat(1, len(ctx_parts))
+                tokens = torch.cat([tokens, ctx_cat], dim=1)
+                tok_mask = torch.cat([tok_mask, ctx_mask], dim=1)
+
+        if self.attn_kind == "knn" and tokens.size(1) != n_cells:
+            raise ValueError(
+                "knn graph attention requires a cell-only sequence "
+                "(disable encoder queries and aux tokens)"
+            )
+        knn_idx = knn_valid = None
+        if self.attn_kind == "knn":
+            if self.graph_on == "cme":
+                gfeat = getattr(data, "cme_features", None)
+                if gfeat is None:
+                    gfeat = e_gene
+            else:
+                gfeat = e_gene
+            knn_idx, knn_valid = knn_indices_from_features(
+                gfeat, node_mask, k=self.graph_k, include_self=True
+            )
+
+        def _run(layer, x, mask):
+            if self.attn_kind == "knn":
+                return layer(x, mask, knn_idx, knn_valid)
+            return layer(x, mask)
+
+        e_all = tokens
+        ctx = None
+        if (
+            self.dual_stream
+            and self.context_layers is not None
+            and self.stream_mix is not None
+        ):
+            ctx = e_raw.new_zeros(e_raw.shape)
+            if type_emb is not None and self.type_to_dx is not None:
+                ctx = ctx + self.type_to_dx(type_emb)
+            if cme_emb is not None and self.cme_to_dx is not None:
+                ctx = ctx + self.cme_to_dx(cme_emb)
+            ctx = ctx * node_mask.unsqueeze(-1).to(e_raw.dtype)
+            for layer, ctx_layer, mix in zip(
+                self.transformer_layers, self.context_layers, self.stream_mix
+            ):
+                e_all = _run(layer, e_all, tok_mask)
+                ctx = _run(ctx_layer, ctx, node_mask)
+                e_all = e_all + mix(ctx)
+        else:
+            for layer in self.transformer_layers:
+                e_all = _run(layer, e_all, tok_mask)
+        e_mixed = e_all[:, qn : qn + n_cells]
+        self._cached_enc_queries = e_all[:, :qn] if qn > 0 else None
         return e_raw, e_mixed
 
     def fuse_for_head(
@@ -778,13 +1273,72 @@ class CellTypeTransformer(nn.Module):
             )
             cell_feat = torch.cat([cell_feat, knn_summary], dim=-1)
 
+        if self.aux_inject in ("head", "both"):
+            extras = []
+            t_emb = getattr(self, "_cached_type_emb", None)
+            c_emb = getattr(self, "_cached_cme_emb", None)
+            if self.use_cell_type_input:
+                extras.append(
+                    t_emb
+                    if t_emb is not None
+                    else cell_feat.new_zeros(
+                        cell_feat.size(0),
+                        cell_feat.size(1),
+                        self.cell_type_embed_dim,
+                    )
+                )
+            if self.use_cme_input:
+                extras.append(
+                    c_emb
+                    if c_emb is not None
+                    else cell_feat.new_zeros(
+                        cell_feat.size(0),
+                        cell_feat.size(1),
+                        self.cell_type_embed_dim,
+                    )
+                )
+            if extras:
+                cell_feat = torch.cat([cell_feat, *extras], dim=-1)
+
         cell_feat = cell_feat * node_mask.unsqueeze(-1).to(cell_feat.dtype)
         return cell_feat
 
     def encode(self, data: DataHolder) -> torch.Tensor:
         """Return features fed to the classifier ``(B, N, head_input_dim)``."""
         e_raw, e_mixed = self.encode_raw_and_mixed(data)
-        return self.fuse_for_head(e_raw, e_mixed, data.node_mask)
+        cell_feat = self.fuse_for_head(e_raw, e_mixed, data.node_mask)
+        n_cells = cell_feat.size(1)
+        mask = data.node_mask
+        extras = []
+        if self.domain_queries is not None and self.domain_query_proj is not None:
+            scale = self.dx ** -0.5
+            scores = torch.einsum("qd,bnd->bqn", self.domain_queries, e_mixed) * scale
+            scores = scores.masked_fill(~mask.bool().unsqueeze(1), float("-inf"))
+            weights = torch.softmax(scores, dim=-1)
+            ctx = torch.einsum("bqn,bnd->bqd", weights, e_mixed)
+            qsum = self.domain_query_proj(ctx.flatten(start_dim=-2)).unsqueeze(1)
+            extras.append(qsum.expand(-1, n_cells, -1))
+        if self.type_hist_proj is not None:
+            type_ids = getattr(data, "cell_type", None)
+            if type_ids is None:
+                raise ValueError("bag_type_hist requires data.cell_type")
+            if type_ids.dim() == 3:
+                type_ids = type_ids.squeeze(-1)
+            n_t = self.num_cell_types + 1
+            onehot = torch.nn.functional.one_hot(
+                type_ids.long().clamp(0, n_t - 1), num_classes=n_t
+            ).to(dtype=cell_feat.dtype)
+            m = mask.unsqueeze(-1).to(dtype=cell_feat.dtype)
+            hist = (onehot * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+            extras.append(self.type_hist_proj(hist).unsqueeze(1).expand(-1, n_cells, -1))
+        enc_q = getattr(self, "_cached_enc_queries", None)
+        if enc_q is not None and self.encoder_query_proj is not None:
+            qpool = self.encoder_query_proj(enc_q.mean(dim=1, keepdim=True))
+            extras.append(qpool.expand(-1, n_cells, -1))
+        if extras:
+            cell_feat = torch.cat([cell_feat, *extras], dim=-1)
+            cell_feat = cell_feat * mask.unsqueeze(-1).to(cell_feat.dtype)
+        return cell_feat
 
     def forward(self, data: DataHolder) -> dict:
         """

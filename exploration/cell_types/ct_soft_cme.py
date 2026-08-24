@@ -347,7 +347,7 @@ def load_soft_cme(
     if not npz_path.exists():
         raise FileNotFoundError(f"Missing soft CME file: {npz_path}")
 
-    data = np.load(npz_path, allow_pickle=False)
+    data = np.load(npz_path, allow_pickle=True)
     soft = data["soft_cme"]
     cme_mass = data["cme_mass"] if "cme_mass" in data.files else None
     cell_id = data["cell_id"]

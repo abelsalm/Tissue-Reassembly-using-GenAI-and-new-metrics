@@ -10,7 +10,7 @@ Select via ``config[\"loss\"][\"name\"]`` (see ``ct_config.json``).
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -450,13 +450,17 @@ def _gene_sim_neighbor_targets(
     return target, has_neighbor
 
 
-def make_cross_entropy(label_smoothing: float = 0.0) -> LossFn:
+def make_cross_entropy(
+    label_smoothing: float = 0.0,
+    class_weight: Optional[Sequence[float]] = None,
+) -> LossFn:
     """Build masked hard CE; ``label_smoothing`` softens hard targets."""
     if not 0.0 <= float(label_smoothing) < 1.0:
         raise ValueError(
             f"label_smoothing must be in [0, 1), got {label_smoothing}"
         )
     ls = float(label_smoothing)
+    weight_list = None if class_weight is None else [float(x) for x in class_weight]
 
     def cross_entropy(
         outputs: Union[torch.Tensor, Dict[str, torch.Tensor]], batch: DataHolder
@@ -485,9 +489,63 @@ def make_cross_entropy(label_smoothing: float = 0.0) -> LossFn:
                     f"min={tmin}, max={tmax}"
                 )
 
-        return F.cross_entropy(logits_m, targets_m, label_smoothing=ls)
+        weight = None
+        if weight_list is not None:
+            if len(weight_list) != num_classes:
+                raise ValueError(
+                    f"class_weight length {len(weight_list)} != C={num_classes}"
+                )
+            weight = logits_m.new_tensor(weight_list)
+        return F.cross_entropy(
+            logits_m, targets_m, weight=weight, label_smoothing=ls
+        )
 
     return cross_entropy
+
+
+def make_focal_loss(
+    gamma: float = 2.0,
+    label_smoothing: float = 0.0,
+    class_weight: Optional[Sequence[float]] = None,
+) -> LossFn:
+    """Masked focal CE: ``(1-p_t)^γ * CE``. Optional class weights as in CE."""
+    if gamma < 0:
+        raise ValueError(f"focal gamma must be >= 0 (got {gamma})")
+    ls = float(label_smoothing)
+    g = float(gamma)
+    weight_list = None if class_weight is None else [float(x) for x in class_weight]
+
+    def focal(
+        outputs: Union[torch.Tensor, Dict[str, torch.Tensor]], batch: DataHolder
+    ) -> torch.Tensor:
+        logits = _as_logits(outputs, "cls_logits")
+        if batch.node_mask is None:
+            raise ValueError("batch.node_mask is required for focal loss")
+        targets = class_indices_from_batch(batch)
+        mask = batch.node_mask.bool()
+        logits_m = logits[mask]
+        targets_m = targets[mask]
+        if logits_m.numel() == 0:
+            return logits.sum() * 0.0
+        logp = F.log_softmax(logits_m, dim=-1)
+        n_classes = logits_m.size(-1)
+        if ls > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(logp)
+                true_dist.fill_(ls / max(n_classes - 1, 1))
+                true_dist.scatter_(1, targets_m.unsqueeze(1), 1.0 - ls)
+            ce = -(true_dist * logp).sum(dim=-1)
+            pt = (true_dist * logp.exp()).sum(dim=-1).clamp(0, 1)
+        else:
+            ce = F.nll_loss(logp, targets_m, reduction="none")
+            pt = logp.exp().gather(1, targets_m.unsqueeze(1)).squeeze(1)
+        loss = ((1.0 - pt) ** g) * ce
+        if weight_list is not None:
+            w = logits_m.new_tensor(weight_list)
+            loss = loss * w[targets_m]
+        return loss.mean()
+
+    return focal
 
 
 def make_soft_cross_entropy(eps: float = 1e-8) -> LossFn:
@@ -1153,6 +1211,8 @@ cross_entropy = make_cross_entropy(0.0)
 
 LOSS_REGISTRY: Dict[str, Callable[..., LossFn]] = {
     "cross_entropy": make_cross_entropy,
+    "focal": make_focal_loss,
+    "focal_loss": make_focal_loss,
     "soft_cross_entropy": make_soft_cross_entropy,
     "combined": make_combined_loss,
 }
