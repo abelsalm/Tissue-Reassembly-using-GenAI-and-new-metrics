@@ -1,0 +1,100 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "output_dir": "exploration/cell_types/outputs",
+  "log_dir": "exploration/cell_types/logs",
+  "run_name": "ct_transformer_abc_domains_best",
+
+  "wandb": {
+    "enabled": true,
+    "project": "cell_domains",
+    "entity": null,
+    "mode": "online",
+    "tags": ["new domains", "domains", "merfish_abc", "ms_coarse_cme"],
+    "log_every_steps": false,
+    "log_per_class_acc": false
+  },
+
+  "dataset": {
+    "dataset_name": "MERFISH_ABC",
+    "gene_columns_start": 8,
+    "gene_columns_end": -1,
+    "train_data_path": "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv",
+    "validation_data_path": "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv",
+    "test_data_path": "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv",
+    "label_column": "spatial_module_l1_complete",
+    "shared_label_prefix": "shared",
+    "other_class_name": "other",
+    "maximum_graph_size": {
+      "train": 8192,
+      "validation": 8192,
+      "test": 8192
+    },
+    "num_workers": 0,
+    "pin_memory": false,
+    "subsample_n": null,
+    "subsample_per_section": false
+  },
+
+  "model": {
+    "n_layers": 4,
+    "dropout_cls": 0.1,
+    "dropout_layer": 0.1,
+    "gene_mlp_activation": "silu",
+    "cls_activation": "silu",
+    "global_skip": "concat",
+    "subgraph_summary": true,
+    "hidden_mlp_dims": {
+      "gene": 128,
+      "cls": 128
+    },
+    "hidden_dims": {
+      "dx": 128,
+      "num_heads": 8,
+      "dim_ffX": 256
+    }
+  },
+
+  "aux_inputs": {
+    "cell_type": true,
+    "cme": true,
+    "cme_dir": "exploration/cell_types/outputs/abc_soft_cmes",
+    "cme_sigma": 0.25,
+    "type_embed_dim": 32,
+    "inject": "input",
+    "fusion": "add",
+    "type_dropout": 0.1,
+    "cme_sigmas": [0.25, 1.0, 2.0]
+  },
+
+  "loss": {
+    "name": "cross_entropy",
+    "label_smoothing": 0.05
+  },
+
+  "train": {
+    "n_epochs": 400,
+    "batch_size": 4,
+    "lr": 0.0002,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "log_every": 50,
+    "val_every_n_epochs": 4,
+    "save_every_n_epochs": 20,
+    "rechunk_every_n_epochs": 1,
+    "early_stopping": {
+      "enabled": true,
+      "monitor": "val/acc",
+      "patience": 16,
+      "min_delta": 0.001
+    }
+  },
+
+  "validation": {
+    "batch_size": 4
+  },
+
+  "test": {
+    "batch_size": 4
+  }
+}

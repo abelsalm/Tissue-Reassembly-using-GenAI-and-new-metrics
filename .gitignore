@@ -40,17 +40,18 @@ outputs/*
 ./outputs/*
 
 
-./exploration/cell_types/outputs
-./exploration/cell_types/outputs/*
-./exploration/cell_types/outputs/*/*
+exploration/cell_types/outputs
+exploration/cell_types/outputs/*
+exploration/cell_types/outputs/*/*
 exploration/cell_types/logs/
-./exploration/cell_types/logs/
-./exploration/cell_types/logs/**
-./exploration/cell_types/experiments/notes
-./exploration/cell_types/experiments/notes/*
+exploration/cell_types/logs/
+exploration/cell_types/logs/**
+exploration/cell_types/experiments/notes
+exploration/cell_types/experiments/notes/*
 
-*.json
-**/*.json
+
+exploration/cell_types/experiments/*.json
+exploration/cell_types/experiments/configs/*.json
 *.log
 **/*.log
 *.log.*
