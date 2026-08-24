@@ -321,6 +321,9 @@ class NoiseModel:
             node_features=data.node_features,
             positions=pos_t,
             cell_class=data.cell_class,
+            cell_ID=data.cell_ID,
+            cell_type=data.cell_type,
+            domain_id=data.domain_id,
             node_mask=data.node_mask,
             t_int=t_int,
             t=t_float,
@@ -335,6 +338,8 @@ class NoiseModel:
         node_mask: torch.Tensor,
         cell_ID: torch.Tensor,
         cell_class: torch.Tensor,
+        cell_type: torch.Tensor = None,
+        domain_id: torch.Tensor = None,
     ) -> DataHolder:
         """
         Sample from the limit distribution of the diffusion process.
@@ -381,6 +386,8 @@ class NoiseModel:
             node_mask=node_mask,
             cell_class=cell_class,
             cell_ID=cell_ID,
+            cell_type=cell_type,
+            domain_id=domain_id,
             t_int=t_int_array,
             t=t_array,
             diffusion_time=t_array,
@@ -454,6 +461,10 @@ class NoiseModel:
             node_features=z_t.node_features,
             positions=positions,
             node_mask=node_mask,
+            cell_class=z_t.cell_class,
+            cell_ID=z_t.cell_ID,
+            cell_type=z_t.cell_type,
+            domain_id=z_t.domain_id,
             t_int=s_int,
             t=s_int / self.max_diffusion_steps,
             diffusion_time=s_int / self.max_diffusion_steps,

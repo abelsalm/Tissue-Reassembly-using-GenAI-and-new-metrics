@@ -43,6 +43,8 @@ def to_batch(data: DataHolder, device=None) -> DataHolder:
             raise ValueError("cell_ID has wrong dimensionality")
     except AttributeError:
         cell_ID = None
+    cell_type = _optional_dense_attribute(data, "cell_type")
+    domain_id = _optional_dense_attribute(data, "domain_id")
     pos = pos.float()
 
     if device is not None:
@@ -51,6 +53,8 @@ def to_batch(data: DataHolder, device=None) -> DataHolder:
         node_mask = node_mask.to(device)
         cell_class = cell_class.to(device)
         cell_ID = cell_ID.to(device) if cell_ID is not None else None
+        cell_type = cell_type.to(device) if cell_type is not None else None
+        domain_id = domain_id.to(device) if domain_id is not None else None
 
     data = DataHolder(
         node_features=node_features,
@@ -58,10 +62,25 @@ def to_batch(data: DataHolder, device=None) -> DataHolder:
         node_mask=node_mask,
         cell_class=cell_class,
         cell_ID=cell_ID,
+        cell_type=cell_type,
+        domain_id=domain_id,
         diffusion_time=None,
     ).mask()
 
     return data
+
+
+def _optional_dense_attribute(data, name):
+    """Densify an optional per-node integer attribute as ``(B, N, 1)``."""
+    value = getattr(data, name, None)
+    if value is None:
+        return None
+    dense, _ = to_dense_batch(x=value, batch=data.batch)
+    if dense.dim() == 2:
+        dense = dense.unsqueeze(-1)
+    elif dense.dim() != 3:
+        raise ValueError(f"{name} has wrong dimensionality: {tuple(dense.shape)}")
+    return dense
 
 
 def setup_wandb(cfg: omegaconf.DictConfig) -> omegaconf.DictConfig:

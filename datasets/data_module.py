@@ -1,4 +1,5 @@
 import gc
+from typing import Optional
 
 import numpy as np
 import omegaconf
@@ -23,6 +24,44 @@ from utils.data.load import (
 )
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
+
+
+def _optional_labels(
+    data: pd.DataFrame, column: str, keep_mask: np.ndarray
+) -> Optional[np.ndarray]:
+    """Return cleaned string labels, preserving missing values as ``None``."""
+    if column not in data.columns:
+        return None
+    values = data[column].to_numpy(dtype=object)[keep_mask]
+    return np.asarray(
+        [None if pd.isna(value) else str(value) for value in values],
+        dtype=object,
+    )
+
+
+def _enabled_embedding(cfg, name: str) -> bool:
+    embeddings = getattr(cfg.model, "embeddings", None)
+    section = getattr(embeddings, name, None) if embeddings is not None else None
+    return bool(getattr(section, "enabled", False)) if section is not None else False
+
+
+def _build_train_vocabulary(labels: Optional[np.ndarray]) -> tuple[dict, list]:
+    """Build a deterministic 1-based vocabulary; index 0 is UNK / pad."""
+    if labels is None:
+        return {}, []
+    names = sorted({str(value) for value in labels if value is not None})
+    return {name: i + 1 for i, name in enumerate(names)}, names
+
+
+def _map_aux_labels(
+    labels: Optional[np.ndarray], vocabulary: dict, n_cells: int
+) -> torch.Tensor:
+    if labels is None:
+        return torch.zeros(n_cells, dtype=torch.long)
+    return torch.tensor(
+        [vocabulary.get(str(value), 0) if value is not None else 0 for value in labels],
+        dtype=torch.long,
+    )
 
 
 class Dataset(InMemoryDataset):
@@ -98,6 +137,24 @@ class Dataset(InMemoryDataset):
         self._cell_sections_clean = self.input_data["cell_section"].values[nan_np]
         self._graph_groups_clean = group_labels[nan_np]
         self._cell_ids_clean = self.input_data.index.values[nan_np]
+        cell_type_column = str(
+            getattr(self.cfg.dataset, "cell_type_column", "cell_class")
+        )
+        if cell_type_column == "subclass":
+            cell_type_column = "cell_class"
+        domain_column = str(
+            getattr(
+                self.cfg.dataset,
+                "domain_column",
+                "spatial_module_l1_complete",
+            )
+        )
+        self._cell_type_labels_clean = _optional_labels(
+            self.input_data, cell_type_column, nan_np
+        )
+        self._domain_labels_clean = _optional_labels(
+            self.input_data, domain_column, nan_np
+        )
 
         (
             clean_positions,
@@ -173,6 +230,8 @@ class Dataset(InMemoryDataset):
         self._data.node_features = clean_node_features
         self._data.cell_class = clean_cell_class
         self._data.cell_ID = cell_ID
+        self._data.cell_type = None
+        self._data.domain_id = None
         # Canonical unwarped coordinates; kept in sync with rechunk permutations.
         self._positions_unwarped = clean_positions.clone()
 
@@ -219,6 +278,14 @@ class Dataset(InMemoryDataset):
         self._graph_groups_clean = groups[keep]
         self._cell_sections_clean = np.asarray(self._cell_sections_clean)[keep]
         self._cell_ids_clean = np.asarray(self._cell_ids_clean)[keep]
+        if self._cell_type_labels_clean is not None:
+            self._cell_type_labels_clean = np.asarray(
+                self._cell_type_labels_clean, dtype=object
+            )[keep]
+        if self._domain_labels_clean is not None:
+            self._domain_labels_clean = np.asarray(
+                self._domain_labels_clean, dtype=object
+            )[keep]
         if int(keep_t.sum().item()) == 0:
             raise ValueError(
                 f"[{self.name}] Split '{self.split}' became empty after "
@@ -286,7 +353,44 @@ class Dataset(InMemoryDataset):
         self._data.node_features = self._data.node_features[perm_t]
         self._data.cell_class    = self._data.cell_class[perm_t]
         self._data.cell_ID       = self._data.cell_ID[perm_t]
+        if self._data.cell_type is not None:
+            self._data.cell_type = self._data.cell_type[perm_t]
+        if self._data.domain_id is not None:
+            self._data.domain_id = self._data.domain_id[perm_t]
+        if self._cell_type_labels_clean is not None:
+            self._cell_type_labels_clean = np.asarray(
+                self._cell_type_labels_clean, dtype=object
+            )[perm]
+        if self._domain_labels_clean is not None:
+            self._domain_labels_clean = np.asarray(
+                self._domain_labels_clean, dtype=object
+            )[perm]
         self._positions_unwarped = self._positions_unwarped[perm_t]
+
+    def set_embedding_ids(
+        self,
+        *,
+        cell_type_ids: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Attach train-vocabulary-aligned auxiliary IDs to this dataset."""
+        n_cells = int(self._data.node_features.size(0))
+        if cell_type_ids is not None:
+            if cell_type_ids.shape != (n_cells,):
+                raise ValueError(
+                    f"cell_type_ids must be ({n_cells},), "
+                    f"got {tuple(cell_type_ids.shape)}"
+                )
+            self._data.cell_type = cell_type_ids.long()
+            self.slices["cell_type"] = self.slices["node_features"]
+        if domain_ids is not None:
+            if domain_ids.shape != (n_cells,):
+                raise ValueError(
+                    f"domain_ids must be ({n_cells},), "
+                    f"got {tuple(domain_ids.shape)}"
+                )
+            self._data.domain_id = domain_ids.long()
+            self.slices["domain_id"] = self.slices["node_features"]
 
     def apply_epoch_warp(
         self,
@@ -369,6 +473,10 @@ class DataModule(AbstractDataModule):
         else:
             self.validation_dataset = None
 
+        self.cell_type_decoder = []
+        self.domain_decoder = []
+        self._configure_embedding_metadata(cfg)
+
         self.statistics = {
             "train": self.train_dataset.statistics,
             "validation": self.validation_dataset.statistics if self.validation_dataset else None,
@@ -384,6 +492,67 @@ class DataModule(AbstractDataModule):
     def _initialize_dataset(self, split, data, cfg):
         return Dataset(split=split, input_data=data, cfg=cfg)
 
+    def _configure_embedding_metadata(self, cfg) -> None:
+        """Align auxiliary categorical IDs to the train split vocabulary."""
+        use_cell_type = _enabled_embedding(cfg, "cell_type")
+        use_domain = _enabled_embedding(cfg, "domain")
+
+        cell_vocab, self.cell_type_decoder = _build_train_vocabulary(
+            self.train_dataset._cell_type_labels_clean
+        )
+        domain_vocab, self.domain_decoder = _build_train_vocabulary(
+            self.train_dataset._domain_labels_clean
+        )
+        # Build available metadata even when currently disabled. In test-only
+        # mode the checkpoint's model config is loaded after DataModule setup,
+        # and may enable an embedding that the command-line config did not.
+        self.num_cell_types = len(self.cell_type_decoder)
+        self.num_domains = len(self.domain_decoder)
+        if use_cell_type and self.num_cell_types == 0:
+            raise ValueError(
+                "Cell-type embedding is enabled but dataset.cell_type_column "
+                "was not found or contains no labels."
+            )
+        if use_domain and self.num_domains == 0:
+            raise ValueError(
+                "Domain embedding is enabled but dataset.domain_column "
+                "was not found or contains no labels."
+            )
+
+        datasets = [
+            self.train_dataset,
+            self.test_dataset,
+            self.validation_dataset,
+        ]
+        for dataset in datasets:
+            if dataset is None:
+                continue
+            n_cells = int(dataset._data.node_features.size(0))
+            cell_ids = (
+                _map_aux_labels(
+                    dataset._cell_type_labels_clean, cell_vocab, n_cells
+                )
+                if self.num_cell_types > 0
+                else None
+            )
+            domain_ids = (
+                _map_aux_labels(
+                    dataset._domain_labels_clean, domain_vocab, n_cells
+                )
+                if self.num_domains > 0
+                else None
+            )
+            dataset.set_embedding_ids(
+                cell_type_ids=cell_ids,
+                domain_ids=domain_ids,
+            )
+        print(
+            "[DataModule] auxiliary embedding vocabularies: "
+            f"cell_types={self.num_cell_types}, domains={self.num_domains} "
+            "(0=UNK/pad)",
+            flush=True,
+        )
+
     def collate(self, batch):
         return self._create_batch(batch)
 
@@ -395,6 +564,14 @@ class DataModule(AbstractDataModule):
         batch_data.positions = torch.cat([data.positions for data in batch], dim=0)
         batch_data.cell_class = torch.cat([data.cell_class for data in batch], dim=0)
         batch_data.cell_ID = torch.cat([data.cell_ID for data in batch], dim=0)
+        if getattr(batch[0], "cell_type", None) is not None:
+            batch_data.cell_type = torch.cat(
+                [data.cell_type for data in batch], dim=0
+            )
+        if getattr(batch[0], "domain_id", None) is not None:
+            batch_data.domain_id = torch.cat(
+                [data.domain_id for data in batch], dim=0
+            )
 
         batch_data.batch = torch.tensor(
             [
@@ -441,6 +618,16 @@ class DataModule(AbstractDataModule):
         required = ["coord_X", "coord_Y", "cell_section", "cell_class"]
         if resolve_graph_split(cfg) == "domain":
             required.extend(graph_group_columns(cfg))
+        if _enabled_embedding(cfg, "domain"):
+            required.append(
+                str(
+                    getattr(
+                        cfg.dataset,
+                        "domain_column",
+                        "spatial_module_l1_complete",
+                    )
+                )
+            )
         missing = [c for c in required if c not in data.columns]
         if missing:
             raise AssertionError(
@@ -496,6 +683,15 @@ class Infos(AbstractDatasetInfos):
         self.cell_class_decoder = {}
         self.num_cell_to_region_mapping_dict = {}
         self.cell_class_decoder = datamodule.statistics["test"].cell_class_decoder
+        self.num_cell_types = int(getattr(datamodule, "num_cell_types", 0))
+        self.num_domains = int(getattr(datamodule, "num_domains", 0))
+        self.cell_type_decoder = list(
+            getattr(datamodule, "cell_type_decoder", [])
+        )
+        self.domain_decoder = list(getattr(datamodule, "domain_decoder", []))
+        train_data = datamodule.train_dataset._data
+        self.train_node_features = train_data.node_features
+        self.train_cell_type = getattr(train_data, "cell_type", None)
         self.num_cell_to_region_mapping_dict = datamodule.statistics[
             "test"
         ].num_cell_to_region_mapping_dict

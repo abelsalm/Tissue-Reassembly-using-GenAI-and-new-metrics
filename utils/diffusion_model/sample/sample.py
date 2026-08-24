@@ -24,6 +24,8 @@ def sample_noise(self, batch: DataHolder) -> torch.Tensor:
         node_features=node_features,
         cell_class=cell_class,
         cell_ID=cell_ID,
+        cell_type=batch.cell_type,
+        domain_id=batch.domain_id,
         node_mask=node_mask,
     )
 

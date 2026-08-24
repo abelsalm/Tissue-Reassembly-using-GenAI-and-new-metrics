@@ -8,6 +8,10 @@ distribute:
 
 dataset:
     dataset_name: 'MERFISH_ABC'
+    # Biological conditioning columns. ``subclass`` is standardized to
+    # ``cell_class`` by the loader; auxiliary IDs are aligned to the train
+    # vocabulary and reserve index 0 for UNK / padding.
+    cell_type_column: cell_class
     gene_columns_start: 8   # first column after the index is a gene
     gene_columns_end: -1 
     train_data_path:  "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC1_complete_cell_gene_shuffled.csv"
@@ -43,6 +47,35 @@ dataset:
     num_workers: 220
     pin_memory: false
 
+# Optional conditioning concatenated with LUNA's original transcriptome
+# embedding, then projected back to model.hidden_dims.dx before the Transformer.
+# Either block can be enabled alone, or both can be enabled together.
+model:
+    embeddings:
+        fusion_hidden_dim: 128
+        fusion_dropout: 0.0
+        cell_type:
+            enabled: false
+            dim: 32
+            # PCA-mean initialization of the classical nn.Embedding table.
+            standardize: true
+            pca_max_cells: 20000
+            freeze: false
+            # Geometry used by train.cell_type_mds_weight.
+            mds_scale: mean       # mean | none | optimal
+            mds_weighting: uniform # uniform | sammon
+        domain:
+            enabled: false
+            dim: 32
+            # Amortized per-(graph, domain) pooling in PCA transcriptome space.
+            pool: mean            # mean | attention
+            attn_hidden: 32
+            # Learned softmax gates over PCA coordinates after domain pooling.
+            variable_attention: false
+            standardize: true
+            pca_max_cells: 20000
+            freeze_pca: true
+
 train: # !!!!
     n_epochs: 3000        # tiny number for a smoke-test; increase for real training
     batch_size: 8      # keep small on CPU
@@ -52,6 +85,10 @@ train: # !!!!
     precision: "32-true"
     # Effective batch size = batch_size * accumulate_grad_batches.
     accumulate_grad_batches: 1
+    # Metric-MDS regularization of cell-type embedding distances against
+    # class-mean distances in real transcriptomic space. Requires
+    # model.embeddings.cell_type.enabled=true. Zero disables it.
+    cell_type_mds_weight: 0.0
 
 test:
     save_dir: '/home/abel/code/outputs'

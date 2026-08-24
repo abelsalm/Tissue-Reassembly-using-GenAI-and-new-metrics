@@ -3,6 +3,7 @@ import torch.nn as nn
 from models.layers import PositionsMLP
 from models.transformer import TransformerLayer
 from utils.data.dataholder import DataHolder
+from exploration.cell_types.embeddings import CellTypeEmbedding, DomainEmbedding
 import torch
 
 
@@ -36,6 +37,12 @@ class Model(nn.Module):
         hidden_dims: dict,
         output_dims,
         positionMLP_eps: float = 1e-9,
+        embedding_cfg=None,
+        num_cell_types: int = 0,
+        num_domains: int = 0,
+        train_node_features: torch.Tensor = None,
+        train_cell_type: torch.Tensor = None,
+        build_cell_type_mds: bool = False,
     ) -> None:
         """
         Constructor to initialize the Model instance.
@@ -68,6 +75,106 @@ class Model(nn.Module):
             nn.Linear(hidden_mlp_dims["X"], hidden_dims["dx"]),
             act_fn_in,
         )
+
+        # Optional biological conditioning. The original transcriptome
+        # embedding is concatenated with either/both auxiliary embeddings,
+        # then projected back to dx so the Transformer stack is unchanged.
+        self.cell_type_embedding = None
+        self.domain_embedding = None
+        self.embedding_fusion = None
+        self.cell_type_mds_scale = "mean"
+        self.cell_type_mds_weighting = "uniform"
+        aux_dim = 0
+        cell_cfg = _cfg_section(embedding_cfg, "cell_type")
+        if bool(_cfg_value(cell_cfg, "enabled", False)):
+            if num_cell_types < 1:
+                raise ValueError(
+                    "Cell-type embedding enabled but no train cell-type "
+                    "vocabulary is available."
+                )
+            if train_node_features is None or train_cell_type is None:
+                raise ValueError(
+                    "Cell-type embedding requires train transcriptomes and IDs."
+                )
+            cell_dim = int(_cfg_value(cell_cfg, "dim", 32))
+            self.cell_type_embedding = CellTypeEmbedding.from_features(
+                train_node_features,
+                train_cell_type.long() - 1,
+                n=cell_dim,
+                num_classes=int(num_cell_types),
+                reserve_unk=True,
+                freeze=bool(_cfg_value(cell_cfg, "freeze", False)),
+                standardize=bool(_cfg_value(cell_cfg, "standardize", True)),
+                pca_max_cells=_optional_int(
+                    _cfg_value(cell_cfg, "pca_max_cells", 20000)
+                ),
+                build_mds=bool(build_cell_type_mds),
+            )
+            self.cell_type_mds_scale = str(
+                _cfg_value(cell_cfg, "mds_scale", "mean")
+            )
+            self.cell_type_mds_weighting = str(
+                _cfg_value(cell_cfg, "mds_weighting", "uniform")
+            )
+            aux_dim += cell_dim
+
+        domain_cfg = _cfg_section(embedding_cfg, "domain")
+        if bool(_cfg_value(domain_cfg, "enabled", False)):
+            if num_domains < 1:
+                raise ValueError(
+                    "Domain embedding enabled but no train domain vocabulary "
+                    "is available."
+                )
+            if train_node_features is None:
+                raise ValueError(
+                    "Domain embedding requires train transcriptomes for PCA."
+                )
+            domain_dim = int(_cfg_value(domain_cfg, "dim", 32))
+            self.domain_embedding = DomainEmbedding.from_features(
+                train_node_features,
+                n=domain_dim,
+                # One extra row for index 0 = UNK / pad.
+                num_domains=int(num_domains) + 1,
+                pool=str(_cfg_value(domain_cfg, "pool", "mean")),
+                variable_attention=bool(
+                    _cfg_value(domain_cfg, "variable_attention", False)
+                ),
+                reserve_unk=True,
+                freeze_pca=bool(
+                    _cfg_value(domain_cfg, "freeze_pca", True)
+                ),
+                attn_hidden=_optional_int(
+                    _cfg_value(domain_cfg, "attn_hidden", domain_dim)
+                ),
+                standardize=bool(
+                    _cfg_value(domain_cfg, "standardize", True)
+                ),
+                pca_max_cells=_optional_int(
+                    _cfg_value(domain_cfg, "pca_max_cells", 20000)
+                ),
+            )
+            aux_dim += domain_dim
+
+        if aux_dim > 0:
+            fused_dim = int(hidden_dims["dx"]) + aux_dim
+            fusion_hidden = int(
+                _cfg_value(
+                    embedding_cfg,
+                    "fusion_hidden_dim",
+                    hidden_dims["dx"],
+                )
+            )
+            fusion_dropout = float(
+                _cfg_value(embedding_cfg, "fusion_dropout", 0.0)
+            )
+            self.embedding_fusion = nn.Sequential(
+                nn.LayerNorm(fused_dim),
+                nn.Linear(fused_dim, fusion_hidden),
+                nn.ReLU(),
+                nn.Dropout(fusion_dropout),
+                nn.Linear(fusion_hidden, hidden_dims["dx"]),
+                nn.ReLU(),
+            )
 
         # MLP for processing input diffusion time
         self.mlp_in_diffusion_time = nn.Sequential(
@@ -134,8 +241,35 @@ class Model(nn.Module):
         ]
 
         # Process input features using MLPs
+        transcriptome_embedding = self.mlp_in_node_features(node_features)
+        embeddings = [transcriptome_embedding]
+        if self.cell_type_embedding is not None:
+            if data.cell_type is None:
+                raise ValueError(
+                    "Cell-type embedding enabled but data.cell_type is missing."
+                )
+            embeddings.append(self.cell_type_embedding(data.cell_type))
+        if self.domain_embedding is not None:
+            if data.domain_id is None:
+                raise ValueError(
+                    "Domain embedding enabled but data.domain_id is missing."
+                )
+            embeddings.append(
+                self.domain_embedding(
+                    node_features,
+                    data.domain_id,
+                    node_mask,
+                )
+            )
+        if self.embedding_fusion is not None:
+            node_embedding = self.embedding_fusion(
+                torch.cat(embeddings, dim=-1)
+            )
+        else:
+            node_embedding = transcriptome_embedding
+
         transformed_features = DataHolder(
-            node_features=self.mlp_in_node_features(node_features),
+            node_features=node_embedding,
             diffusion_time=self.mlp_in_diffusion_time(diffusion_time),
             positions=self.mlp_in_position(positions, node_mask),
             node_mask=node_mask,
@@ -174,3 +308,34 @@ class Model(nn.Module):
         ).mask()
 
         return out
+
+    def cell_type_mds_loss(self) -> torch.Tensor:
+        """Raw transcriptomic-geometry regularizer for the cell-type table."""
+        if self.cell_type_embedding is None:
+            return next(self.parameters()).new_zeros(())
+        return self.cell_type_embedding.mds_loss(
+            scale=self.cell_type_mds_scale,
+            weighting=self.cell_type_mds_weighting,
+        )
+
+
+def _cfg_section(cfg, name):
+    if cfg is None:
+        return None
+    if isinstance(cfg, dict):
+        return cfg.get(name)
+    return getattr(cfg, name, None)
+
+
+def _cfg_value(cfg, name, default):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        value = cfg.get(name, default)
+    else:
+        value = getattr(cfg, name, default)
+    return default if value is None else value
+
+
+def _optional_int(value):
+    return None if value is None else int(value)

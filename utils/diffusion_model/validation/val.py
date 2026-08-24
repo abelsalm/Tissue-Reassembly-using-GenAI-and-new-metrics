@@ -36,6 +36,7 @@ def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
             train_stage=False,
             log=False,
             batch_idx=i,
+            cell_type_mds_loss=self.cell_type_mds_loss(),
         )
 
         self.vanilla_val_loss(

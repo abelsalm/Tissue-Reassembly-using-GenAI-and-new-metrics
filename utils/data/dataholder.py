@@ -33,6 +33,8 @@ class DataHolder:
         diffusion_time: int,
         cell_ID=None,
         cell_class=None,
+        cell_type=None,
+        domain_id=None,
         t_int=None,
         t=None,
         node_mask=None,
@@ -44,6 +46,8 @@ class DataHolder:
         self.node_features = node_features
         self.cell_class = cell_class
         self.cell_ID = cell_ID
+        self.cell_type = cell_type
+        self.domain_id = domain_id
         self.t_int = t_int
         self.t = t
         self.diffusion_time = diffusion_time if diffusion_time is not None else t
@@ -58,6 +62,8 @@ class DataHolder:
         self.node_features = to_device(self.node_features, device)
         self.cell_class = to_device(self.cell_class, device)
         self.cell_ID = to_device(self.cell_ID, device)
+        self.cell_type = to_device(self.cell_type, device)
+        self.domain_id = to_device(self.domain_id, device)
         return self
 
     def mask(self, node_mask=None) -> "DataHolder":
@@ -77,6 +83,8 @@ class DataHolder:
 
         self.cell_class = apply_mask(self.cell_class, node_mask)
         self.cell_ID = apply_mask(self.cell_ID, node_mask)
+        self.cell_type = apply_mask(self.cell_type, node_mask)
+        self.domain_id = apply_mask(self.domain_id, node_mask)
 
         return self
 
@@ -99,6 +107,8 @@ class DataHolder:
             if self.node_features is not None
             else None,
             cell_class=self.cell_class.clone() if self.cell_class is not None else None,
+            cell_type=self.cell_type.clone() if self.cell_type is not None else None,
+            domain_id=self.domain_id.clone() if self.domain_id is not None else None,
             diffusion_time=self.diffusion_time,
             cell_ID=self.cell_ID.clone() if self.cell_ID is not None else None,
             t_int=self.t_int,
@@ -118,6 +128,12 @@ class DataHolder:
             node_mask=extract(batches.node_mask),
             cell_ID=extract(batches.cell_ID) if batches.cell_ID is not None else None,
             cell_class=extract(batches.cell_class),
+            cell_type=extract(batches.cell_type)
+            if batches.cell_type is not None
+            else None,
+            domain_id=extract(batches.domain_id)
+            if batches.domain_id is not None
+            else None,
             diffusion_time=None,  # Adjust as needed
         )
         return dense_data
@@ -130,6 +146,8 @@ class DataHolder:
             f"positions: {self.positions.shape if isinstance(self.positions, torch.Tensor) else self.positions} -- "
             + f"node_features: {self.node_features.shape if isinstance(self.node_features, torch.Tensor) else self.node_features} -- "
             + f"cell_class: {self.cell_class.shape if isinstance(self.cell_class, torch.Tensor) else self.cell_class} -- "
+            + f"cell_type: {self.cell_type.shape if isinstance(self.cell_type, torch.Tensor) else self.cell_type} -- "
+            + f"domain_id: {self.domain_id.shape if isinstance(self.domain_id, torch.Tensor) else self.domain_id} -- "
             + f"cell_ID: {self.cell_ID.shape if isinstance(self.cell_ID, torch.Tensor) else self.cell_ID} -- "
             + f"t_int: {self.t_int} -- "
             + f"t: {self.t} -- "

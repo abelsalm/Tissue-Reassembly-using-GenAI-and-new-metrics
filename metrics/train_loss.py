@@ -214,6 +214,12 @@ class CombinedTrainLoss(nn.Module):
         else:
             self.mmd = None
 
+        # Cell-type embedding metric-MDS regularizer. The raw loss is
+        # produced by Model because the trainable table lives there.
+        self.cell_type_mds_weight = float(
+            _get("cell_type_mds_weight", default=0.0)
+        )
+
         self.other_trigger = int(_get("other_trigger", default=0))
         self._current_epoch = 0
 
@@ -225,6 +231,7 @@ class CombinedTrainLoss(nn.Module):
         self._last_pca: float = -1.0
         self._last_directional: float = -1.0
         self._last_mmd: float = -1.0
+        self._last_cell_type_mds: float = -1.0
         self._last_min_snr_weight: float = 1.0
         self.min_snr_weighting = bool(_get("min_snr_weighting", default=False))
         self.min_snr_gamma = float(_get("min_snr_gamma", default=5.0))
@@ -255,6 +262,7 @@ class CombinedTrainLoss(nn.Module):
         log: bool = True,
         batch_idx: Optional[int] = None,
         min_snr_weight: Optional[torch.Tensor] = None,
+        cell_type_mds_loss: Optional[torch.Tensor] = None,
         **_unused: object,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
 
@@ -377,6 +385,27 @@ class CombinedTrainLoss(nn.Module):
         else:
             self._last_min_snr_weight = 1.0
 
+        # Keep this outside Min-SNR reweighting: it is a static embedding
+        # geometry constraint, independent of the sampled diffusion time.
+        if self.cell_type_mds_weight != 0.0:
+            if cell_type_mds_loss is None:
+                raise ValueError(
+                    "cell_type_mds_weight is non-zero but the model did not "
+                    "provide a cell-type MDS loss."
+                )
+            weighted = self.cell_type_mds_weight * cell_type_mds_loss
+            loss = loss + weighted
+            self._last_cell_type_mds = float(
+                cell_type_mds_loss.detach().item()
+            )
+            if log:
+                to_log[f"{prefix}/cell_type_mds"] = (
+                    self._last_cell_type_mds
+                )
+                to_log[f"{prefix}/cell_type_mds_weighted"] = float(
+                    weighted.detach().item()
+                )
+
         self._last_loss = float(loss.detach().item())
 
         if log:
@@ -466,6 +495,13 @@ class CombinedTrainLoss(nn.Module):
                 to_log.update(self.mmd.log_epoch_metrics(train_stage=train_stage))
             else:
                 to_log[f"{epoch_prefix}/mmd_weighted"] = 0.0
+        if self.cell_type_mds_weight != 0.0:
+            to_log[f"{epoch_prefix}/cell_type_mds"] = float(
+                self._last_cell_type_mds
+            )
+            to_log[f"{epoch_prefix}/cell_type_mds_weighted"] = float(
+                self._last_cell_type_mds * self.cell_type_mds_weight
+            )
         # Do not wandb.log here: this is called every training/val step so
         # Lightning can average with ``on_epoch=True``. WandB is updated once
         # per epoch from ``on_*_epoch_end``.

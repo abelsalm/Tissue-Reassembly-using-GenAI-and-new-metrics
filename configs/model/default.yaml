@@ -15,3 +15,26 @@ hidden_dims:
     dim_ffy: 256 # hidden dimension of the diffusion time feedforward network in the transformer
     dd: 64 # hidden dimension of the MLP for positions
     output_features_to_pos_dims: 4 # hidden dimension of the MLP for the output features to positions2048
+
+# Optional biological conditioning concatenated with the original LUNA
+# transcriptome embedding and projected back to hidden_dims.dx.
+embeddings:
+    fusion_hidden_dim: 64
+    fusion_dropout: 0.0
+    cell_type:
+        enabled: false
+        dim: 32
+        standardize: true
+        pca_max_cells: 20000
+        freeze: false
+        mds_scale: mean
+        mds_weighting: uniform
+    domain:
+        enabled: false
+        dim: 32
+        pool: mean
+        attn_hidden: 32
+        variable_attention: false
+        standardize: true
+        pca_max_cells: 20000
+        freeze_pca: true

@@ -94,7 +94,30 @@ class FullDenoisingDiffusion(pl.LightningModule):
             hidden_mlp_dims=cfg.model.hidden_mlp_dims,
             hidden_dims=cfg.model.hidden_dims,
             output_dims=self.output_dims,
+            embedding_cfg=getattr(cfg.model, "embeddings", None),
+            num_cell_types=int(
+                getattr(dataset_infos, "num_cell_types", 0)
+            ),
+            num_domains=int(getattr(dataset_infos, "num_domains", 0)),
+            train_node_features=getattr(
+                dataset_infos, "train_node_features", None
+            ),
+            train_cell_type=getattr(
+                dataset_infos, "train_cell_type", None
+            ),
+            build_cell_type_mds=(
+                float(getattr(cfg.train, "cell_type_mds_weight", 0.0))
+                != 0.0
+            ),
         )
+        if (
+            float(getattr(cfg.train, "cell_type_mds_weight", 0.0)) != 0.0
+            and self.model.cell_type_embedding is None
+        ):
+            raise ValueError(
+                "train.cell_type_mds_weight requires "
+                "model.embeddings.cell_type.enabled=true."
+            )
 
         self.noise_model = NoiseModel(cfg)
 
@@ -198,6 +221,9 @@ class FullDenoisingDiffusion(pl.LightningModule):
         assert z_t.node_mask is not None
         model_input = z_t.copy()
         return self.model(model_input)
+
+    def cell_type_mds_loss(self) -> torch.Tensor:
+        return self.model.cell_type_mds_loss()
 
     def on_fit_start(self) -> None:
         self.train_iterations = 100

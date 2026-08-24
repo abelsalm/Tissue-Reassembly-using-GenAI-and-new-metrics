@@ -45,6 +45,9 @@ mmd_weight: 64 # Global weight of the whole-slide per-class MMD loss term (0 = d
 transcriptome_multi_radius_weight: 1.0 # Multi-radius neighborhood transcriptome loss.
 ch_weight: 0 # Whole-slide Cahn-Hilliard energy-curve AUC loss.
 pca_weight: 0 # Whole-slide PCA shape-descriptor loss.
+# Metric-MDS regularizer for the optional cell-type embedding. This preserves
+# class-mean transcriptomic pairwise geometry; requires the embedding enabled.
+cell_type_mds_weight: 0.0
 directional_weight: 0 # Transcriptome-weighted local orientation coherence loss.
 # --- Multi-radius neighborhood loss parameters (transcriptome_multi_radius_weight > 0) ----
 # Compares

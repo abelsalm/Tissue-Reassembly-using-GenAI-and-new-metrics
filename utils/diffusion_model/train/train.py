@@ -42,6 +42,7 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
         log=False,
         batch_idx=i,
         min_snr_weight=min_snr_weight,
+        cell_type_mds_loss=self.cell_type_mds_loss(),
     )
 
     # Feed last-step scalars into Lightning every batch; ``on_epoch=True``
