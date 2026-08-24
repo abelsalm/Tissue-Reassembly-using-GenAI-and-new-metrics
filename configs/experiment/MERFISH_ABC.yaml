@@ -40,12 +40,12 @@ dataset:
     # DataLoader memory knobs (already wired up in AbstractDataModule).
     # 0 keeps everything in the main process and avoids forking the
     # in-memory tensors per worker (multi-GB savings on big datasets).
-    num_workers: 0
+    num_workers: 220
     pin_memory: false
 
 train: # !!!!
     n_epochs: 3000        # tiny number for a smoke-test; increase for real training
-    batch_size: 4      # keep small on CPU
+    batch_size: 8      # keep small on CPU
     lr: 5e-4
     # Mixed precision halves GPU memory and is usually safe.
     # "16-mixed" on V100/T4, "bf16-mixed" on A100/H100, "32-true" to disable.
