@@ -1,36 +1,109 @@
 # @package _global_
 general:
     name : 'MERFISH_small_transcripts'
-    mode : 'test_only' # 'train_and_test' # 'test_only' # 
+    mode : 'train_and_test' # 'train_and_test' # 'test_only' #
 
 distribute:
-    gpus_per_node: 4  # 1 = auto-detect one device (works on CPU-only machines)
+    gpus_per_node: 1  # 1 = auto-detect one device (works on CPU-only machines)
 
 dataset:
     dataset_name: 'MERFISH_small_cortex'
+    # Biological conditioning columns. Auxiliary IDs are aligned to the train
+    # vocabulary and reserve index 0 for UNK / padding.
+    cell_type_column: cell_class
     gene_columns_start: 0   # first column after the index is a gene
     gene_columns_end: 254   
     train_data_path: "/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_train.csv"
     test_data_path: "/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv"
     validation_data_path: "/home/abel/biodata/MERFISH_LUNA_small_cortex/MERFISH_mouse_cortex_test.csv"
     maximum_graph_size:
-        train:  null   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
+        # In domain_with_context this bounds the full-section context sampled
+        # before target-domain cells are selected. null keeps the full section.
+        train:  null
         test: null
         validation: null
+    # Graph construction for the LUNA DDPM.
+    #   section — one graph family per cell_section (whole-slice, default)
+    #   domain  — also split each slice by spatial_module clusters so each
+    #             (cell_section, domain) pair is its own graph family
+    #   domain_with_context — denoise one domain while attending to feature-only
+    #                         context from every cell in its parent section
+    graph_split: domain_with_context # section | domain | domain_with_context
+    domain_column: spatial_module_l1_complete
+    # Keep only labels starting with this prefix (null = every non-empty domain).
+    domain_keep_prefix: null
+    # Exact domain labels to keep (null / [] = no extra allowlist). Combined
+    # with domain_keep_prefix when both are set. Example:
+    # domain_keep_values: [shared_01, shared_07]
+    domain_keep_values: null # [shared_19, shared_01, shared_08, shared_05, shared_10, shared_13]
+    # Exact domain labels to drop after prefix / allowlist (null = drop none).
+    # domain_drop_values: [shared_10]
+    domain_drop_values: null
+    # Target eligibility only. Domains omitted here still remain context cells.
+    # Example: [shared_01, shared_02, shared_03, shared_04, shared_05]
+    target_domain_values: null
+    min_target_cells: 32
+    # Drop (section, domain) groups smaller than this (null = keep all).
+    min_graph_size: 32
+    # When graph_split=domain, rescale coords independently per domain so each
+    # cluster fills [-0.5, 0.5] the way a whole slice does in section mode.
+    normalize_positions_per_graph: true
+
+# Optional conditioning concatenated with LUNA's original transcriptome
+# embedding, then projected back to model.hidden_dims.dx before the Transformer.
+# Either block can be enabled alone, or both can be enabled together.
+model:
+    embeddings:
+        fusion_hidden_dim: 256
+        fusion_dropout: 0.0
+        cell_type:
+            enabled: True
+            dim: 128
+            # PCA-mean initialization of the classical nn.Embedding table.
+            standardize: true
+            pca_max_cells: 20000
+            freeze: false
+            # Geometry used by train.cell_type_mds_weight.
+            mds_scale: mean       # mean | none | optimal
+            mds_weighting: uniform # uniform | sammon
+        domain:
+            enabled: True
+            dim: 128
+            # Amortized per-(graph, domain) pooling in PCA transcriptome space.
+            pool: attention            # mean | attention
+            attn_hidden: 32
+            # Learned softmax gates over PCA coordinates after domain pooling.
+            variable_attention: false
+            standardize: true
+            pca_max_cells: 10000
+            freeze_pca: true
+    domain_context:
+        # Set true together with graph_split=domain_with_context.
+        enabled: true
+        encoder_attention_type: multihead # linear | multihead
+        cross_attention_type: multihead   # linear | multihead
+        cross_attention_every: 1
+        context_dropout: 0.1
+        guidance_scale: 1.0
+        shuffle_ablation: false
 
 train: # !!!!
-    n_epochs: 3000     # tiny number for a smoke-test; increase for real training
-    batch_size: 4     # keep small on CPU
-    lr: 5e-4
+    n_epochs: 2000     # tiny number for a smoke-test; increase for real training
+    batch_size: 6     # keep small on CPU
+    lr: 1e-4
+    # Metric-MDS regularization of cell-type embedding distances against
+    # class-mean distances in real transcriptomic space. Requires
+    # model.embeddings.cell_type.enabled=true. Zero disables it.
+    cell_type_mds_weight: 0.0
 
 test:
     save_dir: '/home/abel/code/code_outputs'
     checkpoint_paths: 
-    -  '/home/abel/code/outputs/2026-08-03/13-07-11-MERFISH_small_transcripts/checkpoints/epoch=3487.ckpt'
-    -  '/home/abel/code/outputs/2026-08-03/16-07-55-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
-    -  '/home/abel/code/outputs/2026-08-03/16-07-18-MERFISH_small_transcripts/checkpoints/epoch=2495.ckpt'
-    -  '/home/abel/code/outputs/2026-08-03/16-05-59-MERFISH_small_transcripts/checkpoints/epoch=1967.ckpt'
-    -  '/home/abel/code/outputs/2026-08-03/16-05-13-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-03/13-07-11-MERFISH_small_transcripts/checkpoints/epoch=3487.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-03/16-07-55-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-03/16-07-18-MERFISH_small_transcripts/checkpoints/epoch=2495.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-03/16-05-59-MERFISH_small_transcripts/checkpoints/epoch=1967.ckpt'
+    #-  '/home/abel/code/outputs/2026-08-03/16-05-13-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
     #-  '/home/abel/code/outputs/2026-07-29/18-26-19-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
     #- '/home/abel/code/outputs/2026-07-23/14-25-33-MERFISH_small_transcripts/checkpoints/last_epoch.ckpt'
     #- '/home/abel/code/outputs/2026-07-23/16-04-16-MERFISH_small_transcripts/checkpoints/epoch=2959.ckpt'
@@ -47,4 +120,4 @@ test:
 
 validation: # !!!!
     if_validate: True
-    save_model_every_n_epochs: 1000  # save every epoch during the smoke-test
+    save_model_every_n_epochs: 999  # save every epoch during the smoke-test

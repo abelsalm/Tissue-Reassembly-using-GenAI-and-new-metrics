@@ -14,6 +14,7 @@ from datasets.data_module import DataModule, Infos
 from diffusion_model import FullDenoisingDiffusion
 from utils.data.abstract_datatype import AbstractDataModule, AbstractDatasetInfos
 from utils.data.misc import setup_wandb
+from utils.data.load import is_domain_context_mode
 
 def get_resume(
     cfg: omegaconf.DictConfig,
@@ -167,7 +168,14 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
 
     gpus = cfg.distribute.gpus_per_node
     max_epochs = cfg.train.n_epochs
-    check_val_every_n_epochs = 0 if not cfg.validation.if_validate else cfg.validation.check_val_every_n_epochs
+    # Lightning treats None as "never validate". Passing 0 raises
+    # ZeroDivisionError in `_should_check_val_epoch` (current_epoch % 0).
+    if not cfg.validation.if_validate:
+        check_val_every_n_epochs = None
+    else:
+        check_val_every_n_epochs = int(cfg.validation.check_val_every_n_epochs)
+        if check_val_every_n_epochs < 1:
+            check_val_every_n_epochs = None
 
     # Optional numerical-stability and accumulation knobs.
     precision = getattr(cfg.train, "precision", "32-true")
@@ -175,6 +183,10 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
     gradient_clip_val = float(getattr(cfg.train, "gradient_clip_val", 1.0))
     gradient_clip_algorithm = str(
         getattr(cfg.train, "gradient_clip_algorithm", "norm")
+    )
+    reload_dataloaders = int(
+        is_domain_context_mode(cfg)
+        and cfg.dataset.maximum_graph_size.train is not None
     )
 
     return Trainer(
@@ -190,5 +202,6 @@ def setup_trainer(cfg: omegaconf.DictConfig, callbacks: list) -> Trainer:
         accumulate_grad_batches=accumulate_grad_batches,
         gradient_clip_val=gradient_clip_val,
         gradient_clip_algorithm=gradient_clip_algorithm,
+        reload_dataloaders_every_n_epochs=reload_dataloaders,
     )
 

@@ -5,7 +5,7 @@ def to_device(tensor, device):
     """
     Moves the tensor to the specified device if the tensor is not None.
     """
-    return tensor.to(device) if tensor is not None else None
+    return tensor.to(device) if hasattr(tensor, "to") else tensor
 
 
 def apply_mask(tensor, mask, mask_dim=-1):
@@ -64,6 +64,10 @@ class DataHolder:
         self.cell_ID = to_device(self.cell_ID, device)
         self.cell_type = to_device(self.cell_type, device)
         self.domain_id = to_device(self.domain_id, device)
+        self.t_int = to_device(self.t_int, device)
+        self.t = to_device(self.t, device)
+        self.diffusion_time = to_device(self.diffusion_time, device)
+        self.node_mask = to_device(self.node_mask, device)
         return self
 
     def mask(self, node_mask=None) -> "DataHolder":
@@ -152,4 +156,98 @@ class DataHolder:
             + f"t_int: {self.t_int} -- "
             + f"t: {self.t} -- "
             + f"node_mask: {self.node_mask.shape if isinstance(self.node_mask, torch.Tensor) else self.node_mask}"
+        )
+
+
+class DomainContextBatch:
+    """Dense full-slice features paired with one target-only DDPM batch.
+
+    ``context.positions`` is intentionally always ``None``. This makes the
+    non-target-coordinate privacy invariant explicit at the model boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        context: DataHolder,
+        target: DataHolder,
+        target_membership: torch.Tensor,
+        target_to_context: torch.Tensor,
+        target_domain_id: torch.Tensor,
+        section_id: torch.Tensor = None,
+    ) -> None:
+        if context.positions is not None:
+            raise ValueError("Full-slice context must not contain positions")
+        self.context = context
+        self.target = target
+        self.target_membership = target_membership
+        self.target_to_context = target_to_context
+        self.target_domain_id = target_domain_id
+        self.section_id = section_id
+
+    def device_as(self, tensor: torch.Tensor) -> "DomainContextBatch":
+        self.context.device_as(tensor)
+        self.target.device_as(tensor)
+        device = tensor.device
+        self.target_membership = self.target_membership.to(device)
+        self.target_to_context = self.target_to_context.to(device)
+        self.target_domain_id = self.target_domain_id.to(device)
+        self.section_id = to_device(self.section_id, device)
+        return self
+
+    def copy(self) -> "DomainContextBatch":
+        return DomainContextBatch(
+            context=self.context.copy(),
+            target=self.target.copy(),
+            target_membership=self.target_membership.clone(),
+            target_to_context=self.target_to_context.clone(),
+            target_domain_id=self.target_domain_id.clone(),
+            section_id=self.section_id.clone()
+            if self.section_id is not None
+            else None,
+        )
+
+    def get_batch(self, index: int) -> "DomainContextBatch":
+        """Extract one slice/target pair while preserving a batch dimension."""
+
+        def slice_holder(holder):
+            return DataHolder(
+                positions=holder.positions[index : index + 1]
+                if holder.positions is not None
+                else None,
+                node_features=holder.node_features[index : index + 1],
+                diffusion_time=holder.diffusion_time[index : index + 1]
+                if isinstance(holder.diffusion_time, torch.Tensor)
+                and holder.diffusion_time.dim() > 0
+                else holder.diffusion_time,
+                cell_ID=holder.cell_ID[index : index + 1]
+                if holder.cell_ID is not None
+                else None,
+                cell_class=holder.cell_class[index : index + 1]
+                if holder.cell_class is not None
+                else None,
+                cell_type=holder.cell_type[index : index + 1]
+                if holder.cell_type is not None
+                else None,
+                domain_id=holder.domain_id[index : index + 1]
+                if holder.domain_id is not None
+                else None,
+                t_int=holder.t_int[index : index + 1]
+                if isinstance(holder.t_int, torch.Tensor) and holder.t_int.dim() > 0
+                else holder.t_int,
+                t=holder.t[index : index + 1]
+                if isinstance(holder.t, torch.Tensor) and holder.t.dim() > 0
+                else holder.t,
+                node_mask=holder.node_mask[index : index + 1],
+            )
+
+        return DomainContextBatch(
+            context=slice_holder(self.context),
+            target=slice_holder(self.target),
+            target_membership=self.target_membership[index : index + 1],
+            target_to_context=self.target_to_context[index : index + 1],
+            target_domain_id=self.target_domain_id[index : index + 1],
+            section_id=self.section_id[index : index + 1]
+            if self.section_id is not None
+            else None,
         )

@@ -14,14 +14,14 @@ from metrics.test_evaluation_statistics import (
     align_point_clouds,
     compute_spearman_correlation,
 )
-from utils.data.dataholder import DataHolder
+from utils.data.dataholder import DataHolder, DomainContextBatch
 from utils.data.load import (
     cell_class_decoding,
     compute_distance,
     position_normalize,
     to_dataframe,
 )
-from utils.data.misc import setup_wandb, to_batch
+from utils.data.misc import setup_wandb, to_batch, to_domain_context_batch
 from utils.diffusion_model.sample.sample import sample_graphs
 
 
@@ -39,10 +39,15 @@ def test_step_func(self, data: DataHolder, i: int) -> None:
     """
     Executes a test step for a single data batch.
     """
-    batches = to_batch(data)
+    batches = (
+        to_domain_context_batch(data)
+        if self.conditional_mode
+        else to_batch(data)
+    )
     root_dir = get_root_dir(self.cfg)
     test_save_path = get_test_save_path(root_dir, self.cfg)
-    batch_size = len(batches.positions)
+    target_batches = batches.target if isinstance(batches, DomainContextBatch) else batches
+    batch_size = len(target_batches.positions)
 
     # Evaluate on all test batches
     for index in range(batch_size):
@@ -89,7 +94,10 @@ def process_single_batch(self, batches, index, test_save_path):
     """
     Processes a single batch, samples predictions, and saves evaluation results.
     """
-    batch = batches.get_batch(index=index, batch_size=1)
+    if isinstance(batches, DomainContextBatch):
+        batch = batches.get_batch(index)
+    else:
+        batch = batches.get_batch(index=index, batch_size=1)
     positions_pred_whole = sample_model_predictions(self, batch)
 
     for sample_index, positions_pred in enumerate(positions_pred_whole):
@@ -111,21 +119,28 @@ def process_single_sample(self, batch, positions_pred, test_save_path, sample_in
     """
     Processes a single sample, decodes cell classes, evaluates, and saves results.
     """
+    conditional = batch if isinstance(batch, DomainContextBatch) else None
+    target = conditional.target if conditional is not None else batch
     positions_pred = positions_pred.cpu().numpy()
-    positions_true = batch.positions[0].cpu().numpy()
-    node_mask = batch.node_mask[0].cpu().numpy()
-    cell_ID = batch.cell_ID[0].cpu().numpy()
+    positions_true = target.positions[0].cpu().numpy()
+    node_mask = target.node_mask[0].cpu().numpy()
+    cell_ID = target.cell_ID[0].cpu().numpy()
 
     positions_pred, positions_true, cell_ID = mask_positions(
         positions_pred, positions_true, cell_ID, node_mask
     )
 
     mapping_dict, cell_class_decoder = get_mappings(self)
-    corresponding_region = get_corresponding_region(mapping_dict, positions_pred)
+    if conditional is not None:
+        section = int(conditional.section_id[0].item())
+        domain = int(conditional.target_domain_id[0].item())
+        corresponding_region = f"section_{section}_domain_{domain}"
+    else:
+        corresponding_region = get_corresponding_region(mapping_dict, positions_pred)
 
     save_dir = get_unique_dir(test_save_path, corresponding_region)
 
-    cell_class = cell_class_decoding(batch, cell_class_decoder)
+    cell_class = cell_class_decoding(target, cell_class_decoder)
 
     metadata_true, metadata_pred_normalized, unique_cell_classes = prepare_data(
         positions_pred, positions_true, cell_ID, cell_class, save_dir
@@ -144,6 +159,13 @@ def process_single_sample(self, batch, positions_pred, test_save_path, sample_in
             "save_idx": f"{corresponding_region}_{sample_index}",
         }
     )
+    if conditional is not None:
+        log_dict.update(
+            {
+                "section_id": section,
+                "target_domain_id": domain,
+            }
+        )
 
     file_path = os.path.join(test_save_path, f"{self.cfg.general.name}_results.csv")
     append_to_dataframe(log_dict, file_path)

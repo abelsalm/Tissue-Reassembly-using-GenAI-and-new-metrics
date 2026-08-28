@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from utils.data.dataholder import DataHolder
+from utils.data.dataholder import DataHolder, DomainContextBatch
 
 
 @torch.no_grad()
@@ -32,7 +32,12 @@ def sample_noise(self, batch: DataHolder) -> torch.Tensor:
     return z_t.device_as(node_features)
 
 
-def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor:
+def iterate_sampling(
+    self,
+    z_t: torch.Tensor,
+    batch: DataHolder,
+    conditional_batch: DomainContextBatch = None,
+) -> torch.Tensor:
     """
     Iteratively sample p(z_s | z_t) over the diffusion steps.
 
@@ -47,6 +52,22 @@ def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor
 
     # Iteratively sample z_s from z_t for each diffusion step
     batch_size = batch.node_features.size(0)
+    context_memory = None
+    unconditional_memory = None
+    guidance_scale = 1.0
+    if conditional_batch is not None:
+        context_memory = self.prepare_domain_context(
+            conditional_batch, apply_dropout=False
+        )
+        guidance_scale = float(
+            getattr(
+                getattr(self.cfg.model, "domain_context", None),
+                "guidance_scale",
+                1.0,
+            )
+        )
+        if guidance_scale != 1.0:
+            unconditional_memory = self.drop_domain_context(context_memory)
     for s_int in reversed(range(0, self.max_diffusion_steps, sample_interval)):
         s_array = torch.full(
             (batch_size, 1),
@@ -54,7 +75,15 @@ def iterate_sampling(self, z_t: torch.Tensor, batch: DataHolder) -> torch.Tensor
             dtype=torch.long,
             device=batch.node_features.device,
         )
-        z_s = sample_zs_from_zt(self, z_t, s_array)
+        z_s = sample_zs_from_zt(
+            self,
+            z_t,
+            s_array,
+            conditional_batch=conditional_batch,
+            context_memory=context_memory,
+            unconditional_memory=unconditional_memory,
+            guidance_scale=guidance_scale,
+        )
         z_t = z_s
 
     return z_t
@@ -75,19 +104,33 @@ def sample_from_single_graph(
     Returns:
         torch.Tensor: Sampled graph positions.
     """
-    num_node = batch.positions[batch.node_mask].shape[0]
+    conditional_batch = (
+        batch if isinstance(batch, DomainContextBatch) else None
+    )
+    target_batch = batch.target if conditional_batch is not None else batch
+    num_node = target_batch.positions[target_batch.node_mask].shape[0]
     print(f"Sampling. The number of nodes to sample is {num_node}.")
 
     # Sample noise z_t from the batch
-    z_t = sample_noise(self, batch)
+    z_t = sample_noise(self, target_batch)
 
     # Perform iterative sampling over diffusion steps
-    sampled_graph = iterate_sampling(self, z_t, batch)
+    sampled_graph = iterate_sampling(
+        self, z_t, target_batch, conditional_batch=conditional_batch
+    )
 
     return sampled_graph.positions
 
 
-def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Tensor:
+def sample_zs_from_zt(
+    self,
+    z_t: torch.Tensor,
+    s_int: torch.Tensor,
+    conditional_batch: DomainContextBatch = None,
+    context_memory=None,
+    unconditional_memory=None,
+    guidance_scale: float = 1.0,
+) -> torch.Tensor:
     """
     Samples zs ~ p(zs | zt) for the denoising process.
 
@@ -98,7 +141,20 @@ def sample_zs_from_zt(self, z_t: torch.Tensor, s_int: torch.Tensor) -> torch.Ten
     Returns:
         torch.Tensor: The sampled zs tensor.
     """
-    pred = self.forward(z_t)
+    pred = self.forward(
+        z_t,
+        conditional_batch=conditional_batch,
+        context_memory=context_memory,
+    )
+    if unconditional_memory is not None:
+        unconditional_pred = self.forward(
+            z_t,
+            conditional_batch=conditional_batch,
+            context_memory=unconditional_memory,
+        )
+        pred.positions = unconditional_pred.positions + float(guidance_scale) * (
+            pred.positions - unconditional_pred.positions
+        )
     z_s = self.noise_model.sample_zs_from_zt_and_pred(z_t=z_t, pred=pred, s_int=s_int)
     return z_s
 

@@ -139,12 +139,13 @@ def detect_nan_rows(pos: np.ndarray) -> np.ndarray:
 
 GRAPH_SPLIT_SECTION = "section"
 GRAPH_SPLIT_DOMAIN = "domain"
+GRAPH_SPLIT_DOMAIN_WITH_CONTEXT = "domain_with_context"
 GRAPH_GROUP_SEP = "||"
 DEFAULT_DOMAIN_COLUMN = "spatial_module_l1_complete"
 
 
 def resolve_graph_split(cfg) -> str:
-    """Return ``section`` (whole slices) or ``domain`` (section × spatial domain)."""
+    """Resolve the physical/training graph mode."""
     dataset = getattr(cfg, "dataset", cfg)
     raw = getattr(dataset, "graph_split", GRAPH_SPLIT_SECTION)
     key = str(raw or GRAPH_SPLIT_SECTION).strip().lower()
@@ -154,12 +155,21 @@ def resolve_graph_split(cfg) -> str:
         "slices": GRAPH_SPLIT_SECTION,
         "domain": GRAPH_SPLIT_DOMAIN,
         "domains": GRAPH_SPLIT_DOMAIN,
+        "domain_with_context": GRAPH_SPLIT_DOMAIN_WITH_CONTEXT,
+        "target_with_context": GRAPH_SPLIT_DOMAIN_WITH_CONTEXT,
+        "context_domain": GRAPH_SPLIT_DOMAIN_WITH_CONTEXT,
     }
     if key not in aliases:
         raise ValueError(
-            f"dataset.graph_split must be 'section' or 'domain' (got {raw!r})"
+            "dataset.graph_split must be 'section', 'domain', or "
+            f"'domain_with_context' (got {raw!r})"
         )
     return aliases[key]
+
+
+def is_domain_context_mode(cfg) -> bool:
+    """True when one target domain is denoised with full-slice feature context."""
+    return resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN_WITH_CONTEXT
 
 
 def domain_column_name(cfg) -> str:
@@ -175,7 +185,8 @@ def graph_group_columns(cfg) -> list:
 
     ``section``: ``cell_section`` only (legacy whole-slice graphs).
     ``domain``: ``(cell_section, domain_column)`` so each spatial domain
-    inside a slice is its own graph family.
+    inside a slice is its own graph family. ``domain_with_context`` remains
+    physically grouped by section; target domains are indexed separately.
     """
     if resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN:
         return ["cell_section", domain_column_name(cfg)]
@@ -201,7 +212,20 @@ def should_normalize_per_graph(cfg) -> bool:
     explicit = getattr(dataset, "normalize_positions_per_graph", None)
     if explicit is not None:
         return bool(explicit)
-    return resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN
+    return resolve_graph_split(cfg) in (
+        GRAPH_SPLIT_DOMAIN,
+        GRAPH_SPLIT_DOMAIN_WITH_CONTEXT,
+    )
+
+
+def position_group_columns(cfg) -> list:
+    """Columns defining the coordinate frame used by position normalization."""
+    split = resolve_graph_split(cfg)
+    if split == GRAPH_SPLIT_DOMAIN_WITH_CONTEXT:
+        return ["cell_section", domain_column_name(cfg)]
+    if should_normalize_per_graph(cfg) and split == GRAPH_SPLIT_DOMAIN:
+        return ["cell_section", domain_column_name(cfg)]
+    return ["cell_section"]
 
 
 def domain_keep_prefix(cfg):
@@ -213,14 +237,65 @@ def domain_keep_prefix(cfg):
     return text or None
 
 
+def _config_str_list(cfg, key: str):
+    """Return a cleaned list of strings from ``dataset.<key>``, or None."""
+    dataset = getattr(cfg, "dataset", cfg)
+    raw = getattr(dataset, key, None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        return [text] if text else None
+    try:
+        items = [str(item).strip() for item in raw]
+    except TypeError:
+        text = str(raw).strip()
+        return [text] if text else None
+    items = [item for item in items if item]
+    return items or None
+
+
+def domain_keep_values(cfg):
+    """Exact domain labels to keep (allowlist). None = no extra allowlist."""
+    return _config_str_list(cfg, "domain_keep_values")
+
+
+def domain_drop_values(cfg):
+    """Exact domain labels to drop (denylist). None = drop none extra."""
+    return _config_str_list(cfg, "domain_drop_values")
+
+
+def target_domain_values(cfg):
+    """Domain labels eligible as targets; all other labels remain context."""
+    return _config_str_list(cfg, "target_domain_values")
+
+
+def domain_filters_requested(cfg) -> bool:
+    """True if prefix / allowlist / denylist should restrict domain labels."""
+    return bool(
+        domain_keep_prefix(cfg)
+        or domain_keep_values(cfg)
+        or domain_drop_values(cfg)
+    )
+
+
 def filter_domain_cells(data: pd.DataFrame, cfg) -> pd.DataFrame:
-    """Drop unlabeled / prefix-excluded cells when ``graph_split=domain``."""
-    if resolve_graph_split(cfg) != GRAPH_SPLIT_DOMAIN:
+    """Drop unlabeled / prefix- / value-excluded domain cells.
+
+    Always applied when ``graph_split=domain``. Also applied in section mode
+    when ``domain_keep_prefix``, ``domain_keep_values``, or
+    ``domain_drop_values`` is set, so training can ignore selected modules
+    even on whole-slice graphs.
+    """
+    split_is_domain = resolve_graph_split(cfg) == GRAPH_SPLIT_DOMAIN
+    filters_on = domain_filters_requested(cfg)
+    if not split_is_domain and not filters_on:
         return data
     col = domain_column_name(cfg)
     if col not in data.columns:
         raise ValueError(
-            f"dataset.graph_split='domain' requires column {col!r} in the CSV"
+            f"Domain filtering requires column {col!r} in the CSV "
+            f"(graph_split={resolve_graph_split(cfg)!r})"
         )
     before = len(data)
     labels = data[col]
@@ -231,14 +306,32 @@ def filter_domain_cells(data: pd.DataFrame, cfg) -> pd.DataFrame:
     prefix = domain_keep_prefix(cfg)
     if prefix:
         keep &= as_str.str.startswith(prefix)
+    keep_values = domain_keep_values(cfg)
+    if keep_values:
+        keep_set = set(keep_values)
+        present = set(as_str[keep].unique()) if bool(keep.any()) else set()
+        missing = sorted(keep_set - present)
+        if missing:
+            print(
+                f"[data] domain_keep_values not found in this split: {missing}",
+                flush=True,
+            )
+        keep &= as_str.isin(keep_set)
+    drop_values = domain_drop_values(cfg)
+    if drop_values:
+        keep &= ~as_str.isin(set(drop_values))
     filtered = data.loc[keep]
     if filtered.empty:
         raise ValueError(
-            f"No cells left after domain filter (column={col!r}, prefix={prefix!r})"
+            f"No cells left after domain filter (column={col!r}, "
+            f"prefix={prefix!r}, keep={keep_values}, drop={drop_values})"
         )
+    kept_labels = sorted(filtered[col].astype(str).unique())
     print(
         f"[data] domain filter: kept {len(filtered):,}/{before:,} cells "
-        f"(column={col!r}, prefix={prefix!r})",
+        f"(column={col!r}, prefix={prefix!r}, keep={keep_values}, "
+        f"drop={drop_values}, n_domains={len(kept_labels)}) "
+        f"labels={kept_labels}",
         flush=True,
     )
     return filtered

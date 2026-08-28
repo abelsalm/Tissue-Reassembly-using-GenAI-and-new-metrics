@@ -5,8 +5,10 @@ import torch
 import wandb
 from metrics.train_loss import CombinedTrainLoss
 from metrics.test_vanilla_loss import LossFunction
+from models.domain_context import DomainContextModel
 from models.model import Model
 from utils.data.dataholder import DataHolder
+from utils.data.load import is_domain_context_mode
 from utils.data.misc import setup_wandb
 from utils.diffusion_model.diffusion.noise_model import NoiseModel
 
@@ -88,7 +90,22 @@ class FullDenoisingDiffusion(pl.LightningModule):
         self.train_loss = CombinedTrainLoss(cfg.train)
         self.vanilla_val_loss = LossFunction()
 
-        self.model = Model(
+        context_cfg = getattr(cfg.model, "domain_context", None)
+        context_enabled = bool(
+            getattr(context_cfg, "enabled", False)
+            if context_cfg is not None
+            else False
+        )
+        data_context_mode = is_domain_context_mode(cfg)
+        if data_context_mode != context_enabled:
+            raise ValueError(
+                "dataset.graph_split='domain_with_context' and "
+                "model.domain_context.enabled=true must be enabled together. "
+                "Use section/domain with domain_context disabled for legacy LUNA."
+            )
+        self.conditional_mode = data_context_mode
+        model_cls = DomainContextModel if context_enabled else Model
+        model_kwargs = dict(
             input_dims=self.input_dims,
             n_layers=cfg.model.n_layers,
             hidden_mlp_dims=cfg.model.hidden_mlp_dims,
@@ -110,6 +127,35 @@ class FullDenoisingDiffusion(pl.LightningModule):
                 != 0.0
             ),
         )
+        if context_enabled:
+            model_kwargs["context_cfg"] = context_cfg
+        self.model = model_cls(**model_kwargs)
+        if context_enabled and (
+            self.model.cell_type_embedding is None
+            or self.model.domain_embedding is None
+        ):
+            raise ValueError(
+                "domain_with_context requires both "
+                "model.embeddings.cell_type.enabled=true and "
+                "model.embeddings.domain.enabled=true so every context cell "
+                "carries genes, cell type, and its own domain identity."
+            )
+        if context_enabled:
+            initialize_from = getattr(
+                context_cfg, "initialize_from_checkpoint", None
+            )
+            if initialize_from:
+                checkpoint = torch.load(
+                    str(initialize_from), map_location="cpu"
+                )
+                report = self.model.load_legacy_decoder_state_dict(checkpoint)
+                print(
+                    "[DomainContextModel] initialized target decoder from "
+                    f"{initialize_from}: loaded={len(report['loaded'])}, "
+                    f"missing={len(report['missing'])}, "
+                    f"skipped={len(report['skipped'])}",
+                    flush=True,
+                )
         if (
             float(getattr(cfg.train, "cell_type_mds_weight", 0.0)) != 0.0
             and self.model.cell_type_embedding is None
@@ -217,10 +263,98 @@ class FullDenoisingDiffusion(pl.LightningModule):
         """Measure likelihood on a test set and compute stability metrics."""
         on_test_epoch_end_func(self=self)
 
-    def forward(self, z_t: DataHolder) -> DataHolder:
+    def forward(
+        self,
+        z_t: DataHolder,
+        *,
+        conditional_batch=None,
+        context_memory=None,
+    ) -> DataHolder:
         assert z_t.node_mask is not None
         model_input = z_t.copy()
+        if self.conditional_mode:
+            if conditional_batch is None:
+                raise ValueError(
+                    "domain_with_context forward requires conditional_batch"
+                )
+            if context_memory is None:
+                context_memory = self.prepare_domain_context(
+                    conditional_batch, apply_dropout=False
+                )
+            return self.decode_target(
+                model_input,
+                context_memory,
+                conditional_batch.target_to_context,
+            )
         return self.model(model_input)
+
+    def prepare_domain_context(
+        self,
+        conditional_batch,
+        *,
+        apply_dropout: bool,
+        force_drop: bool = False,
+        shuffle_context: bool = False,
+    ):
+        """Encode once, then optionally apply CFG dropout or context ablation."""
+        if not self.conditional_mode:
+            raise RuntimeError("domain-context modeling is not enabled")
+        context = self.encode_context(
+            conditional_batch.context,
+            conditional_batch.target_domain_id,
+            conditional_batch.target_membership,
+        )
+        batch_size = int(conditional_batch.target_domain_id.numel())
+        drop_mask = None
+        if force_drop:
+            drop_mask = torch.ones(
+                batch_size,
+                dtype=torch.bool,
+                device=conditional_batch.target_domain_id.device,
+            )
+        elif apply_dropout:
+            context_cfg = getattr(self.cfg.model, "domain_context", None)
+            probability = float(
+                getattr(context_cfg, "context_dropout", 0.0)
+            )
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError("model.domain_context.context_dropout must be in [0, 1]")
+            if probability > 0.0:
+                drop_mask = (
+                    torch.rand(
+                        batch_size,
+                        device=conditional_batch.target_domain_id.device,
+                    )
+                    < probability
+                )
+        if drop_mask is not None or shuffle_context:
+            context = self.model.modify_context(
+                context,
+                drop_mask=drop_mask,
+                shuffle_cells=shuffle_context,
+            )
+        return context
+
+    def drop_domain_context(self, context):
+        """Build classifier-free unconditional memory without re-encoding."""
+        drop_mask = torch.ones(
+            context.memory.size(0),
+            dtype=torch.bool,
+            device=context.memory.device,
+        )
+        return self.model.modify_context(context, drop_mask=drop_mask)
+
+    def encode_context(self, *args, **kwargs):
+        """Cache feature-only slice context for conditional reverse steps."""
+        if not isinstance(self.model, DomainContextModel):
+            raise RuntimeError("domain-context modeling is not enabled")
+        return self.model.encode_context(*args, **kwargs)
+
+    def decode_target(self, *args, **kwargs) -> DataHolder:
+        """Decode one target domain using a cached slice context."""
+        if not isinstance(self.model, DomainContextModel):
+            raise RuntimeError("domain-context modeling is not enabled")
+        return self.model.decode_target(*args, **kwargs)
 
     def cell_type_mds_loss(self) -> torch.Tensor:
         return self.model.cell_type_mds_loss()

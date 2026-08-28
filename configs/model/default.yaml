@@ -38,3 +38,28 @@ embeddings:
         standardize: true
         pca_max_cells: 20000
         freeze_pca: true
+
+# Optional architecture for predicting one domain with feature-only full-slice
+# context. Keep disabled for the unchanged section/domain LUNA architectures.
+domain_context:
+    enabled: false
+    n_layers: 4
+    num_heads: 16
+    dim_feedforward: 384
+    dropout: 0.1
+    # linear is recommended for 20–40k-cell ABC slices. multihead uses
+    # torch.nn.MultiheadAttention and has quadratic slice-memory complexity.
+    encoder_attention_type: linear       # linear | multihead
+    cross_attention_type: linear         # linear | multihead
+    cross_attention_every: 1             # inject context after every LUNA layer
+    cross_attention_layers: null          # optional zero-based explicit list
+    cross_attention_dim_feedforward: 384
+    cross_attention_dropout: 0.1
+    # Classifier-free context dropout and sampling guidance.
+    context_dropout: 0.1
+    guidance_scale: 1.0
+    # Validation ablation: shuffled context should increase target loss.
+    shuffle_ablation: false
+    # Optional legacy LUNA checkpoint used only to initialize compatible
+    # target-decoder parameters when starting a new conditional run.
+    initialize_from_checkpoint: null

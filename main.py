@@ -48,7 +48,15 @@ def set_seed(seed: int):
 
 def print_graph_split_summary(cfg: DictConfig, datamodule) -> None:
     """Log whether LUNA graphs are whole slices or section×domain clusters."""
-    from utils.data.load import domain_column_name, resolve_graph_split
+    from utils.data.load import (
+        domain_column_name,
+        domain_drop_values,
+        domain_filters_requested,
+        domain_keep_prefix,
+        domain_keep_values,
+        resolve_graph_split,
+        target_domain_values,
+    )
 
     graph_split = resolve_graph_split(cfg)
     train_ds = datamodule.train_dataset
@@ -58,8 +66,15 @@ def print_graph_split_summary(cfg: DictConfig, datamodule) -> None:
         else "?"
     )
     extra = ""
-    if graph_split == "domain":
+    if graph_split in ("domain", "domain_with_context") or domain_filters_requested(cfg):
         extra = f"  domain_column={domain_column_name(cfg)!r}"
+        extra += (
+            f"  keep_prefix={domain_keep_prefix(cfg)!r} "
+            f"keep_values={domain_keep_values(cfg)} "
+            f"drop_values={domain_drop_values(cfg)}"
+        )
+        if graph_split == "domain_with_context":
+            extra += f"  target_values={target_domain_values(cfg)}"
     print(
         f"[LUNA] graph_split={graph_split}{extra}  "
         f"train_groups={n_groups}  train_graphs={len(train_ds)}",

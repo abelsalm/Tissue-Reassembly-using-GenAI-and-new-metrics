@@ -2,7 +2,7 @@ import torch
 import wandb
 
 from utils.data.dataholder import DataHolder
-from utils.data.misc import to_batch
+from utils.data.misc import to_batch, to_domain_context_batch
 
 
 def _validation_batch_size(self) -> int:
@@ -23,9 +23,22 @@ def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     batch_size = _validation_batch_size(self)
 
     with torch.no_grad():
-        batched_data = to_batch(data)
+        conditional = None
+        if self.conditional_mode:
+            conditional = to_domain_context_batch(data)
+            batched_data = conditional.target
+            context_memory = self.prepare_domain_context(
+                conditional, apply_dropout=False
+            )
+        else:
+            batched_data = to_batch(data)
+            context_memory = None
         z_t = self.noise_model.apply_noise(batched_data, train_flag=False)
-        pred = self.forward(z_t)
+        pred = self.forward(
+            z_t,
+            conditional_batch=conditional,
+            context_memory=context_memory,
+        )
 
         # ``log=False``: skip per-batch ``val_loss/*`` metrics (spiky curves).
         # Do not apply min-SNR weighting here: that reweight is training-only
@@ -45,6 +58,35 @@ def validation_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
             train_stage=False,
             log=False,
         )
+
+        context_cfg = getattr(self.cfg.model, "domain_context", None)
+        if (
+            self.conditional_mode
+            and bool(getattr(context_cfg, "shuffle_ablation", False))
+        ):
+            shuffled_memory = self.prepare_domain_context(
+                conditional, apply_dropout=False, shuffle_context=True
+            )
+            shuffled_pred = self.forward(
+                z_t,
+                conditional_batch=conditional,
+                context_memory=shuffled_memory,
+            )
+            mask = batched_data.node_mask.unsqueeze(-1)
+            denom = mask.sum().clamp_min(1)
+            correct_mse = (
+                (pred.positions - batched_data.positions).square() * mask
+            ).sum() / denom
+            shuffled_mse = (
+                (shuffled_pred.positions - batched_data.positions).square() * mask
+            ).sum() / denom
+            self.log(
+                "val_context/shuffle_loss_delta",
+                shuffled_mse - correct_mse,
+                batch_size=batch_size,
+                on_step=False,
+                on_epoch=True,
+            )
 
     # Feed last-step scalars into Lightning; averaged once per epoch.
     val_epoch_log = self.train_loss.log_epoch_metrics(train_stage=False)

@@ -221,7 +221,63 @@ class Model(nn.Module):
         # MLP for processing output positions
         self.mlp_out_pos = PositionsMLP(hidden_mlp_dims["pos"])
 
-    def forward(self, data: DataHolder) -> DataHolder:
+    def encode_node_features(
+        self,
+        node_features: torch.Tensor,
+        node_mask: torch.Tensor,
+        *,
+        cell_type: torch.Tensor = None,
+        domain_id: torch.Tensor = None,
+        return_domain_table: bool = False,
+    ):
+        """Build the biological cell embedding shared by both model paths."""
+        transcriptome_embedding = self.mlp_in_node_features(node_features)
+        embeddings = [transcriptome_embedding]
+        if self.cell_type_embedding is not None:
+            if cell_type is None:
+                raise ValueError(
+                    "Cell-type embedding enabled but cell_type is missing."
+                )
+            embeddings.append(self.cell_type_embedding(cell_type))
+
+        domain_table = None
+        if self.domain_embedding is not None:
+            if domain_id is None:
+                raise ValueError(
+                    "Domain embedding enabled but domain_id is missing."
+                )
+            if return_domain_table:
+                domain_features, domain_table = self.domain_embedding(
+                    node_features,
+                    domain_id,
+                    node_mask,
+                    return_table=True,
+                )
+            else:
+                domain_features = self.domain_embedding(
+                    node_features,
+                    domain_id,
+                    node_mask,
+                )
+            embeddings.append(domain_features)
+
+        if self.embedding_fusion is not None:
+            node_embedding = self.embedding_fusion(torch.cat(embeddings, dim=-1))
+        else:
+            node_embedding = transcriptome_embedding
+        if return_domain_table:
+            return node_embedding, domain_table
+        return node_embedding
+
+    def forward(
+        self,
+        data: DataHolder,
+        *,
+        precomputed_node_embedding: torch.Tensor = None,
+        context_memory: torch.Tensor = None,
+        context_mask: torch.Tensor = None,
+        cross_attention_blocks=None,
+    ) -> DataHolder:
         """
         Forward pass of the neural network.
 
@@ -240,33 +296,30 @@ class Model(nn.Module):
             ..., : self.output_dimensions_diffusion_time
         ]
 
-        # Process input features using MLPs
-        transcriptome_embedding = self.mlp_in_node_features(node_features)
-        embeddings = [transcriptome_embedding]
-        if self.cell_type_embedding is not None:
-            if data.cell_type is None:
-                raise ValueError(
-                    "Cell-type embedding enabled but data.cell_type is missing."
-                )
-            embeddings.append(self.cell_type_embedding(data.cell_type))
-        if self.domain_embedding is not None:
-            if data.domain_id is None:
-                raise ValueError(
-                    "Domain embedding enabled but data.domain_id is missing."
-                )
-            embeddings.append(
-                self.domain_embedding(
-                    node_features,
-                    data.domain_id,
-                    node_mask,
-                )
-            )
-        if self.embedding_fusion is not None:
-            node_embedding = self.embedding_fusion(
-                torch.cat(embeddings, dim=-1)
+        # Process input features using MLPs. The optional precomputed value is
+        # used only by DomainContextModel after target/context input fusion.
+        if precomputed_node_embedding is None:
+            node_embedding = self.encode_node_features(
+                node_features,
+                node_mask,
+                cell_type=data.cell_type,
+                domain_id=data.domain_id,
             )
         else:
-            node_embedding = transcriptome_embedding
+            expected = (node_features.size(0), node_features.size(1))
+            if tuple(precomputed_node_embedding.shape[:2]) != expected:
+                raise ValueError(
+                    "precomputed_node_embedding leading dimensions must be "
+                    f"{expected}, got {tuple(precomputed_node_embedding.shape[:2])}"
+                )
+            node_embedding = precomputed_node_embedding
+
+        if cross_attention_blocks and (
+            context_memory is None or context_mask is None
+        ):
+            raise ValueError(
+                "context_memory and context_mask are required with cross attention"
+            )
 
         transformed_features = DataHolder(
             node_features=node_embedding,
@@ -276,8 +329,16 @@ class Model(nn.Module):
         ).mask()
 
         # Apply transformer layers
-        for layer in self.transformer_layers:
+        for layer_index, layer in enumerate(self.transformer_layers):
             transformed_features = layer(transformed_features)
+            key = str(layer_index)
+            if cross_attention_blocks is not None and key in cross_attention_blocks:
+                transformed_features.node_features = cross_attention_blocks[key](
+                    transformed_features.node_features,
+                    context_memory,
+                    context_mask,
+                    node_mask,
+                )
 
         # Process output features using MLPs
         transformed_node_features = self.mlp_out_node_features(

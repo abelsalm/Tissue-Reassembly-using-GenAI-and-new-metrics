@@ -2,7 +2,14 @@ import torch
 import wandb
 
 from utils.data.dataholder import DataHolder
-from utils.data.misc import to_batch
+from utils.data.misc import to_batch, to_domain_context_batch
+
+
+def _uses_bounded_domain_context(dataset) -> bool:
+    return bool(
+        getattr(dataset, "graph_split", None) == "domain_with_context"
+        and getattr(dataset, "maximum_graph_size", None) is not None
+    )
 
 
 def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
@@ -20,11 +27,25 @@ def training_step_func(self, data: DataHolder, i: int) -> torch.Tensor:
     self.model.train()
 
     # Preprocess the input data
-    batched_data = to_batch(data)
+    conditional = None
+    if self.conditional_mode:
+        conditional = to_domain_context_batch(data)
+        batched_data = conditional.target
+        context_memory = self.prepare_domain_context(
+            conditional, apply_dropout=True
+        )
+    else:
+        batched_data = to_batch(data)
+        context_memory = None
+    # Only target rows enter NoiseModel in domain_with_context mode.
     z_t = self.noise_model.apply_noise(batched_data)
 
     # Forward pass through the model
-    pred = self.forward(z_t)
+    pred = self.forward(
+        z_t,
+        conditional_batch=conditional,
+        context_memory=context_memory,
+    )
 
     min_snr_weight = None
     if getattr(self.cfg.train, "min_snr_weighting", False):
@@ -60,6 +81,28 @@ def on_train_epoch_end_func(self) -> None:
     Returns:
     - None
     """
+    # Bounded conditional datasets can change which target domains occur in
+    # each freshly shuffled section chunk. Prepare that index before Lightning
+    # reloads the next epoch's DataLoader/sampler.
+    datamodule = getattr(self.trainer, "datamodule", None)
+    rechunk_every = int(
+        getattr(self.cfg.train, "rechunk_every_n_epochs", 0)
+    )
+    if datamodule is not None and rechunk_every > 0:
+        train_ds = getattr(datamodule, "train_dataset", None)
+        next_epoch = int(self.current_epoch) + 1
+        if (
+            train_ds is not None
+            and _uses_bounded_domain_context(train_ds)
+            and next_epoch % rechunk_every == 0
+        ):
+            train_ds.rechunk(seed=next_epoch)
+            print(
+                f"[Epoch {self.current_epoch}] prepared bounded context "
+                f"chunks for epoch {next_epoch}: examples={len(train_ds)}",
+                flush=True,
+            )
+
     cm = self.trainer.callback_metrics
     # Pick the first key Lightning actually produced for this run. The
     # epoch suffix is appended automatically when ``on_epoch=True`` is
@@ -119,7 +162,11 @@ def on_train_epoch_start_func(self) -> None:
     datamodule = getattr(self.trainer, "datamodule", None)
     if datamodule is not None and hasattr(datamodule, "train_dataset"):
         train_ds = datamodule.train_dataset
-        if rechunk_every > 0 and self.current_epoch % rechunk_every == 0:
+        if (
+            rechunk_every > 0
+            and self.current_epoch % rechunk_every == 0
+            and not _uses_bounded_domain_context(train_ds)
+        ):
             train_ds.rechunk(seed=self.current_epoch)
             n_groups = (
                 train_ds.graph_group_count()
@@ -175,8 +222,9 @@ def on_train_epoch_start_func(self) -> None:
             if row < 0 or row >= n:
                 print(f"[Epoch {self.current_epoch}] shuffle-canary: row_index={row} out_of_range (n_cells={n})")
             else:
-                cell_id = int(ds._data.cell_ID[row].item())
-                x, y = ds._data.positions[row].tolist()
+                src = int(ds._row_order[row].item()) if hasattr(ds, "_row_order") else row
+                cell_id = int(ds._data.cell_ID[src].item())
+                x, y = ds._data.positions[src].tolist()
                 print(
                     f"[Epoch {self.current_epoch}] shuffle-canary: "
                     f"row_index={row} cell_ID={cell_id} coord=({x:.4f}, {y:.4f})"

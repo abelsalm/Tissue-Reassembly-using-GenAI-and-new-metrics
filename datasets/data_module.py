@@ -15,12 +15,16 @@ from utils.data.load import (
     character_to_int,
     compose_graph_group_labels,
     detect_nan_rows,
+    domain_column_name,
+    domain_filters_requested,
     filter_domain_cells,
     graph_group_columns,
+    is_domain_context_mode,
+    position_group_columns,
     position_normalize,
     resolve_graph_split,
-    should_normalize_per_graph,
     standardise_dataframe_colnames,
+    target_domain_values,
 )
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch
@@ -64,6 +68,19 @@ def _map_aux_labels(
     )
 
 
+def _contiguous_group_ranges(labels: np.ndarray) -> np.ndarray:
+    """Return ``[n_groups, 2]`` start/end indices for contiguous label runs."""
+    n = int(labels.size)
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    if n == 1:
+        return np.array([[0, 1]], dtype=np.int64)
+    change = np.flatnonzero(labels[1:] != labels[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [n]))
+    return np.stack((starts.astype(np.int64), ends.astype(np.int64)), axis=1)
+
+
 class Dataset(InMemoryDataset):
     def __init__(
         self,
@@ -84,6 +101,7 @@ class Dataset(InMemoryDataset):
         self.cfg = cfg
         self.graph_split = resolve_graph_split(cfg)
         self.graph_group_cols = graph_group_columns(cfg)
+        self._context_examples = None
 
         self._data, self.slices = Data(), {}
 
@@ -102,12 +120,10 @@ class Dataset(InMemoryDataset):
             self.input_data, self.graph_group_cols
         )
 
-        # Normalize coordinates per graph group (domain) or per slice.
-        group_by = (
-            self.graph_group_cols
-            if should_normalize_per_graph(self.cfg)
-            else "cell_section"
-        )
+        # In context mode only target positions are consumed, so preserving
+        # the existing per-domain coordinate frame is safe; context positions
+        # never enter the context encoder.
+        group_by = position_group_columns(self.cfg)
         self.input_data = position_normalize(self.input_data, group_by=group_by)
         (
             positions,
@@ -163,6 +179,7 @@ class Dataset(InMemoryDataset):
         ) = self._drop_small_graph_groups(
             clean_positions, clean_node_features, clean_cell_class
         )
+        self._init_row_order_and_groups()
 
         # Update data attributes
         self._update_data_attributes(
@@ -232,7 +249,8 @@ class Dataset(InMemoryDataset):
         self._data.cell_ID = cell_ID
         self._data.cell_type = None
         self._data.domain_id = None
-        # Canonical unwarped coordinates; kept in sync with rechunk permutations.
+        # Canonical unwarped coordinates in original row order. Warp writes
+        # ``_data.positions`` here; ``get()`` applies ``_row_order``.
         self._positions_unwarped = clean_positions.clone()
 
         num_cell_to_region_mapping_dict = self._create_region_mapping_dict()
@@ -243,13 +261,26 @@ class Dataset(InMemoryDataset):
             num_cell_to_region_mapping_dict=num_cell_to_region_mapping_dict,
         )
 
+    def _init_row_order_and_groups(self) -> None:
+        """Integer-code groups, cache contiguous ranges, identity row order."""
+        labels = np.asarray(self._graph_groups_clean)
+        codes, uniques = pd.factorize(labels, sort=False)
+        self._graph_groups_clean = np.asarray(codes, dtype=np.int32)
+        self._graph_group_names = np.asarray(uniques)
+        self._group_ranges = _contiguous_group_ranges(self._graph_groups_clean)
+        n_cells = int(self._graph_groups_clean.size)
+        self._row_order = torch.arange(n_cells, dtype=torch.long)
+
     def _create_region_mapping_dict(self):
-        groups = np.asarray(self._graph_groups_clean)
-        names, counts = np.unique(groups, return_counts=True)
-        return {int(count): str(name) for name, count in zip(names, counts)}
+        names = np.asarray(self._graph_group_names)
+        ranges = np.asarray(self._group_ranges)
+        return {
+            int(end - start): str(names[i])
+            for i, (start, end) in enumerate(ranges)
+        }
 
     def graph_group_count(self) -> int:
-        return int(len(np.unique(np.asarray(self._graph_groups_clean))))
+        return int(self._group_ranges.shape[0])
 
     def _drop_small_graph_groups(self, positions, node_features, cell_class):
         min_size = getattr(self.cfg.dataset, "min_graph_size", None)
@@ -258,12 +289,13 @@ class Dataset(InMemoryDataset):
 
         min_size = int(min_size)
         groups = np.asarray(self._graph_groups_clean)
+        ranges = _contiguous_group_ranges(groups)
         keep = np.ones(groups.size, dtype=bool)
         dropped_groups = 0
-        for group in np.unique(groups):
-            idx = groups == group
-            if int(idx.sum()) < min_size:
-                keep[idx] = False
+        for start, end in ranges:
+            start, end = int(start), int(end)
+            if (end - start) < min_size:
+                keep[start:end] = False
                 dropped_groups += 1
         if dropped_groups == 0:
             return positions, node_features, cell_class
@@ -322,17 +354,61 @@ class Dataset(InMemoryDataset):
             flush=True,
         )
 
+    def get(self, idx: int) -> Data:
+        """Gather one graph via ``_row_order`` so rechunk never copies genes."""
+        target_domain_id = None
+        section_id = idx
+        if is_domain_context_mode(self.cfg):
+            if self._context_examples is None:
+                raise RuntimeError(
+                    "Context target index is not configured; call "
+                    "configure_context_targets() after attaching domain IDs"
+                )
+            section_id, start, end, target_domain_id = self._context_examples[idx]
+        else:
+            start = int(self.slices["positions"][idx])
+            end = int(self.slices["positions"][idx + 1])
+        rows = self._row_order[start:end]
+        data = Data(
+            positions=self._data.positions[rows],
+            node_features=self._data.node_features[rows],
+            cell_class=self._data.cell_class[rows],
+            cell_ID=self._data.cell_ID[rows],
+        )
+        cell_type = getattr(self._data, "cell_type", None)
+        if cell_type is not None:
+            data.cell_type = cell_type[rows]
+        domain_id = getattr(self._data, "domain_id", None)
+        if domain_id is not None:
+            data.domain_id = domain_id[rows]
+        if target_domain_id is not None:
+            membership = data.domain_id.eq(int(target_domain_id))
+            if not bool(membership.any()):
+                raise RuntimeError(
+                    f"Indexed target domain {target_domain_id} has no cells "
+                    f"in section index {section_id}"
+                )
+            data.target_membership = membership
+            data.target_indices = torch.nonzero(membership, as_tuple=False).flatten()
+            data.target_domain_id = torch.tensor(
+                [int(target_domain_id)], dtype=torch.long
+            )
+            data.section_id = torch.tensor([int(section_id)], dtype=torch.long)
+        return data
+
+    def len(self) -> int:
+        if is_domain_context_mode(self.cfg) and self._context_examples is not None:
+            return len(self._context_examples)
+        return super().len()
+
     def rechunk(self, seed=None) -> None:
         """Randomly reshuffle cells within each graph group.
 
         Graph groups are whole ``cell_section`` slices, or
         ``(cell_section, domain)`` pairs when ``dataset.graph_split=domain``.
-        The chunk boundaries (self.slices) stay the same — they define fixed
-        windows of size maximum_graph_size into the flat tensor.  What changes
-        is the cell order inside that flat tensor: within each group, all
-        cells are randomly permuted, so every chunk receives a fresh random
-        draw of ~maximum_graph_size cells from the same slice / domain instead
-        of always the same spatial neighbours.
+        The chunk windows (self.slices) stay fixed. Only ``_row_order`` is
+        shuffled, so ``get()`` draws a fresh subset of the same group without
+        permuting the gene matrix.
 
         Has no effect when maximum_graph_size is None.
         """
@@ -340,32 +416,17 @@ class Dataset(InMemoryDataset):
             return
 
         rng = np.random.default_rng(seed)
-        total_cells = self._data.positions.shape[0]
-        perm = np.arange(total_cells)
-        groups = np.asarray(self._graph_groups_clean)
-
-        for group in np.unique(groups):
-            indices = np.where(groups == group)[0]
-            perm[indices] = rng.permutation(indices)
-
-        perm_t = torch.from_numpy(perm)
-        self._data.positions     = self._data.positions[perm_t]
-        self._data.node_features = self._data.node_features[perm_t]
-        self._data.cell_class    = self._data.cell_class[perm_t]
-        self._data.cell_ID       = self._data.cell_ID[perm_t]
-        if self._data.cell_type is not None:
-            self._data.cell_type = self._data.cell_type[perm_t]
-        if self._data.domain_id is not None:
-            self._data.domain_id = self._data.domain_id[perm_t]
-        if self._cell_type_labels_clean is not None:
-            self._cell_type_labels_clean = np.asarray(
-                self._cell_type_labels_clean, dtype=object
-            )[perm]
-        if self._domain_labels_clean is not None:
-            self._domain_labels_clean = np.asarray(
-                self._domain_labels_clean, dtype=object
-            )[perm]
-        self._positions_unwarped = self._positions_unwarped[perm_t]
+        order = self._row_order
+        for start, end in self._group_ranges:
+            start, end = int(start), int(end)
+            n = end - start
+            if n <= 1:
+                continue
+            perm = torch.from_numpy(np.asarray(rng.permutation(n), dtype=np.int64))
+            order[start:end] = perm + start
+        if is_domain_context_mode(self.cfg) and self._context_examples is not None:
+            self._rebuild_context_examples()
+        self._data_list = None
 
     def set_embedding_ids(
         self,
@@ -392,6 +453,89 @@ class Dataset(InMemoryDataset):
             self._data.domain_id = domain_ids.long()
             self.slices["domain_id"] = self.slices["node_features"]
 
+    def configure_context_targets(self, domain_vocabulary: dict) -> None:
+        """Index eligible ``(section, target-domain)`` pairs without copying cells."""
+        if not is_domain_context_mode(self.cfg):
+            return
+        domain_ids = getattr(self._data, "domain_id", None)
+        if domain_ids is None:
+            raise ValueError(
+                "domain_with_context requires dataset.domain_column and domain IDs"
+            )
+
+        requested = target_domain_values(self.cfg)
+        if requested:
+            unknown = sorted(set(requested) - set(domain_vocabulary))
+            if unknown:
+                raise ValueError(
+                    f"target_domain_values are absent from the training vocabulary: {unknown}"
+                )
+            eligible = {int(domain_vocabulary[name]) for name in requested}
+        else:
+            eligible = {int(value) for value in domain_vocabulary.values()}
+
+        raw_min = getattr(self.cfg.dataset, "min_target_cells", None)
+        self._min_target_cells = 1 if raw_min is None else int(raw_min)
+        if self._min_target_cells < 1:
+            raise ValueError("dataset.min_target_cells must be at least 1")
+        self._context_eligible_domain_ids = eligible
+        self._rebuild_context_examples()
+
+    def _rebuild_context_examples(self) -> None:
+        """Index target domains inside each current full-slice subsample."""
+        domain_ids = self._data.domain_id
+        examples = []
+        skipped_small = 0
+        for section_id, start, end in self._context_chunk_ranges():
+            rows = self._row_order[start:end]
+            ids = domain_ids[rows]
+            values, counts = torch.unique(ids, return_counts=True)
+            for value, count in zip(values.tolist(), counts.tolist()):
+                value = int(value)
+                if (
+                    value == 0
+                    or value not in self._context_eligible_domain_ids
+                ):
+                    continue
+                if int(count) < self._min_target_cells:
+                    skipped_small += 1
+                    continue
+                examples.append((section_id, start, end, value))
+
+        if not examples:
+            raise ValueError(
+                f"[{self.name}/{self.split}] no eligible (section, target-domain) "
+                "pairs remain after full-slice subsampling with "
+                f"maximum_graph_size={self.maximum_graph_size} and "
+                f"min_target_cells={self._min_target_cells}"
+            )
+        self._context_examples = examples
+        self._data_list = None
+        print(
+            f"[{self.name}/{self.split}] context targets={len(examples)} "
+            f"max_context_cells={self.maximum_graph_size} "
+            f"min_target_cells={self._min_target_cells} "
+            f"skipped_small={skipped_small}",
+            flush=True,
+        )
+
+    def _context_chunk_ranges(self):
+        """Yield section-bounded chunks matching ordinary section graph sizing."""
+        max_size = (
+            None
+            if self.maximum_graph_size is None
+            else int(self.maximum_graph_size)
+        )
+        if max_size is not None and max_size < 1:
+            raise ValueError("maximum_graph_size must be positive or null")
+        for section_id, (raw_start, raw_end) in enumerate(self._group_ranges):
+            section_start, section_end = int(raw_start), int(raw_end)
+            if max_size is None:
+                yield section_id, section_start, section_end
+                continue
+            for start in range(section_start, section_end, max_size):
+                yield section_id, start, min(start + max_size, section_end)
+
     def apply_epoch_warp(
         self,
         seed: int,
@@ -406,6 +550,7 @@ class Dataset(InMemoryDataset):
 
         if not enabled:
             self._data.positions = self._positions_unwarped.clone()
+            self._data_list = None
             return
 
         field = sample_smooth_warp_field(
@@ -415,48 +560,37 @@ class Dataset(InMemoryDataset):
             max_angle_span=float(max_angle_span),
         )
         self._data.positions = apply_warp_field(self._positions_unwarped, field)
+        self._data_list = None
 
     def _generate_slice_indices(self):
         # IMPORTANT: slice boundaries must be computed on the cleaned rows,
         # otherwise they can exceed the length of self._data tensors and crash
         # torch_geometric's InMemoryDataset slicing.
         # Groups are whole sections, or (section, domain) in domain mode.
-        groups = np.asarray(self._graph_groups_clean)
-        if groups.size == 0:
+        ranges = np.asarray(self._group_ranges)
+        n_cells = int(self._row_order.numel())
+        if ranges.size == 0:
             return np.array([0], dtype=int)
 
-        current_group = groups[0]
-        slice_start = 0
-        boundaries: list[int] = []
+        boundaries: list[int] = [0]
+        max_g = self.maximum_graph_size
+        for start, end in ranges:
+            start, end = int(start), int(end)
+            if max_g is None:
+                if end != boundaries[-1]:
+                    boundaries.append(end)
+                continue
+            boundaries.extend(
+                range(start + int(max_g), end, int(max_g))
+            )
+            if boundaries[-1] != end:
+                boundaries.append(end)
 
-        for i in range(1, groups.size + 1):
-            is_end = i == groups.size
-            if is_end or groups[i] != current_group:
-                slice_end = i
-
-                if self.maximum_graph_size is None:
-                    boundaries.extend([slice_start, slice_end])
-                else:
-                    boundaries.extend(
-                        np.arange(slice_start, slice_end, self.maximum_graph_size).astype(int).tolist()
-                    )
-                    boundaries.append(slice_end)
-
-                if not is_end:
-                    current_group = groups[i]
-                    slice_start = i
-
-        boundaries = sorted(set(int(b) for b in boundaries))
-        if boundaries[0] != 0:
-            boundaries = [0] + boundaries
-        if boundaries[-1] != groups.size:
-            boundaries.append(groups.size)
-
-        # Remove any accidental duplicates / empty ranges (defensive)
+        if boundaries[-1] != n_cells:
+            boundaries.append(n_cells)
         boundaries = [boundaries[0]] + [
             b for i, b in enumerate(boundaries[1:], start=1) if b > boundaries[i - 1]
         ]
-
         return np.asarray(boundaries, dtype=int)
 
 
@@ -546,12 +680,27 @@ class DataModule(AbstractDataModule):
                 cell_type_ids=cell_ids,
                 domain_ids=domain_ids,
             )
+            dataset.configure_context_targets(domain_vocab)
         print(
             "[DataModule] auxiliary embedding vocabularies: "
             f"cell_types={self.num_cell_types}, domains={self.num_domains} "
             "(0=UNK/pad)",
             flush=True,
         )
+        if self.domain_decoder:
+            print(
+                f"[DataModule] domain embedding labels: {self.domain_decoder}",
+                flush=True,
+            )
+        if (
+            is_domain_context_mode(cfg)
+            and self.train_dataset.maximum_graph_size is not None
+            and int(getattr(cfg.train, "rechunk_every_n_epochs", 0)) > 0
+        ):
+            # Build epoch-zero target eligibility before Lightning constructs
+            # its sampler. Later bounded-context rechunks are prepared at the
+            # preceding epoch end for the same reason.
+            self.train_dataset.rechunk(seed=0)
 
     def collate(self, batch):
         return self._create_batch(batch)
@@ -571,6 +720,16 @@ class DataModule(AbstractDataModule):
         if getattr(batch[0], "domain_id", None) is not None:
             batch_data.domain_id = torch.cat(
                 [data.domain_id for data in batch], dim=0
+            )
+        if getattr(batch[0], "target_membership", None) is not None:
+            batch_data.target_membership = torch.cat(
+                [data.target_membership for data in batch], dim=0
+            )
+            batch_data.target_domain_id = torch.cat(
+                [data.target_domain_id for data in batch], dim=0
+            )
+            batch_data.section_id = torch.cat(
+                [data.section_id for data in batch], dim=0
             )
 
         batch_data.batch = torch.tensor(
@@ -616,8 +775,12 @@ class DataModule(AbstractDataModule):
         # 3. Standardise column names and validate before grouping / subsample.
         data = standardise_dataframe_colnames(data)
         required = ["coord_X", "coord_Y", "cell_section", "cell_class"]
-        if resolve_graph_split(cfg) == "domain":
+        if (
+            resolve_graph_split(cfg) in ("domain", "domain_with_context")
+            or domain_filters_requested(cfg)
+        ):
             required.extend(graph_group_columns(cfg))
+            required.append(domain_column_name(cfg))
         if _enabled_embedding(cfg, "domain"):
             required.append(
                 str(

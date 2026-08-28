@@ -18,9 +18,12 @@ dataset:
     test_data_path: "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
     validation_data_path: "/home/abel/biodata/MERFISH_ABC/MOUSE_ABC2_complete_cell_gene_shuffled.csv"
     maximum_graph_size:
-        train:  4000   # downsample graphs to fit in CPU RAM; set null for full graphs on GPU
-        test: 4000
-        validation: 4000
+        # In domain_with_context, sample this many cells from the whole section
+        # first; target cells are then selected inside that sampled context.
+        # Set null to expose the complete parent section.
+        train: 5000
+        test: 5000
+        validation: 5000
     # ── Memory-handling options for very large datasets ───────────────
     # Cap how many rows are kept per split (null = use everything).
     # If subsample_per_section: true, the cap is applied per graph group
@@ -31,20 +34,34 @@ dataset:
     #   section — one graph family per cell_section (whole-slice training, default)
     #   domain  — also split each slice by spatial_module clusters so each
     #             (cell_section, domain) pair is its own graph family
-    graph_split: domain # or section by default
+    #   domain_with_context — denoise one domain while attending to feature-only
+    #                         context from every cell in its parent section
+    graph_split: section # section | domain | domain_with_context
     domain_column: spatial_module_l1_complete
     # Keep only labels starting with this prefix (null = every non-empty domain).
     # Set to "shared" to drop ABC1_only_* / ABC2_only_* modules.
     domain_keep_prefix: null
+    # Exact domain labels to keep (null / [] = no extra allowlist). Combined
+    # with domain_keep_prefix when both are set. Example:
+    # domain_keep_values: [shared_01, shared_07]
+    domain_keep_values: null # [shared_19, shared_01, shared_08, shared_05, shared_10, shared_13]
+    # Exact domain labels to drop after prefix / allowlist (null = drop none).
+    # domain_drop_values: [ABC1_only_01]
+    domain_drop_values: null
+    # Target eligibility only: non-listed domains remain in full-slice context.
+    # Example: [shared_01, shared_02, shared_03, shared_04, shared_05]
+    target_domain_values: null
+    # Skip a (section, target-domain) item if it has fewer target cells.
+    min_target_cells: 12
     # Drop (section, domain) groups smaller than this (null = keep all).
-    min_graph_size: 32
+    min_graph_size: 12
     # When graph_split=domain, rescale coords independently per domain so each
     # cluster fills [-0.5, 0.5] the way a whole slice does in section mode.
     normalize_positions_per_graph: true
     # DataLoader memory knobs (already wired up in AbstractDataModule).
     # 0 keeps everything in the main process and avoids forking the
     # in-memory tensors per worker (multi-GB savings on big datasets).
-    num_workers: 220
+    num_workers: 0
     pin_memory: false
 
 # Optional conditioning concatenated with LUNA's original transcriptome
@@ -52,11 +69,11 @@ dataset:
 # Either block can be enabled alone, or both can be enabled together.
 model:
     embeddings:
-        fusion_hidden_dim: 128
+        fusion_hidden_dim: 256
         fusion_dropout: 0.0
         cell_type:
-            enabled: false
-            dim: 32
+            enabled: False
+            dim: 128
             # PCA-mean initialization of the classical nn.Embedding table.
             standardize: true
             pca_max_cells: 20000
@@ -65,8 +82,8 @@ model:
             mds_scale: mean       # mean | none | optimal
             mds_weighting: uniform # uniform | sammon
         domain:
-            enabled: false
-            dim: 32
+            enabled: False
+            dim: 128
             # Amortized per-(graph, domain) pooling in PCA transcriptome space.
             pool: mean            # mean | attention
             attn_hidden: 32
@@ -75,10 +92,21 @@ model:
             standardize: true
             pca_max_cells: 20000
             freeze_pca: true
+    domain_context:
+        # To opt in: set this true, graph_split=domain_with_context, and enable
+        # both embeddings above. maximum_graph_size may remain bounded.
+        enabled: false
+        # Use multihead only for small slices: it scales quadratically in cells.
+        encoder_attention_type: linear # linear | multihead
+        cross_attention_type: linear   # linear | multihead
+        cross_attention_every: 1
+        context_dropout: 0.1
+        guidance_scale: 1.0
+        shuffle_ablation: false
 
 train: # !!!!
     n_epochs: 3000        # tiny number for a smoke-test; increase for real training
-    batch_size: 8      # keep small on CPU
+    batch_size: 8
     lr: 5e-4
     # Mixed precision halves GPU memory and is usually safe.
     # "16-mixed" on V100/T4, "bf16-mixed" on A100/H100, "32-true" to disable.
@@ -92,9 +120,9 @@ train: # !!!!
 
 test:
     save_dir: '/home/abel/code/outputs'
-    checkpoint_paths: null 
-    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1215.ckpt'
-    # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/last_epoch.ckpt'
+    checkpoint_paths:
+    #- '/home/abel/code/outputs/2026-08-25/15-30-00-MERFISH_ABC/checkpoints/epoch=207.ckpt'
+    #- '/home/abel/code/outputs/2026-08-25/15-30-00-MERFISH_ABC/checkpoints/last_epoch.ckpt'
     # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1247.ckpt'
     # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1279.ckpt'
     # - '/home/abel/code/outputs/2026-08-01/13-57-27-MERFISH_ABC/checkpoints/epoch=1455.ckpt'
